@@ -22,42 +22,42 @@ No public specification of the binary format exists. This library is based on re
 
 ### File header (page 0)
 
-| Offset | Size | Type | Description |
-|--------|------|------|-------------|
-| 0 | 16 | bytes | Magic: `ABS0LUTEDATABASE` (note: zero, not letter O) |
-| 16 | 1 | byte | Mode flag: `L` (0x4C) = local/single-user |
-| 17 | 1 | byte | Unknown (always 0x00 in samples) |
-| 18 | 8 | float64 LE | Database engine version (e.g. 5.13, 7.10, 7.61) |
-| 26 | 2 | uint16 LE | Page size in bytes (observed: 4096, max: 65536) |
-| 28 | 2 | uint16 LE | Unknown (always 8 in samples — possibly header version or alignment) |
-| 30 | 2 | uint16 LE | Total column count (user columns + internal columns) |
-| 34 | 4 | uint32 LE | User-visible column count |
-| 38 | 4 | uint32 LE | Varies per file (possibly row count or free page pointer) |
-| 42 | 4 | uint32 LE | Unknown (observed values: 2) |
-| 76 | 4 | uint32 LE | Pointer/offset (observed: 0x0118 = 280 in some files) |
+| Offset | Size | Type       | Description                                                          |
+| ------ | ---- | ---------- | -------------------------------------------------------------------- |
+| 0      | 16   | bytes      | Magic: `ABS0LUTEDATABASE` (note: zero, not letter O)                 |
+| 16     | 1    | byte       | Mode flag: `L` (0x4C) = local/single-user                            |
+| 17     | 1    | byte       | Unknown (always 0x00 in samples)                                     |
+| 18     | 8    | float64 LE | Database engine version (e.g. 5.13, 7.10, 7.61)                      |
+| 26     | 2    | uint16 LE  | Page size in bytes (observed: 4096, max: 65536)                      |
+| 28     | 2    | uint16 LE  | Unknown (always 8 in samples — possibly header version or alignment) |
+| 30     | 2    | uint16 LE  | Total column count (user columns + internal columns)                 |
+| 34     | 4    | uint32 LE  | User-visible column count                                            |
+| 38     | 4    | uint32 LE  | Varies per file (possibly row count or free page pointer)            |
+| 42     | 4    | uint32 LE  | Unknown (observed values: 2)                                         |
+| 76     | 4    | uint32 LE  | Pointer/offset (observed: 0x0118 = 280 in some files)                |
 
 ### ABSP marker (page metadata)
 
 Every page contains an **ABSP** marker at a fixed offset within the page. In page 0, the ABSP marker appears at absolute offset **0x17C** (380 bytes). The ABSP marker structure:
 
-| Offset | Size | Type | Description |
-|--------|------|------|-------------|
-| 0 | 4 | bytes | Marker: `ABSP` |
-| 4 | 2 | uint16 LE | Column/entry count for this page |
-| 6 | 2 | uint16 LE | Unknown (observed: 0) |
-| 8 | 2 | uint16 LE | Page type or flags (observed: 3, 6, 10, 12) |
-| 10+ | var | bytes | Bitmask and metadata (column presence flags, free space map) |
+| Offset | Size | Type      | Description                                                  |
+| ------ | ---- | --------- | ------------------------------------------------------------ |
+| 0      | 4    | bytes     | Marker: `ABSP`                                               |
+| 4      | 2    | uint16 LE | Column/entry count for this page                             |
+| 6      | 2    | uint16 LE | Unknown (observed: 0)                                        |
+| 8      | 2    | uint16 LE | Page type or flags (observed: 3, 6, 10, 12)                  |
+| 10+    | var  | bytes     | Bitmask and metadata (column presence flags, free space map) |
 
 ### Page types (preliminary classification)
 
-| Page role | Characteristics | Observed |
-|-----------|----------------|----------|
-| File header | Page 0; contains magic, version, schema metadata | All files |
-| Table metadata | Contains filename string at page+0x1AF | Page 4 in samples |
-| Schema/catalog | ABSP marker with column definitions, field descriptors | Page 9 in TS03 |
-| B-tree index leaf | Fixed-size key entries (e.g. 29 bytes = string key + child pointers), sorted | Page 12 in TS03 |
-| Data page | Fixed-size records (e.g. 99 bytes), ABSP header + record array | Page 13 in TS03 |
-| Free/empty | All zeros | Most middle pages in small files |
+| Page role         | Characteristics                                                              | Observed                         |
+| ----------------- | ---------------------------------------------------------------------------- | -------------------------------- |
+| File header       | Page 0; contains magic, version, schema metadata                             | All files                        |
+| Table metadata    | Contains filename string at page+0x1AF                                       | Page 4 in samples                |
+| Schema/catalog    | ABSP marker with column definitions, field descriptors                       | Page 9 in TS03                   |
+| B-tree index leaf | Fixed-size key entries (e.g. 29 bytes = string key + child pointers), sorted | Page 12 in TS03                  |
+| Data page         | Fixed-size records (e.g. 99 bytes), ABSP header + record array               | Page 13 in TS03                  |
+| Free/empty        | All zeros                                                                    | Most middle pages in small files |
 
 ### Record structure (data pages)
 
@@ -78,7 +78,8 @@ Records end with a **2–3 byte trailer** containing a record sequence number or
 
 ### B-tree index pages
 
-Index pages contain sorted key entries for B*-tree traversal. Each entry is:
+Index pages contain sorted key entries for B\*-tree traversal. Each entry is:
+
 - The indexed field value (fixed size matching field definition)
 - Child page pointer(s) (uint32 LE)
 
@@ -86,60 +87,60 @@ Index pages allow O(log n) lookup without scanning all data pages.
 
 ### Observed field-to-offset mapping (TS03.abs, 13 user columns)
 
-| Record offset | Size | Content (Record 0: "D/FD-Zug 1988") |
-|---------------|------|--------------------------------------|
-| +0x00 | 19 | String: train type name (null-terminated, Windows-1252) |
-| +0x13 | 3 | String: short code "22" |
-| +0x16 | ~19 | Binary fields (integers, flags) |
-| +0x29 | 8 | Float64: 30.0 (likely a speed or correction parameter) |
-| +0x31 | 8 | Float64: 160.0 (likely length or another parameter) |
-| +0x39 | 8 | Float64: 341.0 (likely a parameter) |
-| +0x41 | ~20 | Remaining fields (floats/ints, mostly zero) |
-| +0x5d | 3 | Record trailer (flags + sequence number) |
+| Record offset | Size | Content (Record 0: "D/FD-Zug 1988")                     |
+| ------------- | ---- | ------------------------------------------------------- |
+| +0x00         | 19   | String: train type name (null-terminated, Windows-1252) |
+| +0x13         | 3    | String: short code "22"                                 |
+| +0x16         | ~19  | Binary fields (integers, flags)                         |
+| +0x29         | 8    | Float64: 30.0 (likely a speed or correction parameter)  |
+| +0x31         | 8    | Float64: 160.0 (likely length or another parameter)     |
+| +0x39         | 8    | Float64: 341.0 (likely a parameter)                     |
+| +0x41         | ~20  | Remaining fields (floats/ints, mostly zero)             |
+| +0x5d         | 3    | Record trailer (flags + sequence number)                |
 
 ### Known data types (from official docs)
 
-| Type | Delphi ftType | Storage | SQL aliases |
-|------|---------------|---------|-------------|
-| AutoInc | ftAutoInc | uint32 (4 bytes) | AUTOINC |
-| BLOB | ftBlob | pointer to BLOB area | BLOB |
-| Bytes | ftBytes | fixed byte array | BYTES(n) |
-| Currency | ftCurrency | 8 bytes (Delphi Currency = int64 / 10000) | CURRENCY, MONEY |
-| Date | ftDate | 8 bytes (TDateTime float64) | DATE |
-| DateTime | ftDateTime | 8 bytes (TDateTime float64) | DATETIME |
-| Extended | ftExtended | 10 bytes (80-bit extended) | EXTENDED |
-| Float | ftFloat | 8 bytes (float64) | FLOAT, DOUBLE, REAL, NUMERIC |
-| FmtMemo | ftFmtMemo | pointer to BLOB area | FMTMEMO |
-| Graphic | ftGraphic | pointer to BLOB area | GRAPHIC |
-| GUID | ftGUID | 16 bytes | GUID |
-| Integer | ftInteger | 4 bytes (int32) | INTEGER, INT, INT32 |
-| LargeInt | ftLargeInt | 8 bytes (int64) | LARGEINT, BIGINT, INT64 |
-| Logical | ftBoolean | 2 bytes (Delphi WordBool) | LOGICAL, BOOLEAN, BOOL, BIT |
-| Memo | ftMemo | pointer to BLOB area | MEMO, CLOB, TEXT |
-| SmallInt | ftSmallint | 2 bytes (int16) | SMALLINT, INT16 |
-| String | ftString | fixed bytes (up to 65500) | STRING(n), CHAR(n), VARCHAR(n) |
-| Time | ftTime | 8 bytes (TDateTime float64) | TIME |
-| TimeStamp | ftTimeStamp | 8 bytes | TIMESTAMP |
-| VarBytes | ftVarBytes | length-prefixed bytes | VARBYTES(n) |
-| WideMemo | ftBlob (subtype) | pointer to BLOB area | WIDEMEMO |
-| WideString | ftWideString | fixed UTF-16LE (up to 65500) | WIDESTRING(n), NCHAR(n) |
-| Word | ftWord | 2 bytes (uint16) | WORD, UNSIGNEDINT16, UINT16 |
+| Type       | Delphi ftType    | Storage                                   | SQL aliases                    |
+| ---------- | ---------------- | ----------------------------------------- | ------------------------------ |
+| AutoInc    | ftAutoInc        | uint32 (4 bytes)                          | AUTOINC                        |
+| BLOB       | ftBlob           | pointer to BLOB area                      | BLOB                           |
+| Bytes      | ftBytes          | fixed byte array                          | BYTES(n)                       |
+| Currency   | ftCurrency       | 8 bytes (Delphi Currency = int64 / 10000) | CURRENCY, MONEY                |
+| Date       | ftDate           | 8 bytes (TDateTime float64)               | DATE                           |
+| DateTime   | ftDateTime       | 8 bytes (TDateTime float64)               | DATETIME                       |
+| Extended   | ftExtended       | 10 bytes (80-bit extended)                | EXTENDED                       |
+| Float      | ftFloat          | 8 bytes (float64)                         | FLOAT, DOUBLE, REAL, NUMERIC   |
+| FmtMemo    | ftFmtMemo        | pointer to BLOB area                      | FMTMEMO                        |
+| Graphic    | ftGraphic        | pointer to BLOB area                      | GRAPHIC                        |
+| GUID       | ftGUID           | 16 bytes                                  | GUID                           |
+| Integer    | ftInteger        | 4 bytes (int32)                           | INTEGER, INT, INT32            |
+| LargeInt   | ftLargeInt       | 8 bytes (int64)                           | LARGEINT, BIGINT, INT64        |
+| Logical    | ftBoolean        | 2 bytes (Delphi WordBool)                 | LOGICAL, BOOLEAN, BOOL, BIT    |
+| Memo       | ftMemo           | pointer to BLOB area                      | MEMO, CLOB, TEXT               |
+| SmallInt   | ftSmallint       | 2 bytes (int16)                           | SMALLINT, INT16                |
+| String     | ftString         | fixed bytes (up to 65500)                 | STRING(n), CHAR(n), VARCHAR(n) |
+| Time       | ftTime           | 8 bytes (TDateTime float64)               | TIME                           |
+| TimeStamp  | ftTimeStamp      | 8 bytes                                   | TIMESTAMP                      |
+| VarBytes   | ftVarBytes       | length-prefixed bytes                     | VARBYTES(n)                    |
+| WideMemo   | ftBlob (subtype) | pointer to BLOB area                      | WIDEMEMO                       |
+| WideString | ftWideString     | fixed UTF-16LE (up to 65500)              | WIDESTRING(n), NCHAR(n)        |
+| Word       | ftWord           | 2 bytes (uint16)                          | WORD, UNSIGNEDINT16, UINT16    |
 
 ### Capacity limits (from official docs)
 
-| Limit | Value |
-|-------|-------|
-| Max database size | 32 TB |
-| Max pages per file | 2,147,483,647 |
-| Max bytes per page | 65,536 |
-| Max tables per database | 2,147,483,647 |
-| Max rows per table | 2,147,483,647 |
-| Max columns per table | 65,000 |
-| Max columns per index | 10,000 |
-| Max string field size | 64,000 bytes (limited by page size) |
-| Max BLOB field size | 2 GB |
-| Max bytes per row | 65,400 (limited by page size) |
-| Max identifier length | 255 characters |
+| Limit                   | Value                               |
+| ----------------------- | ----------------------------------- |
+| Max database size       | 32 TB                               |
+| Max pages per file      | 2,147,483,647                       |
+| Max bytes per page      | 65,536                              |
+| Max tables per database | 2,147,483,647                       |
+| Max rows per table      | 2,147,483,647                       |
+| Max columns per table   | 65,000                              |
+| Max columns per index   | 10,000                              |
+| Max string field size   | 64,000 bytes (limited by page size) |
+| Max BLOB field size     | 2 GB                                |
+| Max bytes per row       | 65,400 (limited by page size)       |
+| Max identifier length   | 255 characters                      |
 
 ### Encryption (not in scope for Phase 1)
 
@@ -179,14 +180,14 @@ Algorithms: None, ZLIB, BZIP, PPM. Compression levels 1–9.
 
 ### Steps
 
-- [ ] Define `File` struct: holds file handle, parsed header, page size
-- [ ] Parse file header (magic validation, version, page size, column counts)
-- [ ] Implement `ReadPage(pageNum int) ([]byte, error)` — read a single page by number
-- [ ] Implement `PageCount() int` — total pages in file
-- [ ] Parse ABSP marker from any page (offset, column count, page type flags)
-- [ ] Classify pages: scan all pages and categorize by ABSP signature and content patterns
-- [ ] Write tests against real `.abs` files (TS03.abs, RREC0011.abs, Addresses.abs)
-- [ ] Create `testdata/` with small representative `.abs` files (or reference Aconiq interoperability fixtures)
+- [x] Define `File` struct: holds file handle, parsed header, page size
+- [x] Parse file header (magic validation, version, page size, column counts)
+- [x] Implement `ReadPage(pageNum int) ([]byte, error)` — read a single page by number
+- [x] Implement `PageCount() int` — total pages in file
+- [x] Parse ABSP marker from any page (offset, column count, page type flags)
+- [x] Classify pages: scan all pages and categorize by ABSP signature and content patterns
+- [x] Write tests against real `.abs` files (TS03.abs, RREC0011.abs, Addresses.abs)
+- [x] Create `testdata/` with small representative `.abs` files (or reference Aconiq interoperability fixtures)
 
 ### API sketch
 
@@ -432,15 +433,15 @@ func (rec Record) Bytes(col int) []byte
 
 Primary test corpus: SoundPlan project files from `../Aconiq/interoperability/Schienenprojekt - Schall 03/`:
 
-| File | Version | Columns | Description |
-|------|---------|---------|-------------|
-| `TS03.abs` | 5.13 | 13 | Train type catalogue (20 records, string + float fields) |
-| `Addresses.abs` | 7.10 | 12 | Address database |
-| `AttrEsse.abs` | 5.13 | 11 | Emission attributes |
-| `RSPS0011/RREC0011.abs` | 7.61 | 12 | Receiver immission levels |
-| `RSPS0011/RCON0011.abs` | 7.61 | 40 | Source contributions (15 records) |
-| `RSPS0011/RPDG0011.abs` | 7.61 | 73 | Propagation diagnostics (32 records) |
-| `RSPS0011/RCFQ0011.abs` | 7.61 | 20 | Frequency contributions (602 records) |
+| File                    | Version | Columns | Description                                              |
+| ----------------------- | ------- | ------- | -------------------------------------------------------- |
+| `TS03.abs`              | 5.13    | 13      | Train type catalogue (20 records, string + float fields) |
+| `Addresses.abs`         | 7.10    | 12      | Address database                                         |
+| `AttrEsse.abs`          | 5.13    | 11      | Emission attributes                                      |
+| `RSPS0011/RREC0011.abs` | 7.61    | 12      | Receiver immission levels                                |
+| `RSPS0011/RCON0011.abs` | 7.61    | 40      | Source contributions (15 records)                        |
+| `RSPS0011/RPDG0011.abs` | 7.61    | 73      | Propagation diagnostics (32 records)                     |
+| `RSPS0011/RCFQ0011.abs` | 7.61    | 20      | Frequency contributions (602 records)                    |
 
 ### Validation approach
 

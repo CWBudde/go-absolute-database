@@ -1,0 +1,80 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+linters:
+  default: all
+  disable:
+    - depguard # no import allow/deny lists needed
+    - err113 # sentinel errors too verbose for this codebase
+    - exhaustive # don't require exhaustive switch on enums
+    - exhaustruct # don't require all struct fields populated
+    - gochecknoglobals # package-level vars are fine
+    - godox # allow TODO/FIXME comments
+    - ireturn # allow returning interfaces
+    - lll # long lines acceptable in binary parsing code
+    - mnd # magic numbers acceptable in binary format parsing
+    - musttag # no struct tag enforcement needed
+    - nlreturn # no blank-line-before-return enforcement
+    - nonamedreturns # named returns useful for complex signatures
+    - paralleltest # not enforcing t.Parallel everywhere
+    - sqlclosecheck # no SQL in this project
+    - testpackage # allow white-box tests in same package
+    - varnamelen # short names idiomatic in binary parsing code
+    - wsl # use wsl_v5 instead
+  enable:
+    - wsl_v5
+
+  settings:
+    cyclop:
+      max-complexity: 15
+
+    funlen:
+      lines: 100
+
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: false
+      branch-max-lines: 2
+      disable: [decl]
+
+  exclusions:
+    generated: lax
+    presets: [comments, common-false-positives, legacy, std-error-handling]
+
+    rules:
+      # test files are more relaxed
+      - linters:
+          [
+            funlen,
+            cyclop,
+            gocognit,
+            maintidx,
+            wrapcheck,
+            dupl,
+            noctx,
+            forcetypeassert,
+            gosec,
+            thelper,
+            usetesting,
+            goconst,
+          ]
+        path: _test\.go
+
+      # wrapcheck too noisy in internal packages
+      - linters: [wrapcheck]
+        path: internal/
+
+formatters:
+  enable:
+    - gofmt
