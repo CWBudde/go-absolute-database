@@ -12,3 +12,7 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# legacy / testdata
+testdata/
+legacy/
