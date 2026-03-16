@@ -1,7 +1,7 @@
 // Package absdb reads ComponentAce Absolute Database (.abs) files.
 //
-// The binary format is reverse-engineered from real .abs files.
-// There is no public specification.
+// The binary format is reverse-engineered from real .abs files and
+// the C++ header files shipped with the Absolute Database SDK.
 package absdb
 
 import (
@@ -19,20 +19,28 @@ var Magic = [16]byte{
 	'D', 'A', 'T', 'A', 'B', 'A', 'S', 'E',
 }
 
-// Header offsets and sizes.
 const (
-	headerMagicSize   = 16
-	headerModeOffset  = 16
-	headerVerOffset   = 18
-	headerVerSize     = 8
-	headerPageSzOff   = 26
-	headerUnk28Off    = 28
-	headerTotalColOff = 30
-	headerUserColOff  = 34
-	headerMinSize     = 38
+	// diskPageHeaderOffset is the fixed byte offset of the TABSDiskPageHeader
+	// ("ABSP" marker) within every page.
+	diskPageHeaderOffset = 0x17C
 
-	// ABSP marker location within page 0.
-	page0ABSPOffset = 0x17C
+	// diskPageHeaderSize is the packed size of TABSDiskPageHeader (40 bytes).
+	diskPageHeaderSize = 40
+
+	// pageDataOffset is where usable page data begins (after the disk page header).
+	pageDataOffset = diskPageHeaderOffset + diskPageHeaderSize // 0x1A4
+
+	// dbHeaderSize is the packed size of TABSDBHeader (76 bytes).
+	dbHeaderSize = 76
+)
+
+// Page type constants from the TABSDiskPageHeader.PageType field.
+const (
+	PageTypeSystemDir = 2  // System directory
+	PageTypeFileHdr   = 3  // File header (page 0)
+	PageTypeSchema    = 8  // Schema metadata (zlib-compressed column defs)
+	PageTypeData      = 10 // Data page (row storage)
+	PageTypeIndex     = 12 // B-tree index page
 )
 
 var (
@@ -43,14 +51,19 @@ var (
 
 // File represents an opened Absolute Database file.
 type File struct {
-	f         *os.File
-	size      int64
-	version   float64
-	pageSize  uint16
-	mode      byte
-	unknown28 uint16
-	totalCols uint16
-	userCols  uint32
+	f    *os.File
+	size int64
+
+	// Parsed from TABSDBHeader.
+	headerSize       int16
+	version          float64
+	pageSize         uint16
+	pagesInExtent    uint16
+	totalPageCount   int32
+	lastUsedPageNo   int32
+	state            int32
+	writeChangeState byte
+	encrypted        bool
 }
 
 // Open opens an Absolute Database file for reading.
@@ -61,10 +74,13 @@ func Open(path string) (*File, error) {
 	}
 
 	db := &File{f: f}
-	if err := db.parseHeader(); err != nil {
+
+	err = db.parseHeader()
+	if err != nil {
 		f.Close()
 		return nil, err
 	}
+
 	return db, nil
 }
 
@@ -85,22 +101,12 @@ func (db *File) PageSize() int {
 
 // PageCount returns the total number of pages in the file.
 func (db *File) PageCount() int {
-	return int(db.size / int64(db.pageSize))
+	return int(db.totalPageCount)
 }
 
-// Mode returns the file mode byte (e.g. 'L' for local/single-user).
-func (db *File) Mode() byte {
-	return db.mode
-}
-
-// TotalColumnCount returns the total column count (user + internal).
-func (db *File) TotalColumnCount() int {
-	return int(db.totalCols)
-}
-
-// UserColumnCount returns the user-visible column count.
-func (db *File) UserColumnCount() int {
-	return int(db.userCols)
+// Encrypted returns true if the database is encrypted.
+func (db *File) Encrypted() bool {
+	return db.encrypted
 }
 
 // ReadPage reads a single page by its zero-based page number.
@@ -111,6 +117,7 @@ func (db *File) ReadPage(n int) (Page, error) {
 
 	data := make([]byte, db.pageSize)
 	offset := int64(n) * int64(db.pageSize)
+
 	_, err := db.f.ReadAt(data, offset)
 	if err != nil && err != io.EOF {
 		return Page{}, fmt.Errorf("absdb: reading page %d: %w", n, err)
@@ -120,7 +127,8 @@ func (db *File) ReadPage(n int) (Page, error) {
 		Number: n,
 		Data:   data,
 	}
-	page.ABSP = parseABSP(data)
+	page.Header = parseDiskPageHeader(data)
+
 	return page, nil
 }
 
@@ -129,53 +137,56 @@ func (db *File) parseHeader() error {
 	if err != nil {
 		return fmt.Errorf("absdb: %w", err)
 	}
+
 	db.size = info.Size()
 
-	if db.size < headerMinSize {
+	if db.size < dbHeaderSize {
 		return ErrTruncated
 	}
 
-	buf := make([]byte, 512) // read enough for the full header area
-	n, err := db.f.ReadAt(buf, 0)
-	if err != nil && err != io.EOF {
+	buf := make([]byte, dbHeaderSize)
+
+	_, err = db.f.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("absdb: reading header: %w", err)
 	}
-	if n < headerMinSize {
-		return ErrTruncated
-	}
-	buf = buf[:n]
 
 	// Validate magic.
 	var magic [16]byte
-	copy(magic[:], buf[:headerMagicSize])
+	copy(magic[:], buf[:16])
+
 	if magic != Magic {
 		return ErrNotABS
 	}
 
-	// Mode flag.
-	db.mode = buf[headerModeOffset]
+	// TABSDBHeader layout (packed):
+	//   Signature[16]        offset 0
+	//   HeaderSize  int16    offset 16
+	//   Version     float64  offset 18
+	//   PageSize    uint16   offset 26
+	//   PageCountInExtent uint16 offset 28
+	//   TotalPageCount int32 offset 30
+	//   LastUsedPageNo int32 offset 34
+	//   State       int32    offset 38
+	//   WriteChangesState byte offset 42
+	//   Encrypted   bytebool offset 43
+	//   Reserved[32]         offset 44
 
-	// Version (float64 LE).
-	db.version = math.Float64frombits(binary.LittleEndian.Uint64(buf[headerVerOffset : headerVerOffset+headerVerSize]))
+	db.headerSize = int16(binary.LittleEndian.Uint16(buf[16:18]))
+	db.version = math.Float64frombits(binary.LittleEndian.Uint64(buf[18:26]))
 
-	// Page size (uint16 LE).
-	db.pageSize = binary.LittleEndian.Uint16(buf[headerPageSzOff : headerPageSzOff+2])
+	db.pageSize = binary.LittleEndian.Uint16(buf[26:28])
 	if db.pageSize == 0 {
-		return fmt.Errorf("absdb: invalid page size 0")
+		return errors.New("absdb: invalid page size 0")
 	}
 
-	// Unknown field at offset 28.
-	db.unknown28 = binary.LittleEndian.Uint16(buf[headerUnk28Off : headerUnk28Off+2])
+	db.pagesInExtent = binary.LittleEndian.Uint16(buf[28:30])
+	db.totalPageCount = int32(binary.LittleEndian.Uint32(buf[30:34]))
+	db.lastUsedPageNo = int32(binary.LittleEndian.Uint32(buf[34:38]))
+	db.state = int32(binary.LittleEndian.Uint32(buf[38:42]))
+	db.writeChangeState = buf[42]
+	db.encrypted = buf[43] != 0
 
-	// Total column count (uint16 at offset 30).
-	db.totalCols = binary.LittleEndian.Uint16(buf[headerTotalColOff : headerTotalColOff+2])
-
-	// User column count (uint32 at offset 34).
-	if len(buf) >= headerUserColOff+4 {
-		db.userCols = binary.LittleEndian.Uint32(buf[headerUserColOff : headerUserColOff+4])
-	}
-
-	// Validate file size is at least one page.
 	if db.size < int64(db.pageSize) {
 		return ErrTruncated
 	}
@@ -187,7 +198,7 @@ func (db *File) parseHeader() error {
 type Page struct {
 	Number int
 	Data   []byte
-	ABSP   *ABSPHeader // nil if no ABSP marker found on this page
+	Header *DiskPageHeader // nil if no ABSP marker found
 }
 
 // IsEmpty returns true if the page contains only zero bytes.
@@ -197,77 +208,61 @@ func (p Page) IsEmpty() bool {
 			return false
 		}
 	}
+
 	return true
 }
 
-// ABSPHeader represents the parsed ABSP marker found in page headers.
-// Every page contains "ABSP" at offset 0x17C. The 4 bytes after the marker
-// appear to be a CRC32 or checksum (on page 0, this value equals the total
-// column count, likely by coincidence). The uint16 at ABSP+8 is the page type.
-type ABSPHeader struct {
-	Offset   int    // byte offset of the ABSP marker within the page
-	Checksum uint32 // 4-byte value after marker (CRC32 or checksum)
-	PageType uint16 // page type identifier at ABSP+8
-}
-
-// parseABSP scans a page for the ABSP marker and parses it.
-// Returns nil if no marker is found.
-func parseABSP(data []byte) *ABSPHeader {
-	// Search for ABSP marker in the page.
-	// It's typically at a fixed offset, but we search to be robust.
-	for i := 0; i <= len(data)-10; i++ {
-		if data[i] == 'A' && data[i+1] == 'B' && data[i+2] == 'S' && data[i+3] == 'P' {
-			return &ABSPHeader{
-				Offset:   i,
-				Checksum: binary.LittleEndian.Uint32(data[i+4 : i+8]),
-				PageType: binary.LittleEndian.Uint16(data[i+8 : i+10]),
-			}
-		}
+// PageData returns the usable data portion of the page (after the disk page header).
+func (p Page) PageData() []byte {
+	if len(p.Data) <= pageDataOffset {
+		return nil
 	}
-	return nil
+
+	return p.Data[pageDataOffset:]
 }
 
-// PageClassification describes the role of a page within the database.
-type PageClassification int
+// DiskPageHeader is the 40-byte TABSDiskPageHeader found at offset 0x17C in every page.
+type DiskPageHeader struct {
+	State      int32  // page state
+	PageType   uint16 // page type (see PageType* constants)
+	NextPageNo int32  // next page in chain (-1 = none)
+	CRC32      uint32 // CRC32 checksum
+	CRCType    byte
+	HashType   byte
+	CipherType byte
+	MACType    byte
+	ObjectID   int32  // table/object this page belongs to (-1 = system)
+	RecPageNo  int32  // record ID: page number
+	RecItemNo  uint16 // record ID: item number within page
+}
 
-const (
-	PageEmpty      PageClassification = iota // All zeros
-	PageFileHeader                           // Page 0: file header
-	PageABSP                                 // Has ABSP marker (further classified by PageType)
-	PageUnknown                              // Non-empty, no ABSP marker
-)
+// parseDiskPageHeader reads the TABSDiskPageHeader from the fixed offset.
+func parseDiskPageHeader(data []byte) *DiskPageHeader {
+	if len(data) < diskPageHeaderOffset+diskPageHeaderSize {
+		return nil
+	}
 
-// String returns a human-readable classification name.
-func (c PageClassification) String() string {
-	switch c {
-	case PageEmpty:
-		return "empty"
-	case PageFileHeader:
-		return "file-header"
-	case PageABSP:
-		return "absp"
-	case PageUnknown:
-		return "unknown"
-	default:
-		return fmt.Sprintf("PageClassification(%d)", int(c))
+	off := diskPageHeaderOffset
+	if data[off] != 'A' || data[off+1] != 'B' || data[off+2] != 'S' || data[off+3] != 'P' {
+		return nil
+	}
+
+	return &DiskPageHeader{
+		State:      int32(binary.LittleEndian.Uint32(data[off+4 : off+8])),
+		PageType:   binary.LittleEndian.Uint16(data[off+8 : off+10]),
+		NextPageNo: int32(binary.LittleEndian.Uint32(data[off+10 : off+14])),
+		CRC32:      binary.LittleEndian.Uint32(data[off+14 : off+18]),
+		CRCType:    data[off+18],
+		HashType:   data[off+19],
+		CipherType: data[off+20],
+		MACType:    data[off+21],
+		ObjectID:   int32(binary.LittleEndian.Uint32(data[off+22 : off+26])),
+		RecPageNo:  int32(binary.LittleEndian.Uint32(data[off+26 : off+30])),
+		RecItemNo:  binary.LittleEndian.Uint16(data[off+30 : off+32]),
 	}
 }
 
-// ClassifyPage returns the classification for a page.
-func ClassifyPage(p Page) PageClassification {
-	if p.Number == 0 {
-		return PageFileHeader
-	}
-	if p.IsEmpty() {
-		return PageEmpty
-	}
-	if p.ABSP != nil {
-		return PageABSP
-	}
-	return PageUnknown
-}
-
-// ScanPages reads all pages and returns their classifications.
+// ScanPages reads all pages and returns their disk page headers.
 func (db *File) ScanPages() ([]PageSummary, error) {
 	count := db.PageCount()
 	summaries := make([]PageSummary, count)
@@ -277,18 +272,36 @@ func (db *File) ScanPages() ([]PageSummary, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		summaries[i] = PageSummary{
-			Number:         i,
-			Classification: ClassifyPage(page),
-			ABSP:           page.ABSP,
+			Number: i,
+			Empty:  page.IsEmpty(),
+			Header: page.Header,
 		}
 	}
+
 	return summaries, nil
 }
 
-// PageSummary is a lightweight summary of a page's classification.
+// PageSummary is a lightweight summary of a scanned page.
 type PageSummary struct {
-	Number         int
-	Classification PageClassification
-	ABSP           *ABSPHeader
+	Number int
+	Empty  bool
+	Header *DiskPageHeader
+}
+
+// findPageByType returns the first page with the given type, or -1.
+func (db *File) findPageByType(pageType uint16) (int, error) {
+	for i := range db.PageCount() {
+		page, err := db.ReadPage(i)
+		if err != nil {
+			return -1, err
+		}
+
+		if page.Header != nil && page.Header.PageType == pageType {
+			return i, nil
+		}
+	}
+
+	return -1, nil
 }
