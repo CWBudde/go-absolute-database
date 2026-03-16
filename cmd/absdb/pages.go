@@ -17,6 +17,8 @@ func pageTypeName(pt uint16) string {
 		return "Schema"
 	case absdb.PageTypeData:
 		return "Data"
+	case absdb.PageTypeBlob:
+		return "Blob"
 	case absdb.PageTypeIndex:
 		return "Index"
 	default:

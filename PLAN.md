@@ -339,14 +339,14 @@ func (rec Record) Bytes(col int) []byte
 
 ### Steps
 
-- [ ] Investigate BLOB block storage layout (separate area within the file, or interleaved pages?)
-- [ ] Decode BLOB pointer format in records (offset + size, or block chain head)
-- [ ] Implement BLOB block reading and chaining (for BLOBs spanning multiple blocks)
-- [ ] Implement ZLIB decompression for compressed BLOBs
-- [ ] Implement BZIP2 decompression (if encountered in test data)
-- [ ] Add `Record.Blob(col int) ([]byte, error)` method
-- [ ] Add `Record.Memo(col int) (string, error)` method (Memo = text BLOB)
-- [ ] Test against files with BLOB data (if available in SoundPlan project)
+- [x] Investigate BLOB block storage layout — page type 11 stores BLOB data, one BLOB per page
+- [x] Decode BLOB pointer format in records — 6 bytes: PageNo(int32) + ItemNo(uint16)
+- [x] Implement BLOB block reading and chaining (for BLOBs spanning multiple pages via NextPageNo)
+- [x] Implement ZLIB decompression for compressed BLOBs
+- [ ] Implement BZIP2 decompression (if encountered in test data) — deferred, no test data
+- [x] Add `Record.Blob(col int) ([]byte, error)` method
+- [x] Add `Record.Memo(col int) (string, error)` method (Memo = text BLOB)
+- [x] Test against RPDG0011.abs — 30 records, 60 non-null BLOBs (polygon diagram data)
 
 ---
 
@@ -356,13 +356,19 @@ func (rec Record) Bytes(col int) []byte
 
 ### Steps
 
-- [ ] Decode index definition records from schema (index name, column list, sort order, case sensitivity)
-- [ ] Decode B-tree node page structure (keys, child pointers, leaf indicators)
-- [ ] Implement B-tree traversal for single-key lookup
-- [ ] Implement range scan via index
-- [ ] Implement `Reader.FindByIndex(indexName string, key interface{}) (Record, error)`
-- [ ] Test: look up train type by name in TS03.abs
-- [ ] Benchmark: index lookup vs full scan
+- [x] Decode B-tree node page structure — TABSBTreePageHeader (18 bytes: IsRoot, IsLeaf, siblings, KeyPrefixSize, EntryCount)
+- [x] Discover indexes by scanning type-12 pages for root nodes
+- [x] Classify indexes: system (4-byte keys), primary (5-byte keys), secondary (string keys)
+- [x] Implement B-tree traversal for single-key lookup (binary search on leaf entries)
+- [x] Implement index scan via leaf chain (RightPageNo horizontal links)
+- [x] Implement `FindByPrimaryKey(key int32)` — exact match on AutoInc/RecNo
+- [x] Implement `FindByStringKey(value string)` — exact match on string secondary index
+- [x] String key comparison handles garbage bytes after null terminator
+- [x] Test: look up train type by name in TS03.abs ("EC / IC" → page 13, item 2)
+- [x] Test: primary key lookup across TS03 (1–18) and RPDG0011
+- [x] Test: full index scan returns 18 sorted entries for both primary and secondary indexes
+- [ ] Decode index definition records from schema metadata — deferred (complex serialization)
+- [ ] Benchmark: index lookup vs full scan — deferred
 
 ---
 

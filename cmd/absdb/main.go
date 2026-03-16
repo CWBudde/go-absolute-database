@@ -18,6 +18,7 @@ func main() {
 	root.AddCommand(schemaCmd())
 	root.AddCommand(dumpCmd())
 	root.AddCommand(hexpageCmd())
+	root.AddCommand(blobCmd())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
