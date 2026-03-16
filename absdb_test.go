@@ -1,6 +1,7 @@
 package absdb
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,22 +13,28 @@ func testdataPath(name string) string {
 
 func openTestFile(t *testing.T, name string) *File {
 	t.Helper()
+
 	path := testdataPath(name)
+
 	db, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open(%q): %v", name, err)
 	}
+
 	t.Cleanup(func() { db.Close() })
+
 	return db
 }
 
 func TestOpenInvalidFile(t *testing.T) {
-	// Create a temporary file with invalid content.
 	tmp := filepath.Join(t.TempDir(), "bad.abs")
-	if err := os.WriteFile(tmp, []byte("not a database file!!"), 0644); err != nil {
+
+	err := os.WriteFile(tmp, []byte("not a database file!!"), 0o644)
+	if err != nil {
 		t.Fatal(err)
 	}
-	_, err := Open(tmp)
+
+	_, err = Open(tmp)
 	if err == nil {
 		t.Fatal("expected error for invalid file")
 	}
@@ -42,13 +49,15 @@ func TestOpenNonExistent(t *testing.T) {
 
 func TestOpenTruncated(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "trunc.abs")
-	// Write valid magic but truncate before page size.
 	data := make([]byte, 20)
 	copy(data, Magic[:])
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+
+	err := os.WriteFile(tmp, data, 0o644)
+	if err != nil {
 		t.Fatal(err)
 	}
-	_, err := Open(tmp)
+
+	_, err = Open(tmp)
 	if err == nil {
 		t.Fatal("expected error for truncated file")
 	}
@@ -60,17 +69,17 @@ func TestTS03Header(t *testing.T) {
 	if v := db.Version(); v != 5.13 {
 		t.Errorf("Version() = %v, want 5.13", v)
 	}
+
 	if ps := db.PageSize(); ps != 4096 {
 		t.Errorf("PageSize() = %d, want 4096", ps)
 	}
-	if m := db.Mode(); m != 'L' {
-		t.Errorf("Mode() = %c, want L", m)
+
+	if pc := db.PageCount(); pc != 14 {
+		t.Errorf("PageCount() = %d, want 14", pc)
 	}
-	if tc := db.TotalColumnCount(); tc != 14 {
-		t.Errorf("TotalColumnCount() = %d, want 14", tc)
-	}
-	if uc := db.UserColumnCount(); uc != 13 {
-		t.Errorf("UserColumnCount() = %d, want 13", uc)
+
+	if db.Encrypted() {
+		t.Error("Encrypted() = true, want false")
 	}
 }
 
@@ -80,11 +89,9 @@ func TestAddressesHeader(t *testing.T) {
 	if v := db.Version(); v != 7.1 {
 		t.Errorf("Version() = %v, want 7.1", v)
 	}
+
 	if ps := db.PageSize(); ps != 4096 {
 		t.Errorf("PageSize() = %d, want 4096", ps)
-	}
-	if uc := db.UserColumnCount(); uc != 12 {
-		t.Errorf("UserColumnCount() = %d, want 12", uc)
 	}
 }
 
@@ -94,40 +101,31 @@ func TestRREC0011Header(t *testing.T) {
 	if v := db.Version(); v != 7.61 {
 		t.Errorf("Version() = %v, want 7.61", v)
 	}
+
 	if ps := db.PageSize(); ps != 4096 {
 		t.Errorf("PageSize() = %d, want 4096", ps)
-	}
-	if uc := db.UserColumnCount(); uc != 12 {
-		t.Errorf("UserColumnCount() = %d, want 12", uc)
-	}
-}
-
-func TestPageCount(t *testing.T) {
-	db := openTestFile(t, "TS03.abs")
-	pc := db.PageCount()
-	// 57724 bytes / 4096 = 14 pages (with remainder, so 14)
-	if pc != 14 {
-		t.Errorf("PageCount() = %d, want 14", pc)
 	}
 }
 
 func TestReadPage(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
 
-	// Page 0 should be readable and contain the magic.
 	p, err := db.ReadPage(0)
 	if err != nil {
 		t.Fatalf("ReadPage(0): %v", err)
 	}
+
 	if p.Number != 0 {
 		t.Errorf("page.Number = %d, want 0", p.Number)
 	}
+
 	if len(p.Data) != 4096 {
 		t.Errorf("len(page.Data) = %d, want 4096", len(p.Data))
 	}
-	// Verify magic in raw data.
+
 	var magic [16]byte
 	copy(magic[:], p.Data[:16])
+
 	if magic != Magic {
 		t.Error("page 0 does not contain magic bytes")
 	}
@@ -137,39 +135,104 @@ func TestReadPageOutOfRange(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
 
 	_, err := db.ReadPage(-1)
-	if err != ErrPageOutOfRange {
+	if !errors.Is(err, ErrPageOutOfRange) {
 		t.Errorf("ReadPage(-1) error = %v, want ErrPageOutOfRange", err)
 	}
 
 	_, err = db.ReadPage(db.PageCount())
-	if err != ErrPageOutOfRange {
+	if !errors.Is(err, ErrPageOutOfRange) {
 		t.Errorf("ReadPage(PageCount) error = %v, want ErrPageOutOfRange", err)
 	}
 }
 
-func TestPage0ABSP(t *testing.T) {
+func TestDiskPageHeader(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
+
 	p, err := db.ReadPage(0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.ABSP == nil {
-		t.Fatal("page 0 should have ABSP marker")
+
+	if p.Header == nil {
+		t.Fatal("page 0 should have disk page header")
 	}
-	if p.ABSP.Offset != page0ABSPOffset {
-		t.Errorf("ABSP offset = 0x%X, want 0x%X", p.ABSP.Offset, page0ABSPOffset)
+
+	if p.Header.PageType != PageTypeFileHdr {
+		t.Errorf("PageType = %d, want %d (FileHdr)", p.Header.PageType, PageTypeFileHdr)
 	}
-	// On page 0, the checksum field equals the total column count (14).
-	if p.ABSP.Checksum != 14 {
-		t.Errorf("ABSP.Checksum = %d, want 14 (column count on page 0)", p.ABSP.Checksum)
-	}
-	if p.ABSP.PageType != 3 {
-		t.Errorf("ABSP.PageType = %d, want 3", p.ABSP.PageType)
+
+	if p.Header.NextPageNo != -1 {
+		t.Errorf("NextPageNo = %d, want -1", p.Header.NextPageNo)
 	}
 }
 
-func TestClassifyPages(t *testing.T) {
+func TestDiskPageHeaderTypes(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
+
+	// Expected page types for TS03.abs.
+	expectedTypes := map[int]uint16{
+		0:  PageTypeFileHdr,
+		1:  PageTypeSystemDir,
+		7:  PageTypeSchema,
+		13: PageTypeData,
+		9:  PageTypeIndex,
+	}
+
+	for pageNo, wantType := range expectedTypes {
+		p, err := db.ReadPage(pageNo)
+		if err != nil {
+			t.Fatalf("ReadPage(%d): %v", pageNo, err)
+		}
+
+		if p.Header == nil {
+			t.Fatalf("page %d has no header", pageNo)
+		}
+
+		if p.Header.PageType != wantType {
+			t.Errorf("page %d: PageType = %d, want %d", pageNo, p.Header.PageType, wantType)
+		}
+	}
+}
+
+func TestDataPageObjectID(t *testing.T) {
+	db := openTestFile(t, "TS03.abs")
+
+	p, err := db.ReadPage(13)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if p.Header.ObjectID != 1 {
+		t.Errorf("data page ObjectID = %d, want 1", p.Header.ObjectID)
+	}
+}
+
+func TestLinkedPages(t *testing.T) {
+	db := openTestFile(t, "TS03.abs")
+
+	// Pages 5 and 6 are linked (both type 7).
+	p5, err := db.ReadPage(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if p5.Header.NextPageNo != 6 {
+		t.Errorf("page 5 NextPageNo = %d, want 6", p5.Header.NextPageNo)
+	}
+
+	p6, err := db.ReadPage(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if p6.Header.NextPageNo != -1 {
+		t.Errorf("page 6 NextPageNo = %d, want -1", p6.Header.NextPageNo)
+	}
+}
+
+func TestScanPages(t *testing.T) {
+	db := openTestFile(t, "TS03.abs")
+
 	summaries, err := db.ScanPages()
 	if err != nil {
 		t.Fatal(err)
@@ -179,25 +242,12 @@ func TestClassifyPages(t *testing.T) {
 		t.Fatalf("got %d summaries, want %d", len(summaries), db.PageCount())
 	}
 
-	// Page 0 should be file-header.
-	if summaries[0].Classification != PageFileHeader {
-		t.Errorf("page 0 classification = %v, want file-header", summaries[0].Classification)
-	}
-
-	// Count page types for debugging.
-	counts := map[PageClassification]int{}
 	for _, s := range summaries {
-		counts[s.Classification]++
-	}
-	t.Logf("Page classifications: %v", counts)
-
-	// Log ABSP pages with their types.
-	for _, s := range summaries {
-		if s.ABSP != nil {
-			t.Logf("Page %2d: ABSP at 0x%03X, checksum=0x%08X, type=%d, class=%v",
-				s.Number, s.ABSP.Offset, s.ABSP.Checksum, s.ABSP.PageType, s.Classification)
+		if s.Header != nil {
+			t.Logf("Page %2d: type=%2d, next=%3d, obj=%3d",
+				s.Number, s.Header.PageType, s.Header.NextPageNo, s.Header.ObjectID)
 		} else {
-			t.Logf("Page %2d: %v", s.Number, s.Classification)
+			t.Logf("Page %2d: no header", s.Number)
 		}
 	}
 }
@@ -207,25 +257,9 @@ func TestPageIsEmpty(t *testing.T) {
 	if !p.IsEmpty() {
 		t.Error("zero page should be empty")
 	}
+
 	p.Data[50] = 1
 	if p.IsEmpty() {
 		t.Error("non-zero page should not be empty")
-	}
-}
-
-func TestPageClassificationString(t *testing.T) {
-	tests := []struct {
-		c    PageClassification
-		want string
-	}{
-		{PageEmpty, "empty"},
-		{PageFileHeader, "file-header"},
-		{PageABSP, "absp"},
-		{PageUnknown, "unknown"},
-	}
-	for _, tt := range tests {
-		if got := tt.c.String(); got != tt.want {
-			t.Errorf("%d.String() = %q, want %q", int(tt.c), got, tt.want)
-		}
 	}
 }
