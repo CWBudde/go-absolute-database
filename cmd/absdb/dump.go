@@ -149,7 +149,12 @@ func formatField(rec absdb.Record, col int, c absdb.Column) string {
 	case absdb.BftVarchar, absdb.BftChar, absdb.BftWideVarchar, absdb.BftWideChar:
 		return rec.String(col)
 	case absdb.BftBlob, absdb.BftClob, absdb.BftWideClob:
-		return "<blob>"
+		ref := rec.BlobRef(col)
+		if ref.IsNull() {
+			return "<blob:null>"
+		}
+
+		return fmt.Sprintf("<blob:%dB>", ref.PageNo)
 	default:
 		return fmt.Sprintf("<%d bytes>", c.Size)
 	}
@@ -172,7 +177,17 @@ func fieldValue(rec absdb.Record, col int, c absdb.Column) any {
 	case absdb.BftVarchar, absdb.BftChar, absdb.BftWideVarchar, absdb.BftWideChar:
 		return rec.String(col)
 	case absdb.BftBlob, absdb.BftClob, absdb.BftWideClob:
-		return "<blob>"
+		data, err := rec.Blob(col)
+		if err != nil || data == nil {
+			return nil
+		}
+
+		// For Memo/Clob, return as string; for binary BLOBs, return size info.
+		if c.BaseType == absdb.BftClob || c.BaseType == absdb.BftWideClob {
+			return string(data)
+		}
+
+		return fmt.Sprintf("<blob:%d bytes>", len(data))
 	default:
 		return fmt.Sprintf("<%d bytes>", c.Size)
 	}

@@ -330,9 +330,11 @@ func (r *Reader) pageHeaderSize() int {
 // detectRecordLayout scans the first data page to determine the record stride,
 // null flag byte count, and extra per-record metadata bytes.
 //
-// Strategy: try candidate null flag + extra byte counts. For each candidate,
-// verify that the second record's first integer field (at the expected offset)
-// contains a plausible value (small positive integer, typically sequential).
+// Strategy: the first column is typically AutoInc or RecNo starting at 1.
+// We scan for 01 00 00 00 in the page data, then validate by checking the
+// second record at the computed stride also has a small positive value.
+// The page header size varies because it contains a record occupancy bitmap
+// whose size depends on max records per page.
 func (r *Reader) detectRecordLayout() {
 	if len(r.dataPages) == 0 {
 		return
@@ -348,27 +350,19 @@ func (r *Reader) detectRecordLayout() {
 		return
 	}
 
-	// The page header is: ceil(totalCols/8) null bytes + some metadata.
-	// We try page header sizes from 3 to 10.
-	// For each, we try null flag sizes from 2 to 6.
-	// We validate by checking that records 1 and 2 have plausible first-field values.
-	type candidate struct {
-		pageHdr    int
-		nullBytes  int
-		extraBytes int
-	}
-
-	for pageHdr := 3; pageHdr <= 10; pageHdr++ {
-		for nullBytes := 2; nullBytes <= 6; nullBytes++ {
+	// Try candidate combinations. The page header can be large (up to ~50 bytes)
+	// because it contains a bitmap of occupied record slots.
+	for pageHdr := 2; pageHdr <= 50; pageHdr++ {
+		for nullBytes := 1; nullBytes <= 6; nullBytes++ {
 			for extra := range 5 {
 				recSize := nullBytes + extra + r.fieldDataSize
 				if recSize <= 0 {
 					continue
 				}
 
-				// Record 1 first field at: pageHdr + nullBytes + extra
+				// Record 0 first field at: pageHdr + nullBytes + extra
 				rec1Off := pageHdr + nullBytes + extra
-				// Record 2 first field at: pageHdr + recSize + nullBytes + extra
+				// Record 1 first field at: pageHdr + recSize + nullBytes + extra
 				rec2Off := pageHdr + recSize + nullBytes + extra
 
 				if rec2Off+4 > len(d) {
@@ -381,6 +375,13 @@ func (r *Reader) detectRecordLayout() {
 				// For the first field (typically AutoInc or RecNo), expect
 				// small positive integers, often sequential.
 				if val1 >= 1 && val1 <= 100 && val2 >= 1 && val2 <= 100 {
+					// Extra validation: the null flag byte(s) before the
+					// field data should be non-zero (record is present).
+					rec1Start := pageHdr
+					if d[rec1Start] == 0 {
+						continue
+					}
+
 					r.nullFlagBytes = nullBytes
 					r.extraBytes = extra
 					r.recordSize = recSize
