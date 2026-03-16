@@ -222,13 +222,14 @@ type ABSPHeader struct {
 
 ### Steps
 
-- [ ] Locate the schema/catalog page(s) — likely the page containing the filename string and surrounding metadata
-- [ ] Decode column definition records: name (string), type (enum), size (uint16), flags (nullable, primary key, etc.)
-- [ ] Map Delphi `ftXxx` type codes to Go `FieldType` enum
-- [ ] Build `TableSchema` struct: table name, column definitions, index definitions
-- [ ] Handle multi-table databases (table catalog enumeration)
-- [ ] Test against TS03.abs (known: 13 user columns, one is a string "train type name", others are floats/ints)
-- [ ] Test against RREC0011.abs, RCON0011.abs (different column counts)
+- [x] Locate the schema/catalog page(s) — page type 8, zlib-compressed internal file
+- [x] Decode column definition records: name (string), type (enum), size (uint32), flags
+- [x] Map Delphi `ftXxx` type codes to Go `FieldType` enum (TABSBaseFieldType + TABSAdvancedFieldType)
+- [x] Build `TableSchema` struct: column definitions
+- [ ] Handle multi-table databases (table catalog enumeration) — deferred, single-table works
+- [x] Test against TS03.abs (9 columns: AutoInc + String + 5×Double + Memo + Graphic)
+- [x] Test against RREC0011.abs (20 columns: Integer + String + Boolean + Double)
+- [x] Test against Addresses.abs (19 columns: AutoInc + 16×String + DateTime + Memo)
 
 ### API sketch
 
