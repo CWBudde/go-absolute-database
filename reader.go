@@ -20,11 +20,11 @@ type Reader struct {
 	schema *TableSchema
 
 	// Computed layout.
-	nullFlagBytes  int // bytes of null flags per record
-	extraBytes     int // version-dependent per-record metadata bytes
-	fieldDataSize  int // total bytes for all field values
-	recordSize     int // nullFlagBytes + extraBytes + fieldDataSize
-	fieldOffsets   []int
+	nullFlagBytes   int // bytes of null flags per record
+	extraBytes      int // version-dependent per-record metadata bytes
+	fieldDataSize   int // total bytes for all field values
+	recordSize      int // nullFlagBytes + extraBytes + fieldDataSize
+	fieldOffsets    []int
 	fieldStoreSizes []int
 
 	// Page layout.
@@ -51,15 +51,18 @@ func (db *File) OpenTable() (*Reader, error) {
 
 	// Find all data pages (type 10).
 	var dataPages []int
+
 	for i := range db.PageCount() {
 		page, err := db.ReadPage(i)
 		if err != nil {
 			return nil, err
 		}
+
 		if page.Header != nil && page.Header.PageType == PageTypeData {
 			dataPages = append(dataPages, i)
 		}
 	}
+
 	if len(dataPages) == 0 {
 		return nil, ErrNoData
 	}
@@ -70,6 +73,7 @@ func (db *File) OpenTable() (*Reader, error) {
 		dataPages: dataPages,
 	}
 	r.computeLayout()
+
 	return r, nil
 }
 
@@ -86,8 +90,11 @@ func (r *Reader) Next() bool {
 
 	if !r.started {
 		r.started = true
+
 		r.pageIdx = 0
-		if err := r.loadPage(); err != nil {
+
+		err := r.loadPage()
+		if err != nil {
 			r.err = err
 			return false
 		}
@@ -100,7 +107,9 @@ func (r *Reader) Next() bool {
 			if recStart+r.recordSize <= len(r.pageData) && r.isRecordPresent(recStart) {
 				return true
 			}
+
 			r.recordIdx++
+
 			continue
 		}
 
@@ -109,7 +118,9 @@ func (r *Reader) Next() bool {
 		if r.pageIdx >= len(r.dataPages) {
 			return false
 		}
-		if err := r.loadPage(); err != nil {
+
+		err := r.loadPage()
+		if err != nil {
 			r.err = err
 			return false
 		}
@@ -126,10 +137,11 @@ func (r *Reader) Record() Record {
 	recStart := r.pageHeaderSize() + r.recordIdx*r.recordSize
 	fieldStart := recStart + r.nullFlagBytes + r.extraBytes
 	r.recordIdx++ // advance for next call to Next()
+
 	return Record{
-		reader:     r,
-		nullFlags:  r.pageData[recStart : recStart+r.nullFlagBytes],
-		fieldData:  r.pageData[fieldStart : fieldStart+r.fieldDataSize],
+		reader:    r,
+		nullFlags: r.pageData[recStart : recStart+r.nullFlagBytes],
+		fieldData: r.pageData[fieldStart : fieldStart+r.fieldDataSize],
 	}
 }
 
@@ -145,8 +157,10 @@ func (rec Record) IsNull(col int) bool {
 	if col < 0 || col >= len(rec.reader.schema.Columns) {
 		return true
 	}
+
 	byteIdx := col / 8
 	bitIdx := uint(col % 8)
+
 	if byteIdx >= len(rec.nullFlags) {
 		return true
 	}
@@ -189,6 +203,7 @@ func (rec Record) String(col int) string {
 	for end < len(raw) && raw[end] != 0 {
 		end++
 	}
+
 	if end == 0 {
 		return ""
 	}
@@ -198,6 +213,7 @@ func (rec Record) String(col int) string {
 	if err != nil {
 		return string(raw[:end]) // fallback
 	}
+
 	return string(decoded)
 }
 
@@ -227,6 +243,7 @@ func (rec Record) Time(col int) time.Time {
 		days := int32(binary.LittleEndian.Uint32(rec.fieldData[off : off+4]))
 		ms := int32(binary.LittleEndian.Uint32(rec.fieldData[off+4 : off+8]))
 		t := delphiDateToTime(days)
+
 		return t.Add(time.Duration(ms) * time.Millisecond)
 	default:
 		return time.Time{}
@@ -239,6 +256,7 @@ func (rec Record) Bytes(col int) []byte {
 	sz := rec.reader.fieldStoreSizes[col]
 	result := make([]byte, sz)
 	copy(result, rec.fieldData[off:off+sz])
+
 	return result
 }
 
@@ -251,12 +269,14 @@ func (r *Reader) computeLayout() {
 	r.fieldOffsets = make([]int, len(cols))
 	r.fieldStoreSizes = make([]int, len(cols))
 	offset := 0
+
 	for i, c := range cols {
 		sz := r.fieldStoreSize(c)
 		r.fieldOffsets[i] = offset
 		r.fieldStoreSizes[i] = sz
 		offset += sz
 	}
+
 	r.fieldDataSize = offset
 
 	// Detect the actual record size and null flag bytes by scanning the first data page.
@@ -322,6 +342,7 @@ func (r *Reader) detectRecordLayout() {
 	if err != nil {
 		return
 	}
+
 	d := page.PageData()
 	if len(d) < 20 {
 		return
@@ -339,7 +360,7 @@ func (r *Reader) detectRecordLayout() {
 
 	for pageHdr := 3; pageHdr <= 10; pageHdr++ {
 		for nullBytes := 2; nullBytes <= 6; nullBytes++ {
-			for extra := 0; extra <= 4; extra++ {
+			for extra := range 5 {
 				recSize := nullBytes + extra + r.fieldDataSize
 				if recSize <= 0 {
 					continue
@@ -364,6 +385,7 @@ func (r *Reader) detectRecordLayout() {
 					r.extraBytes = extra
 					r.recordSize = recSize
 					r.pageHdrSize = pageHdr
+
 					return
 				}
 			}
@@ -381,10 +403,12 @@ func (r *Reader) loadPage() error {
 	if r.pageIdx >= len(r.dataPages) {
 		return ErrNoMoreRows
 	}
+
 	page, err := r.db.ReadPage(r.dataPages[r.pageIdx])
 	if err != nil {
 		return err
 	}
+
 	r.pageData = page.PageData()
 	r.recordIdx = 0
 
@@ -395,6 +419,7 @@ func (r *Reader) loadPage() error {
 	} else {
 		r.maxRecs = 0
 	}
+
 	return nil
 }
 
@@ -405,6 +430,7 @@ func (r *Reader) isRecordPresent(recStart int) bool {
 			return true
 		}
 	}
+
 	return false
 }
 

@@ -1,6 +1,7 @@
 package absdb
 
 import (
+	"errors"
 	"math"
 	"testing"
 )
@@ -17,6 +18,7 @@ func TestTS03ReadRecords(t *testing.T) {
 	for reader.Next() {
 		records = append(records, reader.Record())
 	}
+
 	if err := reader.Err(); err != nil {
 		t.Fatalf("iteration error: %v", err)
 	}
@@ -40,6 +42,7 @@ func TestTS03ReadRecords(t *testing.T) {
 	// Column 1: Name (String/40) - first train type name.
 	name := rec.String(1)
 	t.Logf("Record 0: AutoInc=%d, Name=%q", autoInc, name)
+
 	if name == "" {
 		t.Error("record 0 Name is empty")
 	}
@@ -47,6 +50,7 @@ func TestTS03ReadRecords(t *testing.T) {
 	// Column 2: SBA (Double) - should be a reasonable float.
 	sba := rec.Float(2)
 	t.Logf("Record 0: SBA=%f", sba)
+
 	if math.IsNaN(sba) || math.IsInf(sba, 0) {
 		t.Errorf("record 0 SBA = %f, expected a finite number", sba)
 	}
@@ -57,6 +61,7 @@ func TestTS03ReadRecords(t *testing.T) {
 		n := r.String(1)
 		s := r.Float(2)
 		t.Logf("  [%2d] AutoInc=%d Name=%-25q SBA=%.1f", i, ai, n, s)
+
 		_ = schema
 	}
 }
@@ -70,12 +75,15 @@ func TestTS03RecordCount(t *testing.T) {
 	}
 
 	count := 0
+
 	for reader.Next() {
 		reader.Record()
+
 		count++
 	}
 
 	t.Logf("TS03 record count: %d", count)
+
 	if count < 15 {
 		t.Errorf("expected at least 15 records, got %d", count)
 	}
@@ -93,6 +101,7 @@ func TestRREC0011ReadRecords(t *testing.T) {
 	for reader.Next() {
 		records = append(records, reader.Record())
 	}
+
 	if err := reader.Err(); err != nil {
 		t.Fatalf("iteration error: %v", err)
 	}
@@ -126,6 +135,7 @@ func TestRREC0011ReadRecords(t *testing.T) {
 		if i >= 5 {
 			break
 		}
+
 		recno := r.Int(0)
 		n := r.String(5)
 		xv := r.Float(10)
@@ -138,7 +148,7 @@ func TestAddressesNoData(t *testing.T) {
 	db := openTestFile(t, "Addresses.abs")
 
 	_, err := db.OpenTable()
-	if err != ErrNoData {
+	if !errors.Is(err, ErrNoData) {
 		t.Errorf("expected ErrNoData, got %v", err)
 	}
 }
