@@ -285,27 +285,27 @@ func (f *File) Schema(table string) (*TableSchema, error)
 
 ### Steps
 
-- [ ] Locate data pages for a table (using page scan or catalog pointers)
-- [ ] Calculate record size from schema (sum of field storage sizes + trailer)
-- [ ] Implement record iteration: walk data pages, extract fixed-size records
-- [ ] Implement field value deserialization for all numeric types:
-  - [ ] Integer (int32 LE)
-  - [ ] SmallInt (int16 LE)
-  - [ ] Word (uint16 LE)
-  - [ ] LargeInt (int64 LE)
-  - [ ] Float (float64 LE)
-  - [ ] Currency (int64 LE / 10000)
-  - [ ] AutoInc (uint32 LE)
-- [ ] Implement String field deserialization (Windows-1252, null-terminated, fixed-length)
-- [ ] Implement WideString deserialization (UTF-16LE, fixed-length)
-- [ ] Implement Date/Time/DateTime deserialization (Delphi TDateTime → Go time.Time)
-- [ ] Implement Logical/Boolean deserialization
-- [ ] Implement GUID deserialization
-- [ ] Handle null values (detect null marker vs zero)
-- [ ] Skip deleted records (detect deletion flag in record header/trailer)
-- [ ] Test: read all 20 records from TS03.abs, verify train type names and parameters
-- [ ] Test: read receiver results from RREC0011.abs
-- [ ] Test: read contributions from RCON0011.abs (40 columns, 15 records)
+- [x] Locate data pages for a table (page type 10 scan)
+- [x] Calculate record size from schema (auto-detected from data page patterns)
+- [x] Implement record iteration: walk data pages, extract fixed-size records
+- [x] Implement field value deserialization for numeric types:
+  - [x] Integer (int32 LE)
+  - [x] LargeInt (int64 LE)
+  - [x] Float (float64 LE)
+  - [x] AutoInc (uint32 LE)
+  - [ ] SmallInt (int16 LE) — type defined, untested
+  - [ ] Word (uint16 LE) — type defined, untested
+  - [ ] Currency (int64 LE / 10000) — type defined, untested
+- [x] Implement String field deserialization (Windows-1252 → UTF-8, null-terminated)
+- [ ] Implement WideString deserialization (UTF-16LE) — type defined, untested
+- [x] Implement Date/Time/DateTime deserialization (Delphi int32 epoch → Go time.Time)
+- [x] Implement Logical/Boolean deserialization (WordBool)
+- [ ] Implement GUID deserialization — deferred
+- [x] Handle null values (null flag bitmask per record)
+- [x] Skip deleted records (zero null flags = empty slot)
+- [x] Test: read all 18 records from TS03.abs, verify train type names and SBA values
+- [x] Test: read receiver results from RREC0011.abs (27 records, coordinates verified)
+- [ ] Test: read contributions from RCON0011.abs (40 columns, 15 records) — deferred
 
 ### API sketch
 
