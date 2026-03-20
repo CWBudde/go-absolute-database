@@ -64,6 +64,12 @@ type File struct {
 	state            int32
 	writeChangeState byte
 	encrypted        bool
+
+	// Parsed from TABSCryptoHeader (nil if not encrypted).
+	cryptoHeader *CryptoHeader
+
+	// Derived from password; nil if not encrypted or no password provided.
+	decryptionKey []byte
 }
 
 // Open opens an Absolute Database file for reading.
@@ -80,6 +86,29 @@ func Open(path string) (*File, error) {
 		f.Close()
 		return nil, err
 	}
+
+	return db, nil
+}
+
+// OpenWithPassword opens an encrypted Absolute Database file.
+// If the file is not encrypted, the password is ignored.
+// Returns ErrWrongPassword if the password doesn't match.
+func OpenWithPassword(path, password string) (*File, error) {
+	db, err := Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if !db.encrypted {
+		return db, nil
+	}
+
+	if !db.VerifyPassword(password) {
+		db.Close()
+		return nil, ErrWrongPassword
+	}
+
+	db.decryptionKey = deriveKey(db.cryptoHeader.Algorithm, password)
 
 	return db, nil
 }
@@ -127,7 +156,19 @@ func (db *File) ReadPage(n int) (Page, error) {
 		Number: n,
 		Data:   data,
 	}
-	page.Header = parseDiskPageHeader(data)
+
+	// Decrypt if needed. Page 0 is never encrypted; empty pages are not encrypted.
+	if n > 0 && db.decryptionKey != nil && !page.IsEmpty() {
+		decrypted, decErr := decryptCBC(db.decryptionKey, data)
+		if decErr != nil {
+			return Page{}, fmt.Errorf("absdb: decrypting page %d: %w", n, decErr)
+		}
+
+		page.Data = decrypted
+	}
+
+	// Parse ABSP header after decryption (it's encrypted on non-zero pages).
+	page.Header = parseDiskPageHeader(page.Data)
 
 	return page, nil
 }
@@ -189,6 +230,15 @@ func (db *File) parseHeader() error {
 
 	if db.size < int64(db.pageSize) {
 		return ErrTruncated
+	}
+
+	// Parse CryptoHeader if encrypted.
+	if db.encrypted {
+		page0 := make([]byte, db.pageSize)
+		if _, err := db.f.ReadAt(page0, 0); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("absdb: reading page 0 for crypto header: %w", err)
+		}
+		db.cryptoHeader = parseCryptoHeader(page0)
 	}
 
 	return nil

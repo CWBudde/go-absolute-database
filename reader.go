@@ -102,9 +102,8 @@ func (r *Reader) Next() bool {
 
 	for {
 		if r.recordIdx < r.maxRecs {
-			// Check if this record slot is actually populated (non-zero null flags).
 			recStart := r.pageHeaderSize() + r.recordIdx*r.recordSize
-			if recStart+r.recordSize <= len(r.pageData) && r.isRecordPresent(recStart) {
+			if recStart+r.recordSize <= len(r.pageData) && r.isRecordPresent(r.recordIdx) {
 				return true
 			}
 
@@ -350,54 +349,43 @@ func (r *Reader) detectRecordLayout() {
 		return
 	}
 
-	// Try candidate combinations. The page header can be large (up to ~50 bytes)
-	// because it contains a bitmap of occupied record slots.
-	for pageHdr := 2; pageHdr <= 50; pageHdr++ {
-		for nullBytes := 1; nullBytes <= 6; nullBytes++ {
-			for extra := range 5 {
-				recSize := nullBytes + extra + r.fieldDataSize
-				if recSize <= 0 {
-					continue
-				}
+	expectedNullBytes := (len(r.schema.Columns) + 2 + 7) / 8
+	bestScore := math.MinInt
+	bestPageHdr := 0
+	bestExtra := 0
 
-				// Record 0 first field at: pageHdr + nullBytes + extra
-				rec1Off := pageHdr + nullBytes + extra
-				// Record 1 first field at: pageHdr + recSize + nullBytes + extra
-				rec2Off := pageHdr + recSize + nullBytes + extra
+	for pageHdr := 1; pageHdr <= 64 && pageHdr < len(d); pageHdr++ {
+		if r.countPresentSlots(d, pageHdr) == 0 {
+			continue
+		}
 
-				if rec2Off+4 > len(d) {
-					continue
-				}
+		for extra := 0; extra <= 8; extra++ {
+			recSize := expectedNullBytes + extra + r.fieldDataSize
+			if recSize <= 0 || pageHdr+recSize > len(d) {
+				continue
+			}
 
-				val1 := binary.LittleEndian.Uint32(d[rec1Off : rec1Off+4])
-				val2 := binary.LittleEndian.Uint32(d[rec2Off : rec2Off+4])
-
-				// For the first field (typically AutoInc or RecNo), expect
-				// small positive integers, often sequential.
-				if val1 >= 1 && val1 <= 100 && val2 >= 1 && val2 <= 100 {
-					// Extra validation: the null flag byte(s) before the
-					// field data should be non-zero (record is present).
-					rec1Start := pageHdr
-					if d[rec1Start] == 0 {
-						continue
-					}
-
-					r.nullFlagBytes = nullBytes
-					r.extraBytes = extra
-					r.recordSize = recSize
-					r.pageHdrSize = pageHdr
-
-					return
-				}
+			score := r.scoreLayoutCandidate(d, pageHdr, expectedNullBytes, extra, recSize)
+			if score > bestScore {
+				bestScore = score
+				bestPageHdr = pageHdr
+				bestExtra = extra
 			}
 		}
 	}
 
-	// Fallback: use minimal null flags.
-	r.nullFlagBytes = (len(r.schema.Columns) + 2 + 7) / 8
+	if bestPageHdr != 0 {
+		r.nullFlagBytes = expectedNullBytes
+		r.extraBytes = bestExtra
+		r.recordSize = r.nullFlagBytes + r.extraBytes + r.fieldDataSize
+		r.pageHdrSize = bestPageHdr
+		return
+	}
+
+	r.nullFlagBytes = expectedNullBytes
 	r.extraBytes = 0
 	r.recordSize = r.nullFlagBytes + r.extraBytes + r.fieldDataSize
-	r.pageHdrSize = r.nullFlagBytes + 2
+	r.pageHdrSize = 1
 }
 
 func (r *Reader) loadPage() error {
@@ -415,8 +403,8 @@ func (r *Reader) loadPage() error {
 
 	// Calculate max records that fit in the page data area.
 	usable := len(r.pageData) - r.pageHeaderSize()
-	if usable > 0 && r.recordSize > 0 {
-		r.maxRecs = usable / r.recordSize
+	if usable > 0 && r.recordSize > 0 && r.pageHdrSize > 0 {
+		r.maxRecs = r.pageHdrSize * 8
 	} else {
 		r.maxRecs = 0
 	}
@@ -424,15 +412,168 @@ func (r *Reader) loadPage() error {
 	return nil
 }
 
-func (r *Reader) isRecordPresent(recStart int) bool {
-	// Check if any null flag byte is non-zero (indicates an active record).
-	for i := range r.nullFlagBytes {
-		if r.pageData[recStart+i] != 0 {
-			return true
+func (r *Reader) isRecordPresent(slot int) bool {
+	byteIdx := slot / 8
+	if byteIdx < 0 || byteIdx >= r.pageHdrSize || byteIdx >= len(r.pageData) {
+		return false
+	}
+
+	bitIdx := uint(slot % 8)
+	return r.pageData[byteIdx]&(1<<bitIdx) != 0
+}
+
+func (r *Reader) countPresentSlots(pageData []byte, pageHdr int) int {
+	if pageHdr <= 0 || pageHdr > len(pageData) {
+		return 0
+	}
+
+	count := 0
+	for slot := 0; slot < pageHdr*8; slot++ {
+		if pageData[slot/8]&(1<<uint(slot%8)) != 0 {
+			count++
 		}
 	}
 
-	return false
+	return count
+}
+
+func (r *Reader) scoreLayoutCandidate(pageData []byte, pageHdr, nullBytes, extra, recSize int) int {
+	score := 0
+	firstValues := make([]uint32, 0, 4)
+	recordsScored := 0
+
+	for slot := 0; slot < pageHdr*8 && recordsScored < 4; slot++ {
+		if pageData[slot/8]&(1<<uint(slot%8)) == 0 {
+			continue
+		}
+
+		recStart := pageHdr + slot*recSize
+		if recStart+recSize > len(pageData) {
+			return math.MinInt / 2
+		}
+
+		fieldStart := recStart + nullBytes + extra
+		if fieldStart+r.fieldDataSize > len(pageData) {
+			return math.MinInt / 2
+		}
+
+		recScore, firstValue := r.scoreRecordData(pageData[fieldStart : fieldStart+r.fieldDataSize])
+		score += recScore
+		firstValues = append(firstValues, firstValue)
+		recordsScored++
+	}
+
+	if recordsScored == 0 {
+		return math.MinInt / 2
+	}
+
+	score += recordsScored * 8
+	for i := 1; i < len(firstValues); i++ {
+		switch {
+		case firstValues[i] == firstValues[i-1]+1:
+			score += 10
+		case firstValues[i] > firstValues[i-1]:
+			score += 3
+		default:
+			score -= 8
+		}
+	}
+
+	return score
+}
+
+func (r *Reader) scoreRecordData(fieldData []byte) (int, uint32) {
+	score := 0
+	firstValue := uint32(0)
+	haveFirstValue := false
+
+	for i, c := range r.schema.Columns {
+		off := r.fieldOffsets[i]
+		sz := r.fieldStoreSizes[i]
+		raw := fieldData[off : off+sz]
+
+		switch c.BaseType {
+		case BftInt32, BftUint32:
+			v := binary.LittleEndian.Uint32(raw)
+			if !haveFirstValue {
+				firstValue = v
+				haveFirstValue = true
+			}
+			if v <= 1_000_000_000 {
+				score += 3
+			} else {
+				score -= 8
+			}
+		case BftLogical:
+			v := binary.LittleEndian.Uint16(raw)
+			if v == 0 || v == 1 {
+				score += 3
+			} else {
+				score -= 8
+			}
+		case BftVarchar, BftChar:
+			end := 0
+			for end < len(raw) && raw[end] != 0 {
+				end++
+			}
+
+			if end == 0 {
+				score--
+				continue
+			}
+
+			printable := 0
+			for _, b := range raw[:end] {
+				if b >= 32 || b >= 0x80 {
+					printable++
+				}
+			}
+			if printable*100 >= end*85 {
+				score += 6
+			} else {
+				score -= 8
+			}
+		case BftDouble:
+			bits := binary.LittleEndian.Uint64(raw)
+			v := math.Float64frombits(bits)
+			switch {
+			case bits == 0:
+				score += 1
+			case math.IsNaN(v) || math.IsInf(v, 0):
+				score -= 10
+			default:
+				abs := math.Abs(v)
+				if abs < 1e-100 || abs > 1e100 {
+					score -= 3
+				} else {
+					score += 2
+				}
+			}
+		case BftBlob, BftClob, BftWideClob:
+			ref := readBlobRef(raw)
+			switch {
+			case ref.IsNull():
+				score++
+			case int(ref.PageNo) < 0 || int(ref.PageNo) >= r.db.PageCount():
+				score -= 12
+			default:
+				page, err := r.db.ReadPage(int(ref.PageNo))
+				if err != nil || page.Header == nil || page.Header.PageType != PageTypeBlob {
+					score -= 12
+				} else if ref.ItemNo <= 8 {
+					score += 8
+				} else {
+					score += 4
+				}
+			}
+		}
+	}
+
+	if !haveFirstValue {
+		return math.MinInt / 2, 0
+	}
+
+	return score, firstValue
 }
 
 // delphiDateToTime converts a Delphi date integer to time.Time.
