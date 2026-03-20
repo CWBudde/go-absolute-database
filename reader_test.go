@@ -152,3 +152,101 @@ func TestAddressesNoData(t *testing.T) {
 		t.Errorf("expected ErrNoData, got %v", err)
 	}
 }
+
+func TestRRAIEmissionFiles(t *testing.T) {
+	files := []string{
+		"RRAI0011.abs",
+		"RRAI0012.abs",
+		"RRAI0023.abs",
+	}
+
+	for _, name := range files {
+		t.Run(name, func(t *testing.T) {
+			db := openTestFile(t, name)
+
+			reader, err := db.OpenTable()
+			if err != nil {
+				t.Fatalf("OpenTable(): %v", err)
+			}
+
+			if !reader.Next() {
+				t.Fatal("expected at least one record")
+			}
+
+			rec := reader.Record()
+			if err := reader.Err(); err != nil {
+				t.Fatalf("iteration error: %v", err)
+			}
+
+			if got := rec.Uint32(0); got != 1 {
+				t.Fatalf("IDX = %d, want 1", got)
+			}
+
+			if got := rec.Int(1); got <= 0 {
+				t.Fatalf("ObjID = %d, want > 0", got)
+			}
+
+			if got := rec.String(2); got == "" {
+				t.Fatal("Railname is empty")
+			}
+
+			for _, col := range []int{3, 4, 10, 11} {
+				v := rec.Float(col)
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					t.Fatalf("col %d = %v, want finite", col, v)
+				}
+			}
+		})
+	}
+}
+
+func TestRRADEmissionFiles(t *testing.T) {
+	files := []string{
+		"RRAD0011.abs",
+		"RRAD0012.abs",
+		"RRAD0023.abs",
+	}
+
+	for _, name := range files {
+		t.Run(name, func(t *testing.T) {
+			db := openTestFile(t, name)
+
+			reader, err := db.OpenTable()
+			if err != nil {
+				t.Fatalf("OpenTable(): %v", err)
+			}
+
+			if !reader.Next() {
+				t.Fatal("expected at least one record")
+			}
+
+			rec := reader.Record()
+			if err := reader.Err(); err != nil {
+				t.Fatalf("iteration error: %v", err)
+			}
+
+			if got := rec.Uint32(0); got != 1 {
+				t.Fatalf("No = %d, want 1", got)
+			}
+
+			if got := rec.Int(1); got <= 0 {
+				t.Fatalf("IDX = %d, want > 0", got)
+			}
+
+			if got := rec.String(2); got == "" {
+				t.Fatal("Trainname is empty")
+			}
+
+			if rec.Bool(9) {
+				t.Fatal("Max = true, want false for first record")
+			}
+
+			for _, col := range []int{3, 4, 6, 10, 11} {
+				v := rec.Float(col)
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					t.Fatalf("col %d = %v, want finite", col, v)
+				}
+			}
+		})
+	}
+}
