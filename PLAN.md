@@ -372,6 +372,25 @@ func (rec Record) Bytes(col int) []byte
 
 ---
 
+## Phase 5b — Fix record layout detection for v7.61 emission files
+
+**Goal:** The auto-detect heuristic in `detectRecordLayout` (reader.go) fails for certain v7.61 `.abs` files — specifically RRAI*.abs (rail emission) and RRAD*.abs (train emission) files from SoundPlan result directories. These files have schemas with AutoInc + Integer + String + multiple Double columns, but the reader returns zeros/garbage for all numeric fields. RGRP*.abs and RREC*.abs files of the same version work correctly.
+
+**Symptom:** `absdb dump` on RRAI0011.abs shows all-null or garbage values for IDX, ObjID, Railname, and all Double columns. The schema is parsed correctly (12 columns: AutoInc, Integer, String/40, 9×Double). The issue is that `detectRecordLayout` picks incorrect pageHdrSize, nullFlagBytes, or extraBytes for these files, causing field offsets to be wrong.
+
+**Approach:**
+
+- [x] Compare the working v7.61 files (RGRP, RREC) against the broken ones (RRAI, RRAD) to identify what differs in page structure
+- [x] Hex-dump the first data page of RRAI0011.abs and manually locate the first record's AutoInc=1 value to determine the correct page header size and record stride
+- [x] Improve `detectRecordLayout` to handle the variant page header format, or add a fallback that uses the schema's expected field sizes to validate candidates
+- [x] Test against all .abs files in `../Aconiq/interoperability/Schienenprojekt - Schall 03/`
+
+Implemented in repo with regression coverage for local fixtures: `RRAI0011.abs`, `RRAI0012.abs`, `RRAI0023.abs`, `RRAD0011.abs`, `RRAD0012.abs`, `RRAD0023.abs`.
+
+**Test files:** `RSPS0011/RRAI0011.abs`, `RSPS0011/RRAD0011.abs`, `RRLK0022/RRAI0022.abs`, `RRLK0022/RRAD0022.abs`
+
+---
+
 ## Phase 6 — Encryption support (read-only)
 
 **Goal:** Open encrypted `.abs` files given a password.
