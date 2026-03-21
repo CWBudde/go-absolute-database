@@ -14,7 +14,7 @@ const (
 )
 
 var (
-	ErrNoIndex  = errors.New("absdb: no index found")
+	ErrNoIndex     = errors.New("absdb: no index found")
 	ErrKeyNotFound = errors.New("absdb: key not found")
 )
 
@@ -22,8 +22,8 @@ var (
 type BTreePageHeader struct {
 	IsRoot         bool
 	IsLeaf         bool
-	LeftPageNo     int32  // left sibling page (-1 = none)
-	RightPageNo    int32  // right sibling page (-1 = none)
+	LeftPageNo     int32 // left sibling page (-1 = none)
+	RightPageNo    int32 // right sibling page (-1 = none)
 	HasKeys        bool
 	HasSuffixes    bool
 	KeyPrefixSize  uint16 // key size per entry (short key)
@@ -33,9 +33,9 @@ type BTreePageHeader struct {
 
 // BTreeEntry is a single entry in an index page.
 type BTreeEntry struct {
-	Key    []byte  // key bytes (KeyPrefixSize bytes)
-	PageNo int32   // referenced page number
-	ItemNo uint16  // referenced item number within the page
+	Key    []byte // key bytes (KeyPrefixSize bytes)
+	PageNo int32  // referenced page number
+	ItemNo uint16 // referenced item number within the page
 }
 
 // RecordID returns the entry's reference as a (PageNo, ItemNo) pair.
@@ -45,10 +45,10 @@ func (e BTreeEntry) RecordID() (int32, uint16) {
 
 // IndexInfo describes a discovered index.
 type IndexInfo struct {
-	RootPageNo int    // root page of the B-tree
-	KeySize    int    // key size in bytes
-	EntryCount int    // total entries (for root-only trees)
-	IsInternal bool   // true for system indexes (RecordPage, BlobPage)
+	RootPageNo int  // root page of the B-tree
+	KeySize    int  // key size in bytes
+	EntryCount int  // total entries (for root-only trees)
+	IsInternal bool // true for system indexes (RecordPage, BlobPage)
 }
 
 // parseBTreeHeader reads the TABSBTreePageHeader from index page data.
