@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	absdb "github.com/meko-tech/go-absolute-database"
+	absdb "github.com/cwbudde/go-absolute-database"
 	"github.com/spf13/cobra"
 )
 
