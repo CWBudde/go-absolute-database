@@ -15,7 +15,7 @@ go test -fuzz FuzzName ./...     # Fuzz testing
 
 ## Architecture
 
-- Single Go module: `github.com/meko-tech/go-absolute-database`
+- Single Go module: `github.com/cwbudde/go-absolute-database`
 - No external dependencies for core read path (stdlib only)
 - Page-based I/O: all file access goes through page reads
 - Lazy loading: only read pages when accessed

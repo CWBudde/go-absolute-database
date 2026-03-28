@@ -3,6 +3,7 @@
 *.test
 *.out
 absdb
+!absdb/
 
 # IDE
 .idea/
