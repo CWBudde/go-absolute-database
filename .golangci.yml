@@ -30,6 +30,7 @@ linters:
   enable:
     - wsl_v5
 
+    - revive
   settings:
     cyclop:
       max-complexity: 15
@@ -47,6 +48,13 @@ linters:
       allow-whole-block: false
       branch-max-lines: 2
       disable: [decl]
+    revive:
+      rules:
+        - name: file-length-limit
+          arguments:
+            - max: 1500
+              skip-comments: false
+              skip-blank-lines: false
 
   exclusions:
     generated: lax
@@ -54,21 +62,7 @@ linters:
 
     rules:
       # test files are more relaxed
-      - linters:
-          [
-            funlen,
-            cyclop,
-            gocognit,
-            maintidx,
-            wrapcheck,
-            dupl,
-            noctx,
-            forcetypeassert,
-            gosec,
-            thelper,
-            usetesting,
-            goconst,
-          ]
+      - linters: [funlen, cyclop, gocognit, maintidx, wrapcheck, dupl, noctx, forcetypeassert, gosec, thelper, usetesting, goconst]
         path: _test\.go
 
       # wrapcheck too noisy in internal packages
