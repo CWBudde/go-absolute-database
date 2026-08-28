@@ -10,8 +10,8 @@ validated against real customer files — run `just test` locally for that.
 ## The committed fixtures
 
 Three sets are committed: the eight `Employees-*.abs` files, one per encryption algorithm,
-the eleven `Writes*.abs` files that pin the write path, and the two `MultiTable*.abs` files
-that pin the table catalog.
+the eleven `Writes*.abs` files that pin the write path, and the six `MultiTable*.abs` files
+that pin the table catalog and the schema operations over it.
 
 ### `Employees-*.abs` — one per encryption algorithm
 
@@ -117,16 +117,33 @@ They contain no customer data and no vendor material, checked the same way as th
 `Employees-*` files: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the table
 name and the invented row values.
 
-### `MultiTable*.abs` — the table catalog
+### `MultiTable*.abs` — the table catalog and the schema operations over it
 
-Two unencrypted files, the only ones in the corpus holding more than one table. Every other
+Six unencrypted files, the only ones in the corpus holding more than one table. Every other
 fixture, customer files included, has exactly one, which is why the multi-table bug they
 close survived unnoticed for so long.
 
-| File                  | Made from        | Contents                                           |
-| --------------------- | ---------------- | -------------------------------------------------- |
-| `MultiTable.abs`      | created fresh    | `Alpha`, `Beta`, `Gamma` + `CREATE INDEX` on Alpha |
-| `MultiTable-drop.abs` | `MultiTable.abs` | the same, then `DROP TABLE Beta`                   |
+| File                        | Made from               | Contents                                           |
+| --------------------------- | ----------------------- | -------------------------------------------------- |
+| `MultiTable.abs`            | created fresh           | `Alpha`, `Beta`, `Gamma` + `CREATE INDEX` on Alpha |
+| `MultiTable-drop.abs`       | `MultiTable.abs`        | the same, then `DROP TABLE Beta`                   |
+| `MultiTable-dropfirst.abs`  | `MultiTable.abs`        | the same, then `DROP TABLE Alpha`                  |
+| `MultiTable-droplast.abs`   | `MultiTable.abs`        | the same, then `DROP TABLE Gamma`                  |
+| `MultiTable-create.abs`     | `MultiTable.abs`        | the same, then `CREATE TABLE Delta (X, Y)`         |
+| `MultiTable-createdrop.abs` | `MultiTable-create.abs` | the same, then `DROP TABLE Delta`                  |
+
+The last four are what `TestDropTableMatchesEngineByteForByte` holds the drop to, and each
+covers something the original pair could not. Dropping `Alpha` rewrites every catalog entry
+behind it and frees the file's highest page, so `LastUsedPageNo` has to move; dropping
+`Gamma` rewrites none; dropping `Delta`, which was created and never inserted into, is the
+only case of a table that owns no data page at all, so its index page can only be found by
+reading the page number out of its column definitions.
+
+`MultiTable-create.abs` earns its place twice over. Besides being the base of the
+`createdrop` case, it is the only evidence for what `CREATE TABLE` allocates: five pages
+(two for the table's system internal file, one each for the column definitions, the
+counters and the record page index) and **no data page** — that arrives with the first
+insert.
 
 The three tables are deliberately different shapes, so that anything reading one through
 another's schema is obvious rather than subtle:
@@ -147,11 +164,13 @@ the eleven `Writes*` fixtures structurally could not: the table info counters we
 fixed offsets that are correct only for a four-column table, and every write fixture has
 four columns. See PLAN.md, Phase 7.
 
-`MultiTable-drop.abs` is the same size as its parent and differs by 45 bytes. It records
-that `DROP TABLE` tombstones the dropped table's pages (`ABSP` `State` = `0x7FFFFFFF`)
-rather than erasing them, and that it compacts the catalog while leaving the last entry
-duplicated at the end — so a parser that ignores the catalog's length field reports the
-surviving table twice.
+`MultiTable-drop.abs` is the same size as its parent and differs by 45 bytes; the other
+drops differ by 61, 34 and 29. They record that `DROP TABLE` tombstones the dropped
+table's pages (`ABSP` `State` = `0x7FFFFFFF`) rather than erasing them, and that it
+compacts the catalog while leaving the last entry duplicated at the end — so a parser that
+ignores the catalog's length field reports the surviving table twice. Between them they
+also pin the two allocation maps: the Page Free Space bitmap on page 0 and the Extent
+Allocation Map on page 1. See PLAN.md, Phase 8.
 
 They contain no customer data and no vendor material, checked the same way as the other
 committed fixtures: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the three
@@ -160,8 +179,16 @@ invented table names and the invented row values, and no UTF-16 strings at all.
 ## Regenerating them
 
 They can be recreated on Linux by driving `DBManager.exe` from the SDK under Wine with a
-virtual desktop. Two things make it much easier than it first appears:
+virtual desktop. Three things make it much easier than it first appears:
 
+- `DBManager.exe` takes the database path as `argv[1]` and opens it, which skips the
+  `File → Open Database` dialog entirely. Its window title then reads
+  `AbsDb Manager {path}`, which is also how a script can check that the open succeeded.
+- The main window's own **SQL** tab is a plain editor with an execute button on its
+  toolbar, and the **Log** tab below reports `Ok.` or the error. Typing a statement there
+  with `xdotool type` and clicking the button is markedly more robust than driving
+  `SQL → Execute SQL Script` through a file dialog: no file to write, no dialog
+  coordinates to get right, and the result is legible in one screenshot.
 - `SQL → Execute SQL Script` runs a whole semicolon-separated `.sql` file in one pass, so
   the `CREATE TABLE` / `INSERT` / `CREATE INDEX` statements above need no per-statement
   typing.
@@ -173,9 +200,8 @@ Verify the result by reading the file rather than by screenshot: byte 43 is the
 `Encrypted` flag and byte 78 is the algorithm, which must match the table above.
 
 The `Writes*` and `MultiTable*` files use the same route with the encryption checkbox left
-off, plus `File → Open Database` to reopen the copy before running each single-statement
-script. `DBManager.exe` also accepts the database path as `argv[1]`, which skips that
-dialog entirely.
+off, opening a copy of the parent through `argv[1]` and typing the one statement into the
+SQL tab.
 Verify those by bytes too: a derived file must actually differ from its parent
 (`cmp -l parent child | wc -l`), because a script that silently failed to run produces a
 file that is byte-identical to its parent and looks like a valid fixture.

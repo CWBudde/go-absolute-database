@@ -1467,10 +1467,19 @@ leaf that has to split, are not covered by any fixture**, which is why index mai
 still refused rather than half-implemented. Producing those two fixtures is the first step
 of the work, not an afterthought to it.
 
-Also worth recording: `CREATE INDEX IdxId` stores the name `IdxId` nowhere in the file, as
-ASCII or as UTF-16. The index exists only as an extra index page. That is consistent with
-`IndexInfo` carrying no name, and it means an index cannot be addressed by name when the
-time comes.
+Also worth recording, and **a correction to what this section used to say**: an index's
+name _is_ stored. `Writes-idx.abs` holds `IdxId`, and `MultiTable.abs` holds `IdxAlphaId`,
+in the table's own internal file of column definitions, after the last column. The earlier
+claim that the name appears "nowhere in the file, as ASCII or as UTF-16" came from
+scanning the file with `strings`, and that internal file is zlib-compressed, so no scan of
+the raw bytes could ever have found it. `IndexInfo` carrying no name is a gap in this
+package, not in the format, and `DROP INDEX developers.UniqueName` in the SDK's own sample
+scripts is the engine addressing an index by exactly that name.
+
+The end of that same internal file is what Phase 8 reads to find a table's pages: its last
+two `int32`s are the root page of the index over the table's data pages and the root of
+the index over its BLOB pages, the second being `-1` for a table with no BLOB column. See
+Phase 8.
 
 ### Scope boundaries, each an error rather than a silent success
 
@@ -1501,13 +1510,120 @@ time comes.
 
 ### Steps
 
-- [ ] Implement `CREATE TABLE` — allocate pages, write schema, create initial data page
-- [ ] Implement `ALTER TABLE ADD COLUMN` — update schema, pad existing records
-- [ ] Implement `ALTER TABLE DROP COLUMN` — update schema, compact records
-- [ ] Implement `CREATE INDEX` — build B-tree from existing data
-- [ ] Implement `DROP INDEX` — remove index pages, update catalog
+- [x] Decode the allocation model — the two maps every schema operation has to keep
+- [x] Implement `DROP TABLE` — tombstone its pages, compact the catalog, free the maps
+- [ ] Implement `CREATE TABLE` — allocate pages, write schema; blocked, see below
+- [ ] Implement `ALTER TABLE ADD COLUMN` — update schema, pad existing records; blocked
+- [ ] Implement `ALTER TABLE DROP COLUMN` — update schema, compact records; blocked
+- [ ] Implement `CREATE INDEX` — build B-tree from existing data; blocked
+- [ ] Implement `DROP INDEX` — remove index pages, update schema; blocked
 - [ ] Implement database compaction (defragment free space)
-- [ ] Test: create database from scratch, add tables, insert data, verify
+
+### What blocks the other five, and it is not the format
+
+Every schema operation except `DROP TABLE` rewrites the table's internal file of column
+definitions, and that file is **zlib-compressed**. Byte identity with the engine therefore
+requires reproducing the engine's deflate output exactly, and:
+
+- the engine's compressor is the **C zlib library at level 1**. All 34 compressed internal
+  files in the corpus are reproduced byte for byte by `zlib.compress(data, 1)`, and by no
+  other level;
+- **Go's `compress/zlib` reproduces none of them, at any level.** Go's level 1 is its own
+  fast encoder, not zlib's `deflate_fast`; the shortest schema in the corpus is 93 bytes
+  from zlib and 105 from Go.
+
+So `CREATE TABLE`, both `ALTER TABLE` forms, `CREATE INDEX` and `DROP INDEX` cannot meet
+the standard the rest of the write path is held to until this package carries a deflate
+encoder that is bit-compatible with zlib level 1. That is a bounded piece of work with an
+unusually good oracle attached: 34 real streams whose exact output is already known, plus
+every BLOB stream. It is the first step of the rest of Phase 8, the way fixtures were the
+first step of Phase 7.
+
+`DROP TABLE` is the one operation that never touches a compressed stream, because the
+table catalog it edits is stored uncompressed in every fixture.
+
+### The allocation model, decoded
+
+Pages 0 and 1 each carry a bitmap in their payload, and between them they are the free
+list. The names are the engine's own: `ABSDiskEngine.dcu` exports
+`GetPageUsageFromPFS`, `ABS_PAGE_IS_FREE`, `ABS_EXTENT_IS_FREE`,
+`ABS_EXTENT_IS_PARTIAL_USED` and `ABS_EXTENT_IS_FULL`.
+
+| Structure                       | Where                 | Layout                                                     |
+| ------------------------------- | --------------------- | ---------------------------------------------------------- |
+| **PFS** — Page Free Space       | payload of page 0     | 1 bit per page, LSB first, set while the page is allocated |
+| **EAM** — Extent Allocation Map | payload of page 1     | 2 bits per extent of `PageCountInExtent` (8) pages         |
+| `LastUsedPageNo`                | database header + 34  | the highest page still allocated                           |
+| `LastObjectID`                  | database header + 376 | the last object id handed out                              |
+
+`TestAllocationMapsDescribeEveryFixture` checks both maps against the page states they
+summarise, in every fixture. The check is deliberately asymmetric, and the asymmetry is
+the finding: a PFS bit is exact, but the EAM is only ever _downgraded_. Freeing pages
+turns a full extent into a partial one and **never** turns a partially used extent back
+into a free one, so "partial" claims nothing and only "full" and "free" can be asserted.
+Three `DROP TABLE`s in a row on `MultiTable.abs` advance page 1's State counter three
+times, not nine, because only the first found any full extent left to downgrade.
+
+Object ids are handed out one per table and one per column, which is why the three tables
+of `MultiTable.abs` have ids 1, 4 and 8 rather than 1, 2 and 3 — `Alpha` takes 1 and gives
+2 and 3 to its two columns, `Beta` takes 4 and gives 5, 6 and 7 to its three. A later
+`CREATE INDEX` took 11, and a later `CREATE TABLE Delta (X, Y)` took 12, 13 and 14, which
+is what moved `LastObjectID` from 11 to 14.
+
+### What `DROP TABLE` writes
+
+Measured on four one-statement diffs from `MultiTable.abs` (45, 61, 34 and 29 bytes), and
+reproduced byte for byte by `TestDropTableMatchesEngineByteForByte`:
+
+- every page the table owns is **tombstoned**: its ABSP `State` is set to `0x7FFFFFFF`.
+  Nothing is erased — the pages keep their type, their owner and their contents;
+- the catalog entry is removed by moving the entries behind it down and shortening the
+  internal file by one entry. The bytes past the new end are left alone, so the old last
+  entry survives as a stale duplicate that only the length field rules out;
+- the PFS loses one bit per freed page, and page 0's `State` advances **once per bit**, not
+  once for the write: dropping a seven-page table moves it by seven;
+- the EAM downgrades every extent that was full, and page 1's `State` advances once per
+  entry changed — so it is not written at all when nothing changes;
+- `LastUsedPageNo` follows the highest page still allocated, and the header `State`
+  advances once for the transaction.
+
+A table's pages are found without guessing at the layout. The catalog entry names its
+system internal file, its column definitions and its counters; the ABSP `ObjectID` names
+its data pages; the **last eight bytes of the column definitions** name the roots of its
+record-page index and its BLOB-page index. Only a user index has to be recognised by the
+data pages its leaves point at, which is what `OpenIndex` already does for reading.
+
+### Scope boundaries, each an error rather than a silent success
+
+- `ErrLastTable` — the database's only table is not dropped. When the catalog empties the
+  engine **shortens the file**: dropping all three tables of `MultiTable.abs` leaves 6
+  pages where 30 were, with `LastUsedPageNo` at 4. No fixture pins the rule it shortens
+  by, so this package refuses rather than write a file that would differ from the
+  engine's. Nothing else in the corpus triggers a truncation: dropping `Alpha`, whose
+  index page was the file's highest, left seven trailing free pages and shortened nothing.
+- `ErrTableHasBlobPages` — a table with BLOB pages is not dropped. They are reachable only
+  through its BLOB-page index, which names the page each BLOB starts on and not the ones
+  it continues on, so freeing what it lists would leak the rest.
+- `ErrPageUnattributed` — the file holds an allocated page that belongs to no table. A
+  page this package cannot name is a page it might leave allocated with nothing pointing
+  at it, so a drop refuses instead.
+- `ErrCatalogNotWritable` — a compressed catalog, or one spanning more than one page.
+  Neither occurs in any fixture.
+
+### What the other operations write, recorded for whoever unblocks them
+
+Each of these was produced as a one-statement diff from `MultiTable.abs` under DBManager.
+The files are not committed, because no test uses them yet and a fixture with no test is
+dead weight; the recipe in `testdata/README.md` regenerates them.
+
+| Statement                                 | Bytes | What it does                                                                                                                                                                                                                                                                  |
+| ----------------------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CREATE TABLE Delta (X, Y)`               | 198   | allocates **five** pages — two for the system internal file, one each for the column definitions, the counters and the record-page index — and **no data page**; that arrives with the first insert. Appends a catalog entry and moves `LastObjectID` by 1 + the column count |
+| `DROP TABLE Beta; CREATE TABLE Delta …`   | 128   | the new table takes the freed pages, **lowest first**: `Beta`'s 11–15 of 11–16                                                                                                                                                                                                |
+| `ALTER TABLE Gamma ADD (W INTEGER)`       | 248   | rewrites the column definitions; blocked on zlib                                                                                                                                                                                                                              |
+| `ALTER TABLE Gamma DROP (V)`              | 234   | as above                                                                                                                                                                                                                                                                      |
+| `CREATE INDEX IdxBetaCode ON Beta (Code)` | 93    | allocates one index page, rewrites `Beta`'s column definitions, moves `LastObjectID` by 1                                                                                                                                                                                     |
+| `DROP INDEX Alpha.IdxAlphaId`             | 25    | frees the index page, rewrites `Alpha`'s column definitions                                                                                                                                                                                                                   |
 
 ---
 
@@ -1662,12 +1778,28 @@ an independent decoder for every fixture.
    requires it with no `replace`. Re-tag from `main` and bump Aconiq. This is the only
    item left in this list, and it is not something to do from here: it changes what
    `../Aconiq` resolves to.
+5. ~~**Phase 8 — schema operations.**~~ Begun, not finished. `DROP TABLE` is implemented
+   and byte-identical to the engine on four one-statement fixtures, and the allocation
+   model it needed — PFS, EAM, `LastUsedPageNo`, `LastObjectID` — is decoded and asserted
+   against every fixture. The other five operations are **blocked on one thing**: they
+   rewrite a zlib stream, and Go's `compress/zlib` cannot reproduce the C library's
+   level-1 output that the engine writes.
 
-**After that**, the two open Phase 7 items are the next real work — appending a data page
-when every existing one is full, and maintaining user indexes so insert and delete are
-not refused on an indexed table. Both are blocked on fixtures that do not exist yet: an
-index insert whose key sorts into the middle, and one that splits a full leaf. Producing
-those two files under DBManager is the first step, not an afterthought.
+**After that**, three pieces of work are ready to start, in rough order of what unblocks
+the most:
+
+- **A deflate encoder bit-compatible with zlib level 1.** It unblocks five of the seven
+  Phase 8 operations at once, and it comes with an unusually good oracle: 34 compressed
+  internal files in the corpus whose exact bytes are already known, so the encoder is
+  either right on all of them or wrong. See Phase 8.
+- **Appending a data page when every existing one is full** (Phase 7, `ErrTableFull`).
+  This is now much closer than it was: the allocator that has to hand out the page is
+  decoded and tested, and `MultiTable-create.abs` shows the engine taking freed pages
+  lowest-first.
+- **Maintaining user indexes**, so insert and delete are not refused on an indexed table.
+  Still blocked on fixtures that do not exist yet: an index insert whose key sorts into
+  the middle, and one that splits a full leaf. Producing those two files under DBManager
+  is the first step, not an afterthought.
 
 **The two largest validation gaps** are not phases, and neither can be closed from here:
 
@@ -1684,5 +1816,6 @@ those two files under DBManager is the first step, not an afterthought.
 > Both of those were written before the `Employees-*` fixtures existed and the second is
 > now closed: eight encrypted fixtures with rows, one per algorithm, are committed.
 
-**Deferred.** Phases 8–9 (DDL, `database/sql`) remain out of scope until there is a
-concrete use case. Phase 7 (record writes) is done; Phase 5e (multi-table) is done.
+**Deferred.** Phase 9 (`database/sql`) remains out of scope until there is a concrete use
+case. Phase 7 (record writes) is done bar two items; Phase 5e (multi-table) is done; Phase
+8 (DDL) is started — `DROP TABLE` and the allocation model.

@@ -69,21 +69,25 @@ var oracleRowCounts = map[string]int{
 	"Writes-delins.abs":          3,
 }
 
-// unindexedFixtures are the fixtures deliberately created without a user
-// index, because this package refuses to insert into or delete from an indexed
-// table (see ErrIndexNotMaintained) and the write tests need a table it will
-// accept. They are named here rather than detected, so that an index silently
-// disappearing from any other fixture still fails the cross-check below.
+// unindexedFixtures are the fixtures with no user index to cross-check
+// against. Most were deliberately created without one, because this package
+// refuses to insert into or delete from an indexed table (see
+// ErrIndexNotMaintained) and the write tests need a table it will accept.
+// MultiTable-dropfirst.abs is the exception: its index was dropped along with
+// Alpha, the only table that carried one. They are named here rather than
+// detected, so that an index silently disappearing from any other fixture still
+// fails the cross-check below.
 var unindexedFixtures = map[string]bool{
-	"Writes.abs":         true,
-	"Writes-ins1.abs":    true,
-	"Writes-ins2.abs":    true,
-	"Writes-upd.abs":     true,
-	"Writes-updname.abs": true,
-	"Writes-upd2.abs":    true,
-	"Writes-del2.abs":    true,
-	"Writes-del.abs":     true,
-	"Writes-delins.abs":  true,
+	"Writes.abs":               true,
+	"Writes-ins1.abs":          true,
+	"Writes-ins2.abs":          true,
+	"Writes-upd.abs":           true,
+	"Writes-updname.abs":       true,
+	"Writes-upd2.abs":          true,
+	"Writes-del2.abs":          true,
+	"Writes-del.abs":           true,
+	"Writes-delins.abs":        true,
+	"MultiTable-dropfirst.abs": true,
 }
 
 // fixtureNames returns every testdata/*.abs in sorted order. It skips the test

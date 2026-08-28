@@ -58,6 +58,10 @@ testdata/*
 !testdata/Writes-delins.abs
 !testdata/MultiTable.abs
 !testdata/MultiTable-drop.abs
+!testdata/MultiTable-dropfirst.abs
+!testdata/MultiTable-droplast.abs
+!testdata/MultiTable-create.abs
+!testdata/MultiTable-createdrop.abs
 !testdata/README.md
 
 legacy/

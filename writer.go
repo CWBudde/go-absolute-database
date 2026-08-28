@@ -196,6 +196,12 @@ type pageWriteBuf struct {
 	// so would advance its State counter for a transaction that changed
 	// nothing.
 	dirty bool
+	// stateBump is how far this page's State counter advances when the page is
+	// written. It is 1 for an ordinary page, because the engine counts writes.
+	// The allocation maps count the bits they record instead, and a page that
+	// has just been freed carries pageStateFree as a marker rather than a
+	// counter and must not be advanced at all, so both set this themselves.
+	stateBump int
 }
 
 // TableWriter modifies the records of a table. Changes are buffered until
@@ -402,18 +408,9 @@ func (w *TableWriter) Commit() error {
 	// The order slice may have grown while the counters were updated. Every
 	// page that is written gets its State counter advanced, exactly as the
 	// engine does.
-	for _, no := range w.order {
-		buf := w.pages[no]
-		if !buf.dirty {
-			continue
-		}
-
-		bumpPageState(buf)
-
-		err = w.db.writePageBuf(buf)
-		if err != nil {
-			return err
-		}
+	err = w.db.flushPages(w.order, w.pages)
+	if err != nil {
+		return err
 	}
 
 	err = w.db.bumpFileState()
@@ -551,7 +548,22 @@ func (w *TableWriter) loadPage(no int) (*pageWriteBuf, error) {
 		return buf, nil
 	}
 
-	page, err := w.db.ReadPage(no)
+	buf, err := w.db.bufferPage(no)
+	if err != nil {
+		return nil, err
+	}
+
+	w.pages[no] = buf
+	w.order = append(w.order, no)
+
+	return buf, nil
+}
+
+// bufferPage reads one page into a buffer that can be modified and written
+// back. It is the shared half of buffering: TableWriter and the schema
+// operations in ddl.go keep their own page sets but fill them the same way.
+func (db *File) bufferPage(no int) (*pageWriteBuf, error) {
+	page, err := db.ReadPage(no)
 	if err != nil {
 		return nil, err
 	}
@@ -560,17 +572,13 @@ func (w *TableWriter) loadPage(no int) (*pageWriteBuf, error) {
 		return nil, fmt.Errorf("absdb: page %d has no ABSP header", no)
 	}
 
-	buf := &pageWriteBuf{
+	return &pageWriteBuf{
 		number:    no,
 		raw:       page.raw,
 		payload:   page.Payload,
 		encrypted: page.Header.CRC32 != 0,
-	}
-
-	w.pages[no] = buf
-	w.order = append(w.order, no)
-
-	return buf, nil
+		stateBump: 1,
+	}, nil
 }
 
 func (w *TableWriter) isDataPage(no int) bool {
@@ -929,11 +937,37 @@ func (db *File) bumpFileState() error {
 	return nil
 }
 
-// bumpPageState advances a page's State counter, which the engine increments
-// every time it writes the page.
+// flushPages writes back every dirty page of a page set, in the order the set
+// recorded, advancing each one's State counter as the engine does.
+func (db *File) flushPages(order []int, pages map[int]*pageWriteBuf) error {
+	for _, no := range order {
+		buf := pages[no]
+		if !buf.dirty {
+			continue
+		}
+
+		bumpPageState(buf)
+
+		err := db.writePageBuf(buf)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// bumpPageState advances a page's State counter by the number of writes it
+// stands for: once for a page the engine rewrote, more for an allocation map
+// that records several bits at once, and not at all for a page whose State has
+// just been set to pageStateFree, where the field is a marker and not a count.
 func bumpPageState(p *pageWriteBuf) {
+	if p.stateBump <= 0 {
+		return
+	}
+
 	state := binary.LittleEndian.Uint32(p.raw[pageStateOffset : pageStateOffset+4])
-	binary.LittleEndian.PutUint32(p.raw[pageStateOffset:pageStateOffset+4], state+1)
+	binary.LittleEndian.PutUint32(p.raw[pageStateOffset:pageStateOffset+4], state+uint32(p.stateBump)) //nolint:gosec // stateBump counts pages, checked positive above
 }
 
 // setBit sets the given bit of the occupancy bitmap at the start of data.

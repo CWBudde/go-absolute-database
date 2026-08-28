@@ -10,7 +10,7 @@
 #   record layout derivation, CRC, RIPEMD, the four in-tree ciphers, and the
 #   fuzz targets.
 #
-#   The exceptions are twenty-one fixtures that are ours and are committed (see
+#   The exceptions are twenty-five fixtures that are ours and are committed (see
 #   testdata/README.md: synthetic data, no customer content):
 #
 #     - the eight Employees-*.abs, one per encryption algorithm. CI therefore
@@ -23,10 +23,12 @@
 #       package's insert, update and delete to reproduce the engine's file byte
 #       for byte. That is the strongest assertion in the suite and it does run
 #       on a runner.
-#     - the two MultiTable*.abs, the only fixtures holding more than one table.
+#     - the six MultiTable*.abs, the only fixtures holding more than one table.
 #       CI therefore also covers the table catalog, per-table page partitioning
-#       and DROP TABLE tombstoning -- none of which any customer fixture can
-#       exercise, since all 20 of them hold exactly one table.
+#       and the two allocation maps -- none of which any customer fixture can
+#       exercise, since all 20 of them hold exactly one table. Four of the six
+#       differ from a parent by one DROP TABLE or CREATE TABLE, so
+#       TestDropTableMatchesEngineByteForByte runs on a runner too.
 #
 #   Everything else -- all 20 customer fixtures, and the byte-identical
 #   comparison of decryption against a plaintext twin -- is validated only on a
