@@ -1,12 +1,9 @@
 package absdb
 
 import (
-	"bytes"
-	"compress/zlib"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 )
 
 // BaseFieldType represents the low-level storage type (TABSBaseFieldType).
@@ -173,6 +170,21 @@ type TableSchema struct {
 	Columns []Column
 }
 
+const (
+	// internalFileHeaderSize is the size of the TABSInternalFileHeader that
+	// prefixes an internal file (such as the schema) stored in a page.
+	internalFileHeaderSize = 10
+
+	// minColumnDefSize is the smallest number of bytes a column definition can
+	// occupy: an empty name (1) + ID (4) + types (2) + size (4) + flags (1) +
+	// the 4-byte terminator. It bounds the column count against the amount of
+	// data actually present, so a truncated blob cannot request a huge slice.
+	minColumnDefSize = 16
+
+	// maxSchemaColumns is an absolute ceiling on the column count.
+	maxSchemaColumns = 65000
+)
+
 var (
 	ErrNoSchema    = errors.New("absdb: no schema page found")
 	ErrBadSchema   = errors.New("absdb: malformed schema data")
@@ -199,7 +211,7 @@ func (db *File) Schema() (*TableSchema, error) {
 
 	// Read the internal file header at the start of page data.
 	data := page.PageData()
-	if len(data) < 10 {
+	if len(data) < internalFileHeaderSize {
 		return nil, ErrBadSchema
 	}
 
@@ -219,16 +231,19 @@ func decompressInternalFile(data []byte) ([]byte, error) {
 	//   FileSize             int32   offset 1  (compressed size)
 	//   DecompressedSize     int32   offset 5
 	//   CompressionAlgorithm byte    offset 9
-	if len(data) < 10 {
+	if len(data) < internalFileHeaderSize {
 		return nil, ErrBadSchema
 	}
 
-	fileHdrSize := int(data[0])
-	compressedSize := int(binary.LittleEndian.Uint32(data[1:5]))
-	// decompressedSize := int(binary.LittleEndian.Uint32(data[5:9]))
+	// All three lengths are widened to int64 before any arithmetic: they come
+	// straight off disk and must not be able to overflow or go negative on the
+	// way to a slice expression.
+	fileHdrSize := int64(data[0])
+	compressedSize := int64(binary.LittleEndian.Uint32(data[1:5]))
+	decompressedSize := int64(binary.LittleEndian.Uint32(data[5:9]))
 	compressionAlgo := data[9]
 
-	if fileHdrSize < 10 || len(data) < fileHdrSize+compressedSize {
+	if fileHdrSize < internalFileHeaderSize || fileHdrSize+compressedSize > int64(len(data)) {
 		return nil, fmt.Errorf("%w: internal file header invalid", ErrBadSchema)
 	}
 
@@ -241,13 +256,9 @@ func decompressInternalFile(data []byte) ([]byte, error) {
 
 		return result, nil
 	case 1: // zlib
-		r, err := zlib.NewReader(bytes.NewReader(compressed))
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrCompression, err)
-		}
-		defer r.Close()
-
-		result, err := io.ReadAll(r)
+		// The declared decompressed size bounds the output: without it a
+		// crafted page could inflate far beyond the file it came from.
+		result, err := inflateLimited(compressed, decompressedSize)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrCompression, err)
 		}
@@ -264,15 +275,22 @@ func parseSchema(data []byte) (*TableSchema, error) {
 		return nil, ErrBadSchema
 	}
 
-	columnCount := int(binary.LittleEndian.Uint32(data[0:4]))
-	if columnCount < 0 || columnCount > 65000 {
+	columnCount := int64(binary.LittleEndian.Uint32(data[0:4]))
+	if columnCount > maxSchemaColumns {
 		return nil, fmt.Errorf("%w: invalid column count %d", ErrBadSchema, columnCount)
+	}
+
+	// The blob must be long enough to hold that many definitions. Without this
+	// a 4-byte input could ask for 65000 Column values.
+	if columnCount > int64(len(data)/minColumnDefSize) {
+		return nil, fmt.Errorf("%w: column count %d exceeds %d bytes of schema data",
+			ErrBadSchema, columnCount, len(data))
 	}
 
 	columns := make([]Column, 0, columnCount)
 	pos := 4
 
-	for i := range columnCount {
+	for i := range int(columnCount) {
 		col, nextPos, err := parseColumnDef(data, pos, i)
 		if err != nil {
 			return nil, fmt.Errorf("%w: column %d: %w", ErrBadSchema, i, err)
