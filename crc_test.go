@@ -109,7 +109,7 @@ func TestAbsCRC32ControlBlocks(t *testing.T) {
 func TestPageCRCIsAbsCRC32OfPayload(t *testing.T) {
 	for _, fixture := range encryptedFixtures {
 		t.Run(fixture.name, func(t *testing.T) {
-			db, err := OpenWithPassword(testdataPath(fixture.name), testPassword)
+			db, err := OpenWithPassword(requireFixture(t, fixture.name), testPassword)
 			if err != nil {
 				t.Fatalf("OpenWithPassword: %v", err)
 			}

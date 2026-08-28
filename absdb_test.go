@@ -13,10 +13,33 @@ func testdataPath(name string) string {
 	return filepath.Join("testdata", name)
 }
 
-func openTestFile(t *testing.T, name string) *File {
+// requireFixture returns the path of a fixture in testdata/, skipping the test
+// when it is not there.
+//
+// testdata/ holds real customer data and is deliberately not committed, so on
+// a fresh clone the fixtures are simply absent and the tests that need them
+// have nothing to say. Every path that reaches a fixture — Open, ReadFile,
+// OpenWithPassword — should go through here, so that a fresh clone skips
+// cleanly instead of reporting dozens of failures. Any error other than a
+// missing file is still a hard failure.
+func requireFixture(t *testing.T, name string) string {
 	t.Helper()
 
 	path := testdataPath(name)
+
+	_, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		t.Skipf("fixture %s not present (testdata/ is not committed)", name)
+	}
+
+	return path
+}
+
+// openTestFile opens a fixture from testdata/, skipping when it is absent.
+func openTestFile(t *testing.T, name string) *File {
+	t.Helper()
+
+	path := requireFixture(t, name)
 
 	db, err := Open(path)
 	if err != nil {
@@ -255,11 +278,12 @@ func TestScanPages(t *testing.T) {
 }
 
 // craftFile copies a fixture, applies patch to the raw bytes and writes the
-// result to a temporary file whose path is returned.
+// result to a temporary file whose path is returned. Like openTestFile it
+// skips when the fixture is absent, since testdata/ is not committed.
 func craftFile(t *testing.T, fixture string, patch func([]byte) []byte) string {
 	t.Helper()
 
-	data, err := os.ReadFile(testdataPath(fixture))
+	data, err := os.ReadFile(requireFixture(t, fixture))
 	if err != nil {
 		t.Fatal(err)
 	}

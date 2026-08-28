@@ -205,8 +205,10 @@ func TestOpenWithPassword(t *testing.T) {
 func TestOpenWithWrongPassword(t *testing.T) {
 	for _, fixture := range encryptedFixtures {
 		t.Run(fixture.name, func(t *testing.T) {
+			path := requireFixture(t, fixture.name)
+
 			for _, wrong := range []string{"bla", "wrong", ""} {
-				_, err := OpenWithPassword(testdataPath(fixture.name), wrong)
+				_, err := OpenWithPassword(path, wrong)
 				if !errors.Is(err, ErrWrongPassword) {
 					t.Errorf("OpenWithPassword(%q) error = %v, want ErrWrongPassword", wrong, err)
 				}
