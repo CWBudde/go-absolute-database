@@ -1,5 +1,13 @@
 # treefmt configuration for go-absolute-database
 # Multi-language code formatting
+#
+# The Go formatters below (gofumpt + gci) are the project's single formatting
+# standard. `.golangci.yml` enables the same two under `formatters:` — keep the
+# two files in sync.
+#
+# Every formatter here runs in WRITE mode, which is how treefmt works. Do not
+# invoke treefmt directly for a "check": use `just check-formatted`, which runs
+# it against a scratch copy so the working tree is never modified.
 
 [global]
 excludes = [

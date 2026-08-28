@@ -1,0 +1,161 @@
+# CI for go-absolute-database.
+#
+# SCOPE — please read before trusting a green check:
+#
+#   testdata/ is gitignored on purpose. The .abs fixtures are real customer
+#   project data and are never committed. Every test that opens a fixture calls
+#   t.Skip() when the file is absent, so on a GitHub runner those tests are
+#   SKIPPED, not passed. What CI actually covers is the synthetic and unit
+#   tests: header/page parsing on hand-built buffers, schema and record layout
+#   derivation, CRC, RIPEMD, the crypto key schedule, and the fuzz targets.
+#
+#   Real-file validation only happens on a developer machine that has the
+#   fixtures. Run `just test` (or `just ci`) locally before merging anything
+#   that touches the parser. A green CI run means "nothing obviously broken",
+#   not "verified against real .abs files".
+#
+#   For the same reason there is deliberately no coverage upload here: the
+#   number a runner would produce excludes the fixture-driven paths and would
+#   understate coverage while looking authoritative.
+#
+# This mirrors `just ci` (build, vet, formatting, lint, race tests, tidy). The
+# steps are spelled out with plain `go` commands so the workflow does not need
+# just/treefmt installed; keep the two in sync when either changes.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  build-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      # Baseline formatting gate that needs no extra tooling. The stricter
+      # gofumpt + gci rules (see treefmt.toml) are enforced by the lint job,
+      # which runs golangci-lint with both enabled as formatters.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go mod tidy check
+        run: go mod tidy -diff
+
+      # Fixture-backed tests skip here (see the note at the top of this file).
+      - name: Test (race)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -v ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      # Make the skips visible instead of letting a green check imply the
+      # fixture-backed tests ran.
+      - name: Summarise skipped tests
+        if: always()
+        run: |
+          {
+            echo "### Test scope"
+            echo
+            echo "\`testdata/\` is gitignored, so fixture-backed tests are skipped on CI."
+            echo "Tests skipped in this run:"
+            echo '```'
+            grep -E '^ *--- SKIP' "$RUNNER_TEMP/test.log" || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # .golangci.yml is schema version "2", so the action must be a release
+      # that drives a golangci-lint v2 binary (v7 and later). The version is
+      # pinned so a config change and a linter upgrade never land together by
+      # accident.
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          args: --timeout=5m
+
+  fuzz:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Short budget per target: this is a smoke test for crashes and hangs on
+      # arbitrary input, not a real fuzzing campaign. Targets are discovered at
+      # runtime, so the step succeeds (and says so) when there are none yet.
+      #
+      # Note: the seed corpus under testdata/fuzz/ is gitignored along with the
+      # rest of testdata/, so CI fuzzes from the f.Add() seeds in the test files
+      # only.
+      - name: Fuzz each target
+        run: |
+          set -euo pipefail
+          found=0
+          for pkg in $(go list ./...); do
+            targets="$(go test -list '^Fuzz' "$pkg" 2>/dev/null | grep '^Fuzz' || true)"
+            for t in $targets; do
+              found=1
+              echo "==> fuzzing $t in $pkg"
+              go test -run '^$' -fuzz "^${t}$" -fuzztime=60s "$pkg"
+            done
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::notice::no fuzz targets found yet - nothing to fuzz"
+          fi
+
+      # A crash leaves a reproducer in testdata/fuzz/<Target>/. That directory
+      # is gitignored, so capture it as an artifact or the input is lost.
+      - name: Upload fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: testdata/fuzz/
+          if-no-files-found: ignore

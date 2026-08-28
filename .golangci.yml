@@ -21,6 +21,10 @@ linters:
     - mnd # magic numbers acceptable in binary format parsing
     - musttag # no struct tag enforcement needed
     - nlreturn # no blank-line-before-return enforcement
+    # `if err := f(); err != nil` is the canonical Go idiom for scoping an
+    # error to the branch that handles it, and it is used consistently across
+    # this codebase. noinlineerr forbids it outright, so it is not a fit here.
+    - noinlineerr
     - nonamedreturns # named returns useful for complex signatures
     - paralleltest # not enforcing t.Parallel everywhere
     - sqlclosecheck # no SQL in this project
@@ -62,13 +66,51 @@ linters:
 
     rules:
       # test files are more relaxed
-      - linters: [funlen, cyclop, gocognit, maintidx, wrapcheck, dupl, noctx, forcetypeassert, gosec, thelper, usetesting, goconst]
+      - linters:
+          [
+            funlen,
+            cyclop,
+            gocognit,
+            maintidx,
+            wrapcheck,
+            dupl,
+            noctx,
+            forcetypeassert,
+            gosec,
+            thelper,
+            usetesting,
+            goconst,
+          ]
         path: _test\.go
 
       # wrapcheck too noisy in internal packages
       - linters: [wrapcheck]
         path: internal/
 
+      # cmd/absdb is a command-line tool: writing results to stdout via
+      # fmt.Printf is its purpose, not a stray debug print.
+      - linters: [forbidigo]
+        path: ^cmd/
+
+      # Cobra RunE functions return library errors straight to cobra, which
+      # prints them with the command context already attached. Wrapping there
+      # only produces doubled prefixes ("absdb dump: dump: open: ...").
+      - linters: [wrapcheck]
+        path: ^cmd/
+
+      # G115 flags every same-width unsigned->signed reinterpretation. The .abs
+      # format stores Delphi Integer/SmallInt/Int64 fields, and
+      # `int32(binary.LittleEndian.Uint32(b))` is the standard lossless way to
+      # read them in Go - the bit pattern is preserved and no value is lost.
+      # Narrowing conversions (e.g. int64 -> int32) are deliberately NOT
+      # excluded here, because those can truncate and are worth reviewing.
+      - linters: [gosec]
+        text: "G115: integer overflow conversion (uint8 -> int8|int8 -> uint8|uint16 -> int16|int16 -> uint16|uint32 -> int32|int32 -> uint32|uint64 -> int64|int64 -> uint64)"
+
 formatters:
+  # Must stay in sync with treefmt.toml, which applies the same two formatters
+  # in write mode. gofumpt is a strict superset of gofmt; gci normalises import
+  # grouping.
   enable:
-    - gofmt
+    - gofumpt
+    - gci
