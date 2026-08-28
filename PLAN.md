@@ -481,8 +481,9 @@ is a separate matter that Art. 6 does not cover.** Accordingly:
 - [~] Classify pages: scan all pages and categorize by ABSP signature and content patterns
   — only 5 of ~12 observed page types are named; 4/5/6/7/9 print as `Type_N`
 - [x] Write tests against real `.abs` files (TS03.abs, RREC0011.abs, Addresses.abs)
-- [!] Create `testdata/` with small representative `.abs` files
-  — fixtures exist locally but `testdata/` is **gitignored**, so a fresh clone runs none of them (Phase T)
+- [x] Create `testdata/` with small representative `.abs` files — the real fixtures stay
+      gitignored (customer data); synthetic `.abs` files are built in-test so a fresh clone
+      runs 62 tests and skips 54, with no failures. See Phase T.
 
 ### API sketch
 
@@ -886,8 +887,8 @@ next to each, not just the theory.
 
 ### Fuzzing
 
-- [ ] `FuzzOpen`, `FuzzParseSchema`, `FuzzReadBlob` seeded from `testdata/*.abs`
-- [ ] A `go test -fuzz` job in CI with a time budget
+- [x] `FuzzOpen`, `FuzzParseSchema`, `FuzzReadBlob` — see Phase T, including the caveat
+      that finding no crash in 60 seconds is not a proof of safety
 
 ---
 
@@ -912,57 +913,98 @@ All 20 fixtures are single-table (`ObjectID == 1` everywhere), so no test would 
 
 ---
 
-## Phase T — Test suite, fixtures and CI (do this alongside 5c)
+## Phase T — Test suite, fixtures and CI — MOSTLY DONE
 
-**Goal:** Make the suite green, runnable by anyone, and capable of catching the
+**Goal:** make the suite green, runnable by anyone, and capable of catching the
 Phase 5c/5d class of bug. Without this, nothing else stays fixed.
 
 ### Get to green
 
-- [ ] `TestAddressesHeader` expects version 7.10; the fixture is now v7.94
-- [ ] All four crypto tests target `testdata/Addresses.abs`, which is the
-      **unencrypted** fixture. Repoint them at `Addresses-{Rijndael_128,Blowfish,DES_Single}.abs`
-      with the now-known password `"Bla"`
-- [ ] Replace `TestVerifyPassword`'s "try both casings and pass if either works" with a
-      real assertion — a verification test that does not know its own input validates nothing
+- [x] `TestAddressesHeader` expected version 7.10; the fixture is v7.94
+- [x] All the crypto tests targeted `testdata/Addresses.abs`, which is the
+      **unencrypted** fixture. Repointed at `Addresses-{Rijndael_128,Blowfish,DES_Single}.abs`
+      with password `"Bla"`
+- [x] `TestVerifyPassword` tried both casings and passed if either worked — a
+      verification test that does not know its own input validates nothing. It now
+      asserts which password is correct.
 
 ### Make fixtures available
 
-- [ ] `testdata/` is gitignored, so 36 of 44 tests fail on a fresh clone. Either commit
-      small fixtures or generate synthetic ones in-test. **Confirm provenance first** —
-      the current files contain German street addresses from a SoundPlan project
+- [x] Synthetic `.abs` files are built in Go in-test, so the suite means something on a
+      fresh clone. `testdata/` **stays gitignored** — the fixtures are real customer
+      project data. The builder covers the DB header, ABSP headers, a schema page in
+      both the plain and zlib forms, multi-page data with occupancy bitmaps, chained
+      B-tree leaves, and BLOB pages compressed and uncompressed. The column-count sweep
+      runs 1..25, covering both `mod 8 == 0` and `mod 8 == 7`.
+- [x] Missing fixtures `t.Skip` instead of `t.Fatalf`. With `testdata/` moved away:
+      **62 pass, 54 skip, 0 fail**. It used to fail 36 of 44 tests.
 - [ ] Add an encrypted fixture that actually **contains rows**, with a documented
-      password. The three existing encrypted fixtures are copies of an empty table and
-      can never validate record decryption
-- [ ] Make the test helper `t.Skip` on a missing fixture rather than `t.Fatalf`
+      password. The three existing ones are copies of an empty table and can never
+      validate encrypted record decryption.
 
 ### Add the missing oracle
 
-- [ ] **Cross-check the record reader against the index scan for every fixture.** The
-      B-tree leaf scan already yields exact row counts and record IDs and is
-      independent of the record decoder. Nothing does this today, which is the direct
-      reason all of Phase 5c went unnoticed
-- [ ] Replace shape assertions (`!= ""`, `!IsNaN`, `count >= 15`, `len(Columns) != 0`)
-      with expected values
-- [ ] Assert the multiple-of-12 invariant for **all** RPDG BLOBs, not just record 1
-- [ ] Cover `readBlobChain`, `decompressBlob` and the decryption path — currently 0%
-      and 10.7% respectively
+- [x] **The record reader is cross-checked against the index leaf scan for every
+      fixture** — not only on the row count but on the exact set of `(PageNo, ItemNo)`
+      pairs, and every user index against every other. This is the single assertion
+      that would have caught all of Phase 5c.
+- [x] Shape assertions (`!= ""`, `!IsNaN`, `count >= 15`) replaced with expected values
+- [x] The multiple-of-12 invariant asserted for **all 60** RPDG BLOBs, not just record 1
+      — the four broken ones belong to records 27 and 28, which is exactly why a
+      record-1-only assertion let them through
+- [x] `decompressBlob` covered — it had **0%**, because all 60 BLOBs in the fixture that
+      supposedly covered it are stored uncompressed. The decryption path is covered by
+      byte-exact equality against the plaintext twin.
+- [~] `readBlobChain` is exercised only by synthetic files and by fuzzing. Every BLOB
+  page in the corpus has `NextPageNo == -1`, so the on-disk chaining format remains
+  unverified.
+
+Coverage 70% → 86.7%.
+
+### Fuzzing
+
+- [x] `FuzzOpen`, `FuzzParseSchema`, `FuzzReadBlob`
+- [x] A `go test -fuzz` job in CI with a time budget
+- [x] `.gitignore` uses `testdata/*` rather than `testdata/` so `testdata/fuzz/` can be
+      re-included — git cannot re-include a path whose parent directory is excluded, so
+      the obvious `!testdata/fuzz/` exception under a `testdata/` rule silently never
+      matches, and a crash found by fuzzing could never become a committed regression
+      test
+
+> Sixty seconds per target found no crash, hang or OOM. That is an absence of evidence,
+> not a proof of safety — `FuzzOpen` managed only a few hundred executions, because
+> `inflateLimited` permits a 1000× expansion before rejecting it, so a 4 KiB page costs
+> 9 MiB and 8.7 ms of real work before the limit fires. Nothing crashes and the error is
+> correct, but the allocation happens first, and it should be bounded by the file size,
+> which is known up front.
 
 ### CI
 
-- [ ] Add `.github/workflows` running `just ci` — there is **no CI at all** today
-- [ ] Fix `just check-formatted`: it runs `prettier -w` / `gofumpt -w` / `gci write`, so
-      it **rewrites tracked files while "checking"**
-- [ ] `go mod tidy` — `golang.org/x/crypto` is required but never imported; `cobra` and
-      `x/text` are wrongly marked `// indirect`
-- [ ] Decide on the `stdlib only` claim in `CLAUDE.md`: the core read path imports
-      `golang.org/x/text/encoding/charmap`. Either inline the 128-entry Windows-1252
-      table or amend the policy
+- [x] `.github/workflows/ci.yml` — build, vet, gofmt, `go mod tidy -diff`, race tests,
+      golangci-lint, and a fuzz budget per target. Validated by actually running it
+      under `act`, which is how the last 15 non-skipping tests were found.
+- [x] `just check-formatted` no longer rewrites the files it claims to check. treefmt
+      has no read-only mode — every formatter runs with `-w` — so it now formats a
+      scratch copy and uses only the exit status. `check-tidy` likewise moved from
+      `go mod tidy && git diff --exit-code` to `go mod tidy -diff`.
+- [x] `go mod tidy` — cobra, `x/text` and `x/crypto` are direct dependencies and were
+      all marked `// indirect`
+- [x] The `stdlib only` claim in `CLAUDE.md` is amended rather than deleted: the library
+      uses two `golang.org/x` packages, cobra is confined to the CLI, and anything
+      further needs a reason
+- [x] Formatting had three disagreeing sources (`treefmt.toml`: gofumpt+gci;
+      `.golangci.yml`: gofmt only; `CLAUDE.md`: "standard gofmt, no special config").
+      Settled on gofumpt+gci, which the code already satisfies.
+
+> **CI cannot validate the parser.** `testdata/` is gitignored, so every fixture-backed
+> test skips on a runner. The workflow prints the skip list into the job summary and
+> uploads no coverage number, precisely so a green tick does not imply real-file
+> validation. That stays a local `just test` responsibility.
 
 ### Packaging
 
 - [ ] The `v0.1.0` tag is **orphaned** — it shares no ancestry with `main`, yet
-      `../Aconiq` requires it with no `replace`. Re-tag from `main` and bump Aconiq
+      `../Aconiq` requires it with no `replace`. Re-tag from `main` and bump Aconiq.
 - [ ] Consider moving `cmd/` to its own module so library consumers do not inherit
       cobra + pflag + mousetrap
 
@@ -1176,26 +1218,37 @@ candidate for `internal/`.
 
 ## Priority
 
-**Done — correctness and trust.** Phases 5c, 5d and 6 have landed. The library no longer
-loses rows or returns garbage without signalling, the parser no longer panics or OOMs on
-malformed input, and encrypted files open with a password.
+**Done.** Phases 5c (layout correctness), 5d (robustness), 6 (encryption) and most of T
+(oracle, synthetic fixtures, fuzzing, CI). The library no longer loses rows or returns
+garbage without signalling, the parser no longer panics or OOMs on malformed input,
+encrypted files open with a password, and the record reader is now cross-checked against
+an independent decoder for every fixture.
 
 **Next.**
 
-1. **Phase T** — synthetic fixtures, CI, and the index cross-check as a standing
-   assertion. Without it the next regression is as invisible as the last one was: the
-   suite passed for months while the reader returned 275 of 300 rows.
-2. **Phase 5e** — multi-table, if any real file needs it. It forces a breaking API
+1. **Clear the remaining lint findings.** The CI lint job is blocking, so CI is red
+   until they are. Four of them are genuinely narrowing integer conversions in
+   `reader.go` and deserve reading rather than suppressing.
+2. **Bound `inflateLimited` by the file size** before inflating, not only after. A 4 KiB
+   page currently costs 9 MiB and 8.7 ms before the limit rejects it, which is why
+   `FuzzOpen` manages only a few hundred executions per minute.
+3. **Phase 5e — multi-table**, if any real file needs it. It forces a breaking API
    change (`Schema()` / `OpenTable()` gain a table argument), so it should land before a
    stable version is tagged. No fixture exercises it — all 20 are `ObjectID == 1`.
-3. **Re-tag `v0.1.0`.** The existing tag shares no ancestry with `main`, yet `../Aconiq`
+4. **Re-tag `v0.1.0`.** The existing tag shares no ancestry with `main`, yet `../Aconiq`
    requires it with no `replace`. Re-tag from `main` and bump Aconiq.
 
-**The largest remaining validation gap** is not a phase. Fourteen field types have zero
-corpus coverage — Single, SmallInt, Word, Int64, Currency, WideString and the rest are
-correct by construction only. Closing that needs a round-trip against the Delphi engine
-(create a table with known values in every type, export, compare), which is the one
-thing this repository cannot do from Linux.
+**The two largest validation gaps** are not phases, and neither can be closed from here:
+
+- **Fourteen field types have zero corpus coverage.** Single, SmallInt, Word, Int64,
+  Currency, WideString and the rest are correct by construction only. Closing this needs
+  a round-trip against the Delphi engine — create a table with known values in every
+  type, export, compare — which requires Windows and the Absolute Database Personal
+  Edition.
+- **Encrypted _record_ decryption is never validated.** All three encrypted fixtures are
+  copies of an empty table. A fixture with rows and a documented password would close
+  it, and would also make the CTS tail discriminate between page-extent models instead
+  of being degenerate.
 
 **Deferred.** Phases 7–9 (write support, DDL, `database/sql`) remain out of scope until
 there is a concrete use case for writing `.abs` files.
