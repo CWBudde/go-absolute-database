@@ -73,29 +73,46 @@ Every page carries a 40-byte `TABSDiskPageHeader` at the **fixed offset `0x17C`
 
 `ObjectID` is parsed today but ignored by every consumer — see Phase 5e.
 
-### Page data extent (corrected)
+### Page payload extent (SOLVED — supersedes two earlier descriptions)
 
-This is the single most important structural correction from the 2026-08-28 review.
+The single most important structural correction, and both earlier revisions of this
+section were wrong. Fixed in `absdb.go`.
 
-The usable data area of a page is **`pageSize - 40` bytes**: it begins at `0x1A4`
-(immediately after the page header), runs to the end of the page, and **wraps around
-to physical offset 0**, skipping only the 40-byte header block at `0x17C..0x1A3`.
-
-The implementation currently models the data area as `data[0x1A4:]` only — 3676 bytes
-instead of 4056 — and therefore **silently drops the trailing records of every full
-data page**.
-
-Proof (RREC0011.abs, record size 176, page 11):
+A `.abs` file is not a sequence of self-contained pages. It is a byte stream in which a
+40-byte `TABSDiskPageHeader` is interleaved at a **fixed phase**: every `pageSize` bytes,
+at block offset `0x17C..0x1A3`. Page N's payload is the **contiguous** run between its
+own header and the next one:
 
 ```
-occupancy bitmap = ff ff 7f  ->  23 records present
-3 (bitmap) + 23 * 176        =  4051 bytes required
-pageSize - 40                =  4056 bytes available   OK
-data[0x1A4:] only            =  3676 bytes available   TOO SMALL -> 3 records lost
+page N payload = file[N*pageSize + 0x1A4 : (N+1)*pageSize + 0x17C]
+length         = pageSize - 40                       (4056 for a 4096-byte page)
 ```
 
-The primary index independently confirms 30 rows across pages 11 and 12 (23 + 7);
-the reader returns 27.
+The payload starts right after page N's header and continues into the **next block's
+first 380 bytes**. It does not "wrap around" within the block — an earlier revision of
+this document said that, and it would have produced a wrong implementation: the tail of
+page N lives at the _start of block N+1_, not at the start of block N.
+
+Three independent confirmations:
+
+1. **File size.** Every fixture is exactly `pageCount * pageSize + 380` bytes. The
+   trailing 380 bytes exist precisely so the last page's payload is complete. That shape
+   is now checked in `parseHeader`.
+2. **Records.** RREC0011 page 11 has occupancy bitmap `ff ff 7f` = 23 slots. Only under
+   this model do all 23 slots (stride 176 from payload offset 3) carry the valid
+   null-flag triple `08 00 f9`; slots 21 and 22 live in block 12's first 380 bytes.
+   Under the old `data[0x1A4:]` model only 20 fit, while the index independently reports
+   30 rows across pages 11 and 12 (23 + 7).
+3. **Index entries.** RCFQ0011 block 11's first 380 bytes decode exactly as the
+   continuation of page 10's B-tree leaf entries — `key(5) + PageNo(4) + ItemNo(2)`,
+   keys 334, 335, 336… — which is only meaningful if that region belongs to page 10.
+
+A fourth arrived from the encryption work: the ciphertext extent of an encrypted page is
+this same 4056-byte span.
+
+Under the old model the trailing records of every full data page were dropped with no
+error: RCON0011 returned 275 of 300 rows, RREC0011 27 of 30, RCFQ0011 504 of 600,
+RR240011 28 of 30.
 
 ### Page types
 
@@ -292,9 +309,10 @@ required.**
    trailing partial block: `P = C XOR E(F)`.
 4. **Ciphers are the standard ones** — Go's `crypto/aes`, `crypto/des` and
    `golang.org/x/crypto/blowfish` work unmodified. No DEC-specific byte swapping.
-5. **Encrypted region** = page bytes **`[420, 4096)`** (3676 bytes), i.e. everything
-   after the 40-byte `ABSP` header. Page 0 is never encrypted, and the `ABSP` header
-   itself stays in the clear.
+5. **Encrypted region** = the **whole page payload**, `pageSize - 40` bytes = 4056 for a
+   4096-byte page, spanning from `[420, pageSize)` of this block into `[0, 380)` of the
+   next. An earlier revision said `[420, 4096)` (3676 bytes); that was an artifact of the
+   old page model. Page 0 is never encrypted, and the `ABSP` header stays in the clear.
 6. **Is this page encrypted?** `ABSP.CRC32 != 0`.
 7. **Password verification** = decrypt `ControlBlock`, compute CRC32 with the
    **reflected IEEE polynomial `0xEDB88320`, init 0, no final XOR** (_not_ Go's
@@ -321,17 +339,26 @@ attempts failed.
 
 #### Verification status
 
-Independently reproduced from scratch against the local fixtures, password **`"Bla"`**:
+Implemented in `crypto.go` / `ripemd256.go` / `crc.go`, asserted in `crypto_test.go`,
+password **`"Bla"`**:
 
 ```
-Addresses-Rijndael_128.abs   ControlBlock CRC 0xffac4819 == 0xffac4819   8/8 pages byte-identical
-Addresses-DES_Single.abs     ControlBlock CRC 0xd9f59b5b == 0xd9f59b5b   8/8 pages byte-identical
-Addresses-Blowfish.abs       verified separately (needs RIPEMD-256)
-wrong passwords ("bla", "wrong")                                          correctly rejected, 0/8
+Addresses-Rijndael_128.abs   ControlBlock CRC 0xffac4819 == 0xffac4819   13/13 pages byte-identical
+Addresses-DES_Single.abs     ControlBlock CRC 0xd9f59b5b == 0xd9f59b5b   13/13 pages byte-identical
+Addresses-Blowfish.abs       ControlBlock CRC 0x5a2f73e6 == 0x5a2f73e6   13/13 pages byte-identical
+wrong passwords ("bla", "wrong")                                          correctly rejected
 ```
 
-"Every encrypted page decrypts byte-identically to the plaintext `Addresses.abs`,
-including the trailing partial block."
+Every encrypted page decrypts byte-identically to the plaintext `Addresses.abs` over the
+full 4056-byte payload.
+
+**What actually discriminates the payload extent.** Not the CTS tail: DEC's full-block
+and partial-block rules coincide when the plaintext is zero
+(`E(P XOR F) = E(F) = P XOR E(F)`), and these fixtures are empty tables, so the trailing
+partial block is degenerate and decrypts identically under either model. What settles it
+is the next block's first 380 bytes — under the 3676-byte model those stay ciphertext:
+0 of 8 pages match and ~3030 of 3040 bytes differ against a known-zero plaintext. A
+fixture with rows near the end of a page would discriminate on the tail as well.
 
 #### Caveats
 
@@ -341,10 +368,12 @@ including the trailing partial block."
 - Rijndael-256, Twofish-128/256, Square and DES-Triple are untested — no fixtures.
   AES-256 and 3DES are stdlib; Twofish and Square would need Go implementations
   (Square is DEC-specific and would have to be ported).
-- The `ABSP.CRC32` page checksum does not yet reproduce over the decrypted data
-  (computed `8316267a` vs stored `6b705972`, consistent across all three files, so it
-  _is_ over plaintext — probably a different length or range). Cosmetic: it affects
-  optional page-integrity checking only, not decryption.
+- ~~The `ABSP.CRC32` page checksum does not reproduce over the decrypted data.~~
+  **Resolved.** `ABSP.CRC32` is `absCRC32` over the decrypted **4056-byte payload** — 24
+  of 24 encrypted pages across all three fixtures. The recorded mismatch (computed
+  `8316267a` vs stored `6b705972`) was the 3676-byte value: an artifact of the old page
+  model, not a different CRC range. The format therefore has a working page-integrity
+  check, pinned by `TestPageCRCIsAbsCRC32OfPayload`.
 
 ### BLOB compression
 
@@ -354,54 +383,68 @@ Algorithms: None, ZLIB, BZIP, PPM. Compression levels 1–9.
 
 ## Status of the original unknowns
 
-| #   | Unknown (as originally posed)  | Status                                                                                                                                                                                                                                                               |
-| --- | ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Complete page header structure | **Resolved.** `TABSDiskPageHeader`, all 40 bytes, from `ABSTypes.hpp`.                                                                                                                                                                                               |
-| 2   | Schema storage location        | **Mostly resolved.** Type-8 page, zlib internal file. But only ~26% of the blob is decoded — ~50% is skipped by a pattern search for `7F 00 <baseType> FF`, and ~24% (index definitions, constraints, table name) is never read.                                     |
-| 3   | Page allocation map            | **Open.** Page types 4/5/6/7/9 are the EAM/PFS/free-space structures and remain unidentified. Not needed for reading.                                                                                                                                                |
-| 4   | BLOB block layout              | **Mostly resolved.** Type-11 pages, `TABSDiskBLOBHeader { Word BlobID; int NumBlocks; int64 CompressedSize; int64 UncompressedSize }` = **22 bytes packed**. The code assumes 24 and ignores `ItemNo`, so multiple BLOBs per page and >1-page BLOBs are unsupported. |
-| 5   | Multi-table databases          | **Resolved in principle, unimplemented.** `ABSP.ObjectID` tags every page with its owning table, and `TABSTableListItem { TableName; TableID; MetaDataFilePageNo; ... }` in the type-2 System Directory is the catalog. See Phase 5e.                                |
-| 6   | Record deletion                | **Resolved.** A per-page occupancy bitmap at the head of the data area. No per-record tombstone.                                                                                                                                                                     |
-| 7   | Index page child pointers      | **Resolved.** Leaf stride `keySize+6`, internal stride `keySize+4`. The code uses `+6` for both — see Phase 5c.                                                                                                                                                      |
-| 8   | Record trailer bytes           | **Dissolved — there is no trailer.** Those bytes are the next record's null-flag prefix.                                                                                                                                                                             |
-| 9   | Version differences            | **Open.** Corpus spans 5.13, 7.10, 7.61, 7.94. No structural difference has been isolated; the RRAI/RRAD problem originally attributed to v7.61 turned out to be the `nullFlagBytes` bug, not a version difference.                                                  |
+| #   | Unknown (as originally posed)  | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Complete page header structure | **Resolved.** `TABSDiskPageHeader`, all 40 bytes, from `ABSTypes.hpp`.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 2   | Schema storage location        | **Mostly resolved.** Type-8 page, zlib internal file. But only ~26% of the blob is decoded — ~50% is skipped by a pattern search for `7F 00 <baseType> FF`, and ~24% (index definitions, constraints, table name) is never read.                                                                                                                                                                                                                                                                                      |
+| 3   | Page allocation map            | **Open.** Page types 4/5/6/7/9 are the EAM/PFS/free-space structures and remain unidentified. Not needed for reading.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 4   | BLOB block layout              | **Resolved for the on-disk form.** Type-11 pages carry three `int64 LE` values at payload offset 0: `ItemCount`, `CompressedSize`, `UncompressedSize` — **24 bytes**, not the 22-byte packed `TABSDiskBLOBHeader` an earlier revision claimed. Verified over all 60 type-11 pages of RPDG0011; read as 22 packed bytes it yields nonsense. `ItemNo` is still ignored, so several BLOBs per page remains unsupported, and every BLOB page in the corpus has `NextPageNo == -1`, so chaining is guarded but unverified. |
+| 5   | Multi-table databases          | **Resolved in principle, unimplemented.** `ABSP.ObjectID` tags every page with its owning table, and `TABSTableListItem { TableName; TableID; MetaDataFilePageNo; ... }` in the type-2 System Directory is the catalog. See Phase 5e.                                                                                                                                                                                                                                                                                 |
+| 6   | Record deletion                | **Resolved.** A per-page occupancy bitmap at the head of the data area. No per-record tombstone.                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 7   | Index page child pointers      | **Resolved and fixed.** Leaf stride `keySize+6`, internal stride `keySize+4`. A second defect was found alongside it: keys are `[null flag] + int32 **little-endian**`, but the search compared them with `bytes.Compare`, which orders 256 before 2 while the page is sorted by value. `FindByPrimaryKey` on RCFQ0011/RMPA0011 went 0/600 → 229/600 (stride alone) → 600/600 (both).                                                                                                                                 |
+| 8   | Record trailer bytes           | **Dissolved — there is no trailer.** Those bytes are the next record's null-flag prefix.                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 9   | Version differences            | **Open.** Corpus spans 5.13, 7.10, 7.61, 7.94. No structural difference has been isolated; the RRAI/RRAD problem originally attributed to v7.61 turned out to be the `nullFlagBytes` bug, not a version difference.                                                                                                                                                                                                                                                                                                   |
 
 ### Still genuinely unknown
 
 - Page types 4, 5, 6, 7, 9.
 - The ~24% tail of the schema page: index definitions, constraints, table name.
-- The `ABSP.CRC32` page-checksum input range.
-- Whether any `.abs` in the wild uses a page size other than 4096.
+- Whether any `.abs` in the wild uses a page size other than 4096. The payload model is
+  expressed in terms of `pageSize` and the fixed header offset `0x17C`; if that offset is
+  proportional to the page size rather than fixed, a different page size breaks it.
+  Untested — every fixture is 4096.
+- The on-disk form of multi-page BLOB chaining. Every BLOB page in the corpus has
+  `NextPageNo == -1`, so `readBlobChain` is guarded but has never run against real data.
+- Whether the encryption unit is still the page payload for a page holding **records**.
+  All three encrypted fixtures are copies of an empty table.
 
 ---
 
-## Review findings (2026-08-28) — current state
+## Review findings (2026-08-28) — and what became of them
 
-A full review was run against the committed tree. Summary of what it changed about the
-picture above:
+A full review was run against the tree at commit `1c83e5e`. This records what it found
+and how each item was resolved, so the next reader can tell a fixed problem from a
+standing one.
 
-**The good.** Everything backed by the SDK's C++ headers is correct and
-SDK-faithful: file header, page header, B-tree page header, internal file header, both
-field-type enums, `TABSDateTime`. RIPEMD-128 passes all seven official vectors. The
-B-tree leaf scan is correct. Encryption is now fully solved (above). 16 of 20 fixtures
-dump without error.
+**What was already right.** Everything backed by the SDK's C++ headers: file header,
+page header, B-tree page header, internal file header, both field-type enums,
+`TABSDateTime`. RIPEMD-128 passes all seven official vectors. The B-tree leaf scan was
+correct all along — and was the oracle that exposed the rest.
 
-**The problems, in priority order.**
+**The problems, and their disposition.**
 
-1. **The record reader silently returns wrong or missing data.** Two independent bugs
-   (Phase 5c). Nothing in the API signals it.
-2. **Robustness policy is unmet.** `go test -fuzz` reaches a 4.4 GB OOM in 11 seconds;
-   nine distinct panics, two infinite loops and three unbounded allocations were
-   reproduced. There are zero fuzz tests (Phase 5d).
-3. **The test suite is red on `main`** — five failures from fixture drift, and
-   `testdata/` is gitignored so a fresh clone cannot run 36 of 44 tests. There is no
-   CI, which is why this went unnoticed (Phase T).
-4. **`crypto.go` ships an implementation now known to be wrong** in four ways: zero IV,
-   plain CBC, whole-page decryption, RIPEMD-128 only (Phase 6).
-5. **Packaging.** The `v0.1.0` tag is **orphaned** — it shares no ancestry with `main`
-   (history was rewritten during the `meko-tech` → `cwbudde` module rename), yet
-   `../Aconiq` requires exactly `v0.1.0` with no `replace` directive. `go.mod` is not
-   tidy and carries `golang.org/x/crypto` as an unused dependency.
+1. **The record reader silently returned wrong or missing data.** Four bugs, not two:
+   the `nullFlagBytes` fudge, the page extent, the B-tree stride, and — found during the
+   fix — byte-wise comparison of little-endian keys. **Fixed, Phase 5c.**
+2. **The robustness policy was unmet.** A 4.4 GB OOM in 11 seconds, nine distinct
+   panics, two infinite loops, three unbounded allocations. **Fixed, Phase 5d**; each
+   was reproduced against the tree before being fixed.
+3. **The suite was red on `main`** — five failures from fixture drift — and `testdata/`
+   is gitignored, so a fresh clone could not run 36 of 44 tests, with no CI to notice.
+   **Partly resolved:** the suite is green and coverage is 85%, but synthetic fixtures
+   and CI are still **Phase T**.
+4. **`crypto.go` shipped a wrong implementation** — zero IV, plain CBC, wrong extent,
+   RIPEMD-128 only. **Fixed, Phase 6**, and the CLI can reach the feature at last.
+5. **Packaging.** The `v0.1.0` tag is still **orphaned** — it shares no ancestry with
+   `main` (history was rewritten during the `meko-tech` → `cwbudde` rename), yet
+   `../Aconiq` requires exactly `v0.1.0` with no `replace`. **Open.**
+
+**A lesson worth keeping.** Every one of the Phase 5c bugs was invisible to a suite that
+passed. The tests asserted shapes (`count >= 15`, `name != ""`, `!IsNaN(x)`) and
+constants read out of the reader's own earlier output, so they could only confirm that
+the reader still agreed with itself. The B-tree leaf scan was an independent decoder
+sitting in the same package, and nothing ever compared the two. Prefer an independent
+oracle to a pinned constant.
 
 ### Legal basis and repository hygiene
 
@@ -558,9 +601,9 @@ func (f *File) Schema(table string) (*TableSchema, error)
 
 - [~] Locate data pages for a table (page type 10 scan)
   — collects **every** type-10 page in the file, ignoring `ABSP.ObjectID` (breaks multi-table)
-- [!] Calculate record size from schema
-  — **not calculated, guessed.** 576-candidate brute-force search with a
-  plausibility score, plus a wrong hardcoded `nullFlagBytes`. See Phase 5c
+- [x] Calculate record size from schema — now genuinely calculated. It was a
+      576-candidate brute-force search with a plausibility score and a wrong hardcoded
+      `nullFlagBytes`; see Phase 5c
 - [x] Implement record iteration: walk data pages, extract fixed-size records
 - [x] Implement field value deserialization for numeric types:
   - [x] Integer (int32 LE)
@@ -571,9 +614,9 @@ func (f *File) Schema(table string) (*TableSchema, error)
   - [!] Word (uint16 LE) — **broken**: same 4-byte read over a 2-byte field
   - [ ] Currency (int64 LE / 10000) — type defined, untested
 - [x] Implement String field deserialization (Windows-1252 → UTF-8, null-terminated)
-- [!] Implement WideString deserialization (UTF-16LE) — **broken**, not merely untested:
-  `String()` stops at the first `0x00` and decodes Windows-1252, so UTF-16LE `"Hallo"`
-  returns `"H"`. The CLI prints this silently. See Phase 5d
+- [~] Implement WideString deserialization (UTF-16LE) — fixed in Phase 5d (it used to
+  stop at the first `0x00` and decode Windows-1252, so `"Hallo"` returned `"H"`), but
+  **no fixture has a wide-string column**, so it is correct by construction only
 - [~] Implement Date/Time/DateTime deserialization (`TABSDateTime` int32 pair → Go `time.Time`)
   — implementation is correct, but **never exercised**: the only DateTime column in the
   corpus is in `Addresses.abs`, which has no rows
@@ -584,11 +627,10 @@ func (f *File) Schema(table string) (*TableSchema, error)
       (the original description in this plan was wrong; the implementation is right)
 - [~] Test: read all 18 records from TS03.abs
   — asserts `count >= 15`, `name != ""` and `!IsNaN(sba)`; no value is checked against a known source
-- [!] Test: read receiver results from RREC0011.abs
-  — **the true row count is 30, not 27.** "27" is the truncated count produced by the
-  page-extent bug; it was recorded here as if validated. The test asserts no count at all
-- [ ] Test: read contributions from RCON0011.abs (**36** columns, **300** records) — deferred.
-      Currently returns 275 rows (Phase 5c bug 2)
+- [x] Test: read receiver results from RREC0011.abs — 30 rows, asserted against the
+      index leaf scan. The "27" recorded in an earlier revision was the truncated count
+      produced by the page-extent bug, written down as if it had been validated
+- [x] Test: read contributions from RCON0011.abs — 36 columns, 300 records (was 275)
 
 ### API sketch
 
@@ -626,22 +668,30 @@ func (rec Record) Bytes(col int) []byte
 
 ### Steps
 
-- [~] Investigate BLOB block storage layout — page type 11
-  — SDK says `TABSDiskBLOBHeader` is **22 bytes packed**; the code assumes 24.
-  `BlobRef.ItemNo` is parsed and never used, so "one BLOB per page" is an assumption, not a finding
+- [x] Investigate BLOB block storage layout — page type 11. The on-disk header is three
+      `int64 LE` values at payload offset 0 (`ItemCount`, `CompressedSize`,
+      `UncompressedSize`) = **24 bytes**. An earlier revision of this document claimed the
+      SDK's 22-byte packed `TABSDiskBLOBHeader`; read that way it yields nonsense. Verified
+      over all 60 type-11 pages of RPDG0011.
 - [x] Decode BLOB pointer format in records — 6 bytes: PageNo(int32) + ItemNo(uint16)
-- [ ] Implement BLOB block reading and chaining for multi-page BLOBs
-      — **not working.** `readBlobChain` is never reached (`NextPageNo` is always -1); the
-      fallback returns _the entire rest of the page_. Measured on RPDG0011: 4 of 60 BLOBs come
-      back as exactly 3652 bytes and are the only 4 that violate the file's own
-      multiple-of-12 invariant. BLOBs larger than one page cannot be read
+- [~] Implement BLOB block reading and chaining for multi-page BLOBs. The four BLOBs that
+  came back as exactly 3652 bytes — the only four violating the file's own
+  multiple-of-12 invariant — were a symptom of the page-extent bug, not of missing
+  chaining: they are 3816 bytes, above the old 3676−24 limit and below the new
+  4056−24. All 60 now read correctly. `readBlobChain` is guarded against cycles but
+  **every BLOB page in the corpus has `NextPageNo == -1`**, so multi-page chaining
+  has never run against real data and its two tests are synthetic.
 - [x] Implement ZLIB decompression for compressed BLOBs
 - [ ] Implement BZIP2 decompression (if encountered in test data) — deferred, no test data
 - [x] Add `Record.Blob(col int) ([]byte, error)` method
 - [x] Add `Record.Memo(col int) (string, error)` method (Memo = text BLOB)
-- [~] Test against RPDG0011.abs — 30 records, 60 non-null BLOBs
-  — checks only `len(data) != 0`; the multiple-of-12 invariant is asserted for record 1 only,
-  which is why the 4 broken BLOBs slip through
+- [x] Test against RPDG0011.abs — all 60 BLOBs across all 30 records asserted against an
+      independently measured page→size table plus the multiple-of-12 invariant. The old test
+      checked `len(data) != 0` and asserted the invariant for record 1 only, which is exactly
+      why the four broken BLOBs slipped through — they belong to records 27 and 28.
+- [x] `decompressBlob` has a direct test. It had **0% coverage**: all 60 BLOBs in the
+      fixture that supposedly covers it are stored uncompressed (`CompressedSize ==
+UncompressedSize`), so the decompression path had never executed.
 
 ---
 
@@ -655,9 +705,9 @@ func (rec Record) Bytes(col int) []byte
 - [x] Discover indexes by scanning type-12 pages for root nodes
 - [~] Classify indexes by key size — heuristic tuned to TS03. RREC0011 has key sizes {4,10} and
   RCON0011 {4,15,10}, so `PrimaryKeyIndex()` returns `ErrNoIndex` on both
-- [!] Implement B-tree traversal for single-key lookup
-  — **broken for multi-level trees**: internal nodes use stride `keySize+4`, the code uses
-  `keySize+6` everywhere. `FindByPrimaryKey` fails 600/600 on RCFQ0011 and RMPA0011
+- [x] Implement B-tree traversal for single-key lookup — was broken for multi-level
+      trees (wrong internal-node stride, and byte-wise comparison of little-endian keys).
+      `FindByPrimaryKey` now succeeds 600/600 on RCFQ0011 and RMPA0011; see Phase 5c bug 3
 - [x] Implement index scan via leaf chain (RightPageNo horizontal links)
 - [x] Implement `FindByPrimaryKey(key int32)` — exact match on AutoInc/RecNo
 - [~] Implement `FindByStringKey(value string)`
@@ -690,9 +740,9 @@ func (rec Record) Bytes(col int) []byte
 - [x] Compare the working v7.61 files (RGRP, RREC) against the broken ones (RRAI, RRAD) to identify what differs in page structure
 - [x] Hex-dump the first data page of RRAI0011.abs and manually locate the first record's AutoInc=1 value to determine the correct page header size and record stride
 - [x] Improve `detectRecordLayout` to handle the variant page header format, or add a fallback that uses the schema's expected field sizes to validate candidates
-- [!] Test against all .abs files in `../Aconiq/interoperability/Schienenprojekt - Schall 03/`
-  — **not done.** `RCFQ0011.abs` and `RMPA0011.abs` come from that same corpus, sit in
-  `testdata/`, are still broken, and have no test
+- [x] Test against all .abs files in `../Aconiq/interoperability/Schienenprojekt - Schall 03/`
+      — `RCFQ0011.abs` and `RMPA0011.abs` come from that same corpus, were still broken when
+      this box was first ticked, and are now covered
 
 Implemented in repo with regression coverage for local fixtures: `RRAI0011.abs`, `RRAI0012.abs`, `RRAI0023.abs`, `RRAD0011.abs`, `RRAD0012.abs`, `RRAD0023.abs`. All six still read correctly after the Phase 5c fix was trialled, so 5c is a safe replacement.
 
@@ -700,117 +750,144 @@ Implemented in repo with regression coverage for local fixtures: `RRAI0011.abs`,
 
 ---
 
-## Phase 5c — Record and index layout correctness (HIGHEST PRIORITY)
+## Phase 5c — Record and index layout correctness — DONE
 
-**Goal:** Replace the record-layout guessing machine with the derivation, and fix the
-page extent and B-tree stride. These are data-fidelity bugs: the library currently
-returns wrong or missing rows with no error.
+Four data-fidelity bugs. The library returned wrong or missing rows with no error, and
+every test passed while it did.
 
-### Bug 1 — `nullFlagBytes` is computed with a `+2` fudge factor
+### Bug 1 — `nullFlagBytes` had a `+2` fudge factor — FIXED
 
-`reader.go` hardcodes `(numColumns + 2 + 7) / 8`. Correct is `ceil(numColumns / 8)`.
-The `+2` is not merely suboptimal — it puts the correct answer **outside** the search
-space whenever `numColumns mod 8` is 0 or 7.
+`reader.go` hardcoded `(numColumns + 2 + 7) / 8`; the correct value is
+`ceil(numColumns / 8)`. The `+2` was not merely suboptimal — it put the correct answer
+**outside** the 576-candidate search space whenever `numColumns mod 8` was 0 or 7.
 
 | File     | cols | mod 8     | code            | true | result                                                                       |
 | -------- | ---- | --------- | --------------- | ---- | ---------------------------------------------------------------------------- |
 | RCFQ0011 | 7    | 7         | 2               | 1    | every field shifted 2 bytes → `SrcNo = 65536` (`1<<16`), `FOT500 = 8.1e-292` |
-| RMPA0011 | 31   | 7         | 5               | 4    | garbage from row 2 on; `dump --json` emits invalid JSON                      |
+| RMPA0011 | 31   | 7         | 5               | 4    | garbage from row 2 on; `dump --json` emitted invalid JSON                    |
 | other 14 | —    | 1,3,4,5,6 | correct by luck | —    | plausible values                                                             |
 
-A one-line change to `ceil(cols/8)` was tested against the full corpus: **zero
-regressions**, RCFQ0011 goes from garbage to correct SoundPlan values
-(`Tag`/`Nacht`, `Rail`, 44.909 dB), RMPA0011 from invalid JSON to 516 clean rows.
+- [x] `nullFlagBytes = ceil(numColumns / 8)`
+- [x] Validate using the spare high bits of the last null-flag byte (set to 1 when the
+      layout is right) — a check that errors, never a search
+- [x] `detectRecordLayout`, `scoreLayoutCandidate`, `scoreRecordData` and
+      `countPresentSlots` deleted; the layout is computed from the schema
+- [x] All tuning constants gone (`pageHdr <= 64`, `extra <= 8`, the score weights,
+      `1e9`, the 85%-printable rule, `1e±100`)
 
-- [ ] `nullFlagBytes = ceil(numColumns / 8)`
-- [ ] Validate the result using the spare high bits (they are set to 1 when correct)
-- [ ] Delete `detectRecordLayout` and `scoreRecordData` entirely; compute
-      `recordSize = nullFlagBytes + fieldDataSize` directly from the schema
-- [ ] Remove the now-dead tuning constants (`pageHdr <= 64`, `extra <= 8`, the score
-      weights, `1e9`, the 85%-printable rule, `1e±100`)
+The derivation, verified against all 12 non-empty fixtures:
 
-### Bug 2 — page data extent is 3676 bytes instead of `pageSize - 40`
+```
+nullFlagBytes  = ceil(numColumns / 8)
+recordSize     = nullFlagBytes + sum(fieldStoreSize(col))   // no trailer, no padding
+recordsPerPage = max n with ceil(n/8) + n*recordSize <= pageSize - 40
+bitmapBytes    = ceil(recordsPerPage / 8)
+record k       at payload[bitmapBytes + k*recordSize]
+```
 
-Trailing records of every full data page are silently dropped.
+`recordsPerPage` is a fixed point: the bitmap size depends on the slot count, which
+depends on the bitmap size. Note that files like RPDG0011 have far more slots per page
+(161) than rows (30), so most of the bitmap is zero bytes — `bitmapBytes` must never be
+inferred from the number of set bits.
 
-| File     | true rows | reader rows | lost |
-| -------- | --------- | ----------- | ---- |
-| RCON0011 | 300       | 275         | 25   |
-| RREC0011 | 30        | 27          | 3    |
-| RR240011 | 30        | 28          | 2    |
+### Bug 2 — page payload extent — FIXED
 
-- [ ] Model the data area as `pageSize - 40` bytes, wrapping around the `ABSP` header
-      block at `0x17C..0x1A3`
-- [ ] `recordsPerPage = floor((pageSize - 40 - bitmapBytes) / recordSize)`
+- [x] Page N's payload is the contiguous `pageSize - 40` bytes at
+      `file[N*pageSize+420 : (N+1)*pageSize+380]`, continuing into the next block. See
+      [Page payload extent](#page-payload-extent-solved--supersedes-two-earlier-descriptions);
+      the "wraps around inside the page" description this section used to carry was wrong.
+- [x] `recordsPerPage` derived from the real payload length
 
-### Bug 3 — B-tree internal-node stride
+Rows recovered: RCON0011 275 → 300, RCFQ0011 504 → 600, RREC0011 27 → 30,
+RR240011 28 → 30. It also repaired the four truncated RPDG0011 BLOBs, which were
+3816 bytes — above the old 3652-byte limit, below the new 4032.
 
-- [ ] Use `keySize + 4` for internal nodes and `keySize + 6` for leaves in
-      `readBTreeEntries`
-- [ ] Re-test `FindByPrimaryKey` on RCFQ0011 and RMPA0011 (currently 0/600 on both)
-- [ ] Make `FindByStringKey` a binary search rather than a linear scan
+### Bug 3 — B-tree stride, plus a second defect — FIXED
 
-### Bug 4 — empty tables are an error
+- [x] `keySize + 4` for internal nodes, `keySize + 6` for leaves
+- [x] Keys are `[null flag] + int32 **little-endian**` but were compared with
+      `bytes.Compare`, which orders 256 before 2 while the page is sorted by value.
+      This was not in the original diagnosis and the stride fix alone was not enough:
+      `FindByPrimaryKey` on RCFQ0011/RMPA0011 went 0/600 → 229/600 → 600/600.
+- [x] `FindByStringKey` binary-searches instead of scanning the leaf linearly
 
-- [ ] `OpenTable()` on a table with no rows (e.g. `Addresses.abs`) returns
-      `ErrNoData`; it should return an iterator that yields nothing
+Separator semantics were confirmed from raw bytes rather than assumed: RCFQ0011's root
+holds `key=0 → child 16`, `key=185 → 17`, `key=369 → 20`, covering 1..184 / 185..368 /
+369..600, so the key is the child's smallest key with a 0 sentinel and the existing
+"rightmost separator ≤ searchKey" descent was already correct.
 
-**Exit criterion:** reader row count equals index-scan row count for every fixture
-(Phase T), and RCFQ0011/RMPA0011 produce correct values.
+### Bug 4 — empty tables were an error — FIXED
+
+- [x] `OpenTable()` on a table with no rows returns an iterator that yields nothing
+
+**Exit criterion met:** reader row count equals index leaf-scan count for all 20
+fixtures, and RCFQ0011/RMPA0011 produce correct values.
 
 ---
 
-## Phase 5d — Robustness and fuzz-safety
+## Phase 5d — Robustness and fuzz-safety — DONE
 
-**Goal:** Meet the "No panics" and "Fuzz-safe" policies stated in `CLAUDE.md`, which
-are currently unmet. All of the following were reproduced against the committed tree.
+The "No panics" and "Fuzz-safe" policies in `CLAUDE.md` were unmet. Every item below was
+**reproduced against the tree before being fixed** — the measured failure is recorded
+next to each, not just the theory.
 
 ### Unbounded resource use
 
-- [ ] Validate `TotalPageCount` against the real file size in `parseHeader` and reject
-      negatives — a 148 KB input currently triggers
-      `runtime: out of memory: cannot allocate 4429185024-byte block` via
-      `ScanPages`' `make([]PageSummary, count)`; a negative value reaches `make()` and
-      panics with `makeslice: len out of range`
-- [ ] Make `ReadPage` reject reads past EOF instead of swallowing `io.EOF`; it
-      currently fabricates zero-filled pages, which is what converts a bogus header
-      field into an OOM rather than an error
-- [ ] Add cycle detection to the BLOB page chain — a self-referential `NextPageNo`
-      grows to 7.3 GiB in 3 seconds from a 4 KB file
-- [ ] Add cycle/depth guards to all four B-tree walks (`scanLeaves`, `searchBTree`,
-      `searchBTreeString`, `findLeftmostLeaf`) — a cyclic leaf chain loops forever
-- [ ] Bound both zlib readers with `io.LimitReader` using the already-parsed
-      decompressed size — a 64 KB page currently expands to 157 MiB. The size field is
-      parsed and then discarded in two places (`schema.go`, and a parameter literally
-      named `_ int64` in `blob.go`)
+- [x] `TotalPageCount` validated against the real file size, negatives rejected. A
+      148 KB crafted input produced
+      `runtime: out of memory: cannot allocate 4429185024-byte block` via `ScanPages`'
+      `make([]PageSummary, count)`; a negative value panicked in `makeslice`.
+- [x] `ReadPage` rejects short reads instead of swallowing `io.EOF` and fabricating
+      zero-filled pages — the mechanism that turned a bogus header field into an OOM
+- [x] BLOB chain cycle detection. `CompressedSize = 1<<34` with a self-referential
+      `NextPageNo` gave `out of memory: cannot allocate 17179869184-byte block` from a
+      320 KB file; the chain also now allocates in chunks rather than trusting the
+      declared total
+- [x] Cycle and depth guards on all four B-tree walks — a self-referential
+      `RightPageNo` hung the process
+- [x] Both zlib readers bounded with `io.LimitReader`. A 2 KB stream declaring
+      `UncompressedSize = 100` returned 2 MiB with `err == nil`; a schema stream
+      declaring 64 returned 64 MiB. The declared size was parsed and then discarded in
+      both places — in `schema.go`, and via a parameter literally named `_ int64` in
+      `blob.go`. A ceiling stops a bogus declared size being the bomb itself.
+- [x] B-tree entry counts and schema column counts bounded by what the page can hold,
+      not by the attacker-controlled count field
 
 ### Panics on malformed input
 
-- [ ] `blob.go` — the guard tests `page.Header == nil` and then dereferences
-      `page.Header.PageType` **inside that same branch**. Same shape in `readBlobChain`
-- [ ] `blob.go` — `hdr.CompressedSize` is a raw int64; a negative value reaches
-      `compressedData[:hdr.CompressedSize]` → `slice bounds out of range [:-1]`
-- [ ] `index.go` — `entries[0]` on an empty internal node
-- [ ] `index.go` — `KeyPrefixSize == 0` reaches `makeStringKey` → index out of range
-- [ ] Bounds-check **every** `Record` accessor: validate `col` is in range and that
-      `off + width <= len(fieldData)`. All of `Int`, `Int64`, `Float`, `Bool`, `Time`,
-      `Bytes`, `String`, `BlobRef` currently panic on a short trailing column or an
-      out-of-range index — and this is reachable from the shipped CLI, not just misuse
+- [x] `blob.go` — the guard tested `page.Header == nil` and then dereferenced
+      `page.Header.PageType` **inside that same branch**; same shape in `readBlobChain`
+- [x] `blob.go` — negative `CompressedSize` reached `compressedData[:size]` →
+      `slice bounds out of range [:-1]`
+- [x] `index.go` — `entries[0]` on an empty internal node
+- [x] `index.go` — `KeyPrefixSize == 0` reached `makeStringKey` → index out of range
+- [x] Every `Record` accessor bounds-checks `col` and `off + width <= len(fieldData)`,
+      including `BlobRef`. All of them panicked before, reachable from the shipped CLI.
+- [x] `Record()` advanced the iterator as a side effect, so calling it twice per
+      `Next()` sliced out of range
+- [x] A crafted `pageSize` below 420 made the payload slice negative
 
 ### Type-decoding bugs
 
-- [ ] `Single` (4 bytes) is decoded with `math.Float64frombits` over 8 bytes — always
-      wrong, and reads into the next field
-- [ ] `Int()` reads 4 bytes for 2-byte `SmallInt`/`Word` — wrong value and wrong sign
+- [x] `Single` was decoded with `math.Float64frombits` over 8 bytes — always wrong, and
+      it read into the next field
+- [x] `Int()` read 4 bytes for 2-byte `SmallInt`/`Word`; added `Int16`/`Uint16` and
+      routed the integer accessors through the column's real width with correct sign
       extension
-- [ ] `WideString`/`WideChar` stop at the first `0x00` and decode as Windows-1252, so
-      UTF-16LE `"Hallo"` returns `"H"`. The CLI routes these types here and prints
-      silently wrong data
+- [x] `WideString`/`WideChar` stopped at the first `0x00` and decoded Windows-1252, so
+      UTF-16LE `"Hallo"` returned `"H"`. Now decoded as UTF-16LE.
+- [x] Column **names** were built with a raw `string()` and not decoded from
+      Windows-1252, unlike every other string on disk
+
+> Single, SmallInt, Word, Int64, Currency and WideString have **no corpus coverage** —
+> no fixture has a column of those types. They are correct by construction and covered
+> only by hand-built records. This is the largest remaining validation gap in the reader
+> and only a round-trip against the Delphi engine can close it.
 
 ### Fuzzing
 
-- [ ] Add `FuzzOpen`, `FuzzParseSchema`, `FuzzReadBlob` seeded from `testdata/*.abs`
-- [ ] Add a `go test -fuzz` job to CI with a time budget
+- [ ] `FuzzOpen`, `FuzzParseSchema`, `FuzzReadBlob` seeded from `testdata/*.abs`
+- [ ] A `go test -fuzz` job in CI with a time budget
 
 ---
 
@@ -891,15 +968,14 @@ Phase 5c/5d class of bug. Without this, nothing else stays fixed.
 
 ---
 
-## Phase 6 — Encryption support (read-only)
+## Phase 6 — Encryption support (read-only) — DONE
 
-**Goal:** Open encrypted `.abs` files given a password.
+Encrypted `.abs` files open with a password, from the library and from the CLI.
 
-The cryptography is **solved and verified** — see
-[Encryption](#encryption-solved-and-verified) for the full scheme. What remains is
-mechanical Go coding against a known-correct specification. `crypto.go` currently ships
-an implementation that is wrong in four independent ways: zero IV, plain AES-CBC,
-whole-page decryption, and RIPEMD-128-only key derivation.
+The scheme is documented under [Encryption](#encryption-solved-and-verified). The
+implementation that shipped before this phase was wrong in four independent ways: a zero
+IV, plain AES-CBC instead of DEC's CTS, whole-block decryption over the wrong extent, and
+a key derivation that took an algorithm parameter and ignored it.
 
 ### Steps
 
@@ -908,29 +984,45 @@ whole-page decryption, and RIPEMD-128-only key derivation.
 - [x] RIPEMD-128 (passes all seven official vectors)
 - [x] Recover the key derivation, cipher mode, IV and CRC convention
 - [x] Recover the per-algorithm hash mapping (via go-dede on `ABSDiskEngine.dcu`)
-- [ ] Add `ripemd256.go` (needed for Rijndael-256, Blowfish and Twofish-256)
-- [ ] Add `absCRC32` — reflected `0xEDB88320`, init 0, **no** final XOR
-- [ ] Replace `decryptCBC` with `decryptCTS` using the **`0xFF` IV** and DEC feedback
-      rule `F_{i+1} = C_i XOR F_i`, including the trailing partial block
-- [ ] Make `deriveKey` algorithm-aware (it currently takes an `algo` parameter and
-      ignores it, so Blowfish and DES files are silently treated as AES-128 and fail
-      with a misleading `ErrWrongPassword`)
-- [ ] Return the already-declared `ErrUnsupportedCipher` for Twofish/Square instead of
-      `ErrWrongPassword` — it is currently never returned anywhere
-- [ ] Decrypt `data[420:pageSize]` in `ReadPage`, gated on `ABSP.CRC32 != 0`, leaving
-      the `ABSP` header in the clear
-- [ ] Add `golang.org/x/crypto/blowfish`
-- [x] Add `OpenWithPassword(path, password string) (*File, error)`
-- [ ] Add a `--password` flag to the CLI — `OpenWithPassword` exists and three
-      encrypted fixtures are present, but no command can reach the feature
-- [ ] Repoint the crypto tests at the real encrypted fixtures (Phase T)
+- [x] `ripemd256.go` — needed for Rijndael-256, Blowfish and Twofish-256
+- [x] `absCRC32` — reflected `0xEDB88320`, init 0, **no** final XOR
+- [x] DEC `cmCTS` with the `0xFF` IV and feedback `F_{i+1} = C_i XOR F_i`, including
+      the trailing partial block
+- [x] `deriveKey` is algorithm-aware — Blowfish uses RIPEMD-**256**, which is the
+      non-obvious entry and why earlier Blowfish attempts failed
+- [x] `ErrUnsupportedCipher` is actually returned, for Twofish and Square
+- [x] Decrypt the **whole page payload** (4056 bytes), not `data[420:pageSize]`, gated
+      on `ABSP.CRC32 != 0`, leaving the `ABSP` header in the clear
+- [x] `golang.org/x/crypto/blowfish`
+- [x] `OpenWithPassword(path, password string) (*File, error)`, and `Unlock` on an
+      already-open file. `OpenWithPassword` no longer collapses `ErrUnsupportedCipher`
+      into `ErrWrongPassword` — a caller can retry a password but not a missing cipher.
+- [x] `--password` / `-p` on all six CLI commands. An encrypted file opened without one
+      now says so instead of yielding nil-header pages.
+- [x] Crypto tests repointed at the real encrypted fixtures. They previously all
+      targeted `Addresses.abs`, which is the **unencrypted** fixture, and
+      `TestVerifyPassword` tried two casings and passed if either worked.
+
+**Verified:** Rijndael-128, DES-Single, Blowfish — each decrypts byte-identically to the
+plaintext `Addresses.abs`, 13/13 pages, over the full payload.
+
+**Implemented but untested:** Rijndael-256 and DES-Triple — no fixtures. For DES-Triple
+the 16-byte digest is expanded to two-key 3DES (K1, K2, K1) to fill Go's 24-byte key
+schedule; that expansion is an inference, not a verified fact.
+
+**Unsupported:** Twofish-128/256 and Square return `ErrUnsupportedCipher`. Their key
+derivation is implemented and tested, so only the block cipher is missing. Square is
+DEC-specific and would have to be ported.
+
+> The three encrypted fixtures are encrypted copies of an **empty table**. Header, schema
+> and page decryption are validated byte-exactly; encrypted _record_ decryption never is,
+> and cannot be until a fixture with rows and a known password exists.
 
 ### Deferred
 
-- [ ] Twofish-128/256 and Square — need Go implementations; Square is DEC-specific and
-      would have to be ported. No fixtures exist to test against
-- [ ] Rijndael-256 and DES-Triple — stdlib ciphers, but no fixtures
-- [ ] Reproduce the `ABSP.CRC32` page checksum (cosmetic; integrity checking only)
+- [ ] Twofish-128/256 — need a Go implementation; no fixtures
+- [ ] Square — DEC-specific, would have to be ported; no fixtures
+- [ ] Fixtures with rows for Rijndael-256 and DES-Triple
 
 ---
 
@@ -987,33 +1079,36 @@ whole-page decryption, and RIPEMD-128-only key derivation.
 Fixtures live in `testdata/` (currently **gitignored** — see Phase T). Derived from
 SoundPlan project files in `../Aconiq/interoperability/Schienenprojekt - Schall 03/`.
 
-Columns and row counts below are **measured**, not estimated. "True rows" comes from the
-B-tree index scan; "reader" is what the record iterator returns today.
+Columns and row counts below are **measured**, not estimated.
 
-| File                         | Version | Cols | True rows | Reader | Status                                  |
-| ---------------------------- | ------- | ---- | --------- | ------ | --------------------------------------- |
-| `TS03.abs`                   | 5.13    | 9    | 18        | 18     | OK                                      |
-| `RREC0011.abs`               | 7.61    | 20   | 30        | 27     | 3 rows lost (Phase 5c bug 2)            |
-| `RCON0011.abs`               | 7.61    | 36   | 300       | 275    | 25 rows lost                            |
-| `RCFQ0011.abs`               | 7.61    | 7    | 600       | 504    | **garbage values** (bug 1) + rows lost  |
-| `RMPA0011.abs`               | 7.61    | 31   | 600       | —      | **garbage**, emits invalid JSON (bug 1) |
-| `RPDG0011.abs`               | 7.61    | 5    | 30        | 30     | OK, but 4 of 60 BLOBs are wrong         |
-| `RR240011.abs`               | 7.61    | 27   | 30        | 28     | 2 rows lost                             |
-| `RFRQ0011.abs`               | 7.61    | 5    | 60        | 60     | OK                                      |
-| `RGRP0011.abs`               | 7.61    | 6    | 30        | 30     | OK                                      |
-| `RMND0011.abs`               | 7.61    | 3    | 10        | 10     | OK                                      |
-| `RRAD0011/0012/0023.abs`     | 7.61    | 12   | 20 each   | 20     | OK                                      |
-| `RRAI0011/0012/0023.abs`     | 7.61    | 12   | 5 each    | 5      | OK                                      |
-| `Addresses.abs`              | 7.94    | 19   | 0 (empty) | error  | empty table returned as `ErrNoData`     |
-| `Addresses-Rijndael_128.abs` | 7.94    | 19   | 0 (empty) | —      | encrypted; password `"Bla"`             |
-| `Addresses-Blowfish.abs`     | 7.94    | 19   | 0 (empty) | —      | encrypted; password `"Bla"`             |
-| `Addresses-DES_Single.abs`   | 7.94    | 19   | 0 (empty) | —      | encrypted; password `"Bla"`             |
+| File                         | Version | Cols | Rows | Reader | Status                                      |
+| ---------------------------- | ------- | ---- | ---- | ------ | ------------------------------------------- |
+| `TS03.abs`                   | 5.13    | 9    | 18   | 18     | OK                                          |
+| `RREC0011.abs`               | 7.61    | 20   | 30   | 30     | OK (was 27)                                 |
+| `RCON0011.abs`               | 7.61    | 36   | 300  | 300    | OK (was 275)                                |
+| `RCFQ0011.abs`               | 7.61    | 7    | 600  | 600    | OK (was 504 rows of garbage values)         |
+| `RMPA0011.abs`               | 7.61    | 31   | 600  | 600    | OK (was garbage, emitting invalid JSON)     |
+| `RPDG0011.abs`               | 7.61    | 5    | 30   | 30     | OK; all 60 BLOBs correct (4 were truncated) |
+| `RR240011.abs`               | 7.61    | 27   | 30   | 30     | OK (was 28)                                 |
+| `RFRQ0011.abs`               | 7.61    | 5    | 60   | 60     | OK                                          |
+| `RGRP0011.abs`               | 7.61    | 6    | 30   | 30     | OK                                          |
+| `RMND0011.abs`               | 7.61    | 3    | 10   | 10     | OK                                          |
+| `RRAD0011/0012/0023.abs`     | 7.61    | 12   | 20   | 20     | OK                                          |
+| `RRAI0011/0012/0023.abs`     | 7.61    | 12   | 5    | 5      | OK                                          |
+| `Addresses.abs`              | 7.94    | 19   | 0    | 0      | OK; empty iterator (was `ErrNoData`)        |
+| `Addresses-Rijndael_128.abs` | 7.94    | 19   | 0    | 0      | decrypts 13/13 pages, password `"Bla"`      |
+| `Addresses-Blowfish.abs`     | 7.94    | 19   | 0    | 0      | decrypts 13/13 pages, password `"Bla"`      |
+| `Addresses-DES_Single.abs`   | 7.94    | 19   | 0    | 0      | decrypts 13/13 pages, password `"Bla"`      |
 
-> **Correction (2026-08-28 review).** The previous version of this table was written
-> from notes rather than from the files, and was wrong throughout: `RCFQ0011` was listed
-> as 20 columns / 602 rows (really 7 / 600), `RCON0011` as 40 / 15 (really 36 / 300),
-> `RPDG0011` as 73 / 32 (really 5 / 30), and `Addresses.abs` as v7.10 / 12 columns
-> (really v7.94 / 19, and empty). `AttrEsse.abs` was listed but is not in `testdata/`.
+"Rows" is the count from the B-tree leaf scan, which is independent of the record
+decoder. "Reader" is what the record iterator returns. They now agree for every fixture,
+and the suite asserts that _agreement_, not just the numbers.
+
+> Earlier revisions of this table were written from notes rather than from the files and
+> were wrong throughout: `RCFQ0011` was listed as 20 columns / 602 rows (really 7 / 600),
+> `RCON0011` as 40 / 15 (really 36 / 300), `RPDG0011` as 73 / 32 (really 5 / 30), and
+> `Addresses.abs` as v7.10 / 12 columns (really v7.94 / 19, and empty). `AttrEsse.abs`
+> was listed but is not in `testdata/`.
 
 ### Validation approach
 
@@ -1081,21 +1176,26 @@ candidate for `internal/`.
 
 ## Priority
 
-**Immediate — correctness and trust.** The library is already a dependency of
-`../Aconiq`, and it currently loses rows and returns garbage without signalling either.
+**Done — correctness and trust.** Phases 5c, 5d and 6 have landed. The library no longer
+loses rows or returns garbage without signalling, the parser no longer panics or OOMs on
+malformed input, and encrypted files open with a password.
 
-1. **Phase 5c** — record and index layout correctness. Two of the four fixes are one
-   line each and were verified to have zero regressions.
-2. **Phase T** — the index cross-check oracle, a green suite, committed fixtures, CI.
-   5c without T means the next regression is equally invisible.
-3. **Phase 5d** — robustness. Required before the library is pointed at any `.abs`
-   file that Aconiq did not produce itself.
+**Next.**
 
-**Next — capability.**
+1. **Phase T** — synthetic fixtures, CI, and the index cross-check as a standing
+   assertion. Without it the next regression is as invisible as the last one was: the
+   suite passed for months while the reader returned 275 of 300 rows.
+2. **Phase 5e** — multi-table, if any real file needs it. It forces a breaking API
+   change (`Schema()` / `OpenTable()` gain a table argument), so it should land before a
+   stable version is tagged. No fixture exercises it — all 20 are `ObjectID == 1`.
+3. **Re-tag `v0.1.0`.** The existing tag shares no ancestry with `main`, yet `../Aconiq`
+   requires it with no `replace`. Re-tag from `main` and bump Aconiq.
 
-4. **Phase 6** — ship the verified encryption scheme. The hard part is done.
-5. **Phase 5e** — multi-table, if any real file needs it. Note it forces a breaking API
-   change, so it should land before a stable version is tagged.
+**The largest remaining validation gap** is not a phase. Fourteen field types have zero
+corpus coverage — Single, SmallInt, Word, Int64, Currency, WideString and the rest are
+correct by construction only. Closing that needs a round-trip against the Delphi engine
+(create a table with known values in every type, export, compare), which is the one
+thing this repository cannot do from Linux.
 
 **Deferred.** Phases 7–9 (write support, DDL, `database/sql`) remain out of scope until
 there is a concrete use case for writing `.abs` files.
