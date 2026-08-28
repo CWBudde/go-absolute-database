@@ -9,11 +9,11 @@ validated against real customer files — run `just test` locally for that.
 
 ## The committed fixtures
 
-The seven `Employees-*.abs` files are the exception, one per encryption algorithm. They
+The eight `Employees-*.abs` files are the exception, one per encryption algorithm. They
 are committed because they are the only fixtures CI can see: without them the encryption
 code is never exercised on a runner at all.
 
-All seven hold the identical database and differ only in the cipher:
+All eight hold the identical database and differ only in the cipher:
 
 |          |                                                                                         |
 | -------- | --------------------------------------------------------------------------------------- |
@@ -29,12 +29,10 @@ All seven hold the identical database and differ only in the cipher:
 | `Employees-Rijndael_256.abs` | 1                     | DEC's Rijndael — **not** AES-256, see PLAN.md |
 | `Employees-DES_Single.abs`   | 2                     | DES                                           |
 | `Employees-DES_Triple.abs`   | 3                     | DEC's `TCipher_3TDES`, 24-byte block          |
+| `Employees-Blowfish.abs`     | 4                     | Blowfish (`golang.org/x/crypto/blowfish`)     |
 | `Employees-Twofish_128.abs`  | 5                     | DEC's Twofish variant                         |
 | `Employees-Twofish_256.abs`  | 6                     | DEC's Twofish variant                         |
 | `Employees-Square.abs`       | 7                     | Square                                        |
-
-Blowfish (4) has no `Employees-` fixture; it is covered only by the empty-table
-`Addresses-Blowfish.abs`, which is not committed.
 
 They contain no customer data — the schema and all three rows are invented — and no
 vendor material. This was checked rather than assumed: scanning both the ciphertext and
@@ -48,17 +46,22 @@ produced by the Software, not parts of it, and carry no registration or access c
 
 ## Why they matter
 
-Three of them found real bugs that no amount of reading could have:
+Three of them found real bugs that no amount of reading could have, and the fourth
+ruled one out:
 
 - `Employees-Rijndael_256.abs` proved that DEC's Rijndael key schedule diverges from AES
   for 256-bit keys, so the shipped `crypto/aes` implementation was silently wrong.
 - `Employees-DES_Triple.abs` proved that `DES_Triple` is `TCipher_3TDES` with a **24-byte
   block**, not two-key EDE Triple DES over 8 bytes as had been inferred.
 - `Employees-Square.abs` validated the Square port end to end.
+- `Employees-Blowfish.abs` was the last one added, and is the only algorithm whose
+  implementation it did **not** change: Blowfish read its three rows correctly on the
+  first attempt. That is a result, not a formality — the two before it did not.
 
 They are also the only encrypted fixtures with any rows. The three `Addresses-*` fixtures
 are encrypted copies of an _empty_ table, so before these existed, encrypted _record_
-decryption had never been validated for any cipher.
+decryption had never been validated for any cipher. With Blowfish in place there is no
+longer any algorithm whose record path rests on an empty table.
 
 Because they have no plaintext twin, decryption is checked against each page's `ABSP`
 checksum, which covers the decrypted payload and so is an oracle needing no twin, and

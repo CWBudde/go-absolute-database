@@ -13,7 +13,7 @@ import (
 // their plaintext twin, but they cannot validate the decryption of encrypted
 // *records* — there are none.
 //
-// The seven Employees-* fixtures close that gap: one per algorithm, each
+// The eight Employees-* fixtures close that gap: one per algorithm, each
 // carrying a real table with three rows, so TestEmployeeFixtures reads
 // encrypted schema and encrypted records end to end. They have no plaintext
 // twin, so instead of a byte comparison they are checked against the ABSP page
@@ -384,8 +384,8 @@ func TestEncryptedFileWithoutPassword(t *testing.T) {
 //
 // They are the whole reason two of these ciphers are correct: Rijndael-256 and
 // DES-Triple were both implemented from inference and both silently wrong until
-// a real file existed to test them against. Blowfish is the one algorithm with
-// no fixture here; it is covered only by the empty-table Addresses-Blowfish.abs.
+// a real file existed to test them against. There are eight, one per algorithm,
+// so no cipher rests on inference or on an empty table any more.
 var employeeFixtures = []struct {
 	name      string
 	algorithm CryptoAlgorithm
@@ -394,6 +394,7 @@ var employeeFixtures = []struct {
 	{"Employees-Rijndael_256.abs", CryptoRijndael256},
 	{"Employees-DES_Single.abs", CryptoDESSingle},
 	{"Employees-DES_Triple.abs", CryptoDESTriple},
+	{"Employees-Blowfish.abs", CryptoBlowfish},
 	{"Employees-Twofish_128.abs", CryptoTwofish128},
 	{"Employees-Twofish_256.abs", CryptoTwofish256},
 	{"Employees-Square.abs", CryptoSquare},
@@ -413,8 +414,8 @@ var employeeRows = []struct {
 }
 
 // TestEmployeeFixtures reads every algorithm's fixture end to end: header,
-// password verification, per-page decryption, schema and record values. Seven
-// of the eight defined algorithms are covered.
+// password verification, per-page decryption, schema and record values. All
+// eight defined algorithms are covered.
 func TestEmployeeFixtures(t *testing.T) {
 	for _, fixture := range employeeFixtures {
 		t.Run(fixture.name, func(t *testing.T) {

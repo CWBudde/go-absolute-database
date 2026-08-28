@@ -10,15 +10,16 @@
 #   record layout derivation, CRC, RIPEMD, the four in-tree ciphers, and the
 #   fuzz targets.
 #
-#   The exceptions are the seven testdata/Employees-*.abs fixtures, one per
+#   The exceptions are the eight testdata/Employees-*.abs fixtures, one per
 #   encryption algorithm, which are committed (see testdata/README.md:
 #   synthetic data, no customer content). They are the only real .abs files a
 #   runner sees, so CI does exercise the full encrypted read path end to end --
 #   page decryption against the ABSP checksum, schema, records, and the index
-#   oracle -- for seven of the eight algorithms. Only Blowfish is missing.
+#   oracle -- for every one of the eight algorithms.
 #
-#   Everything else -- all 20 customer fixtures, and Blowfish decryption --
-#   is validated only on a developer machine that has them. Run
+#   Everything else -- all 20 customer fixtures, and the byte-identical
+#   comparison against a plaintext twin -- is validated only on a developer
+#   machine that has them. Run
 #   `just test` (or `just ci`) locally before merging anything that touches the
 #   parser. A green CI run means "nothing obviously broken", not "verified
 #   against real .abs files".

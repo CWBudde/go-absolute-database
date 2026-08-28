@@ -352,7 +352,7 @@ vendor-produced `.abs` file:
 | 1     | Rijndael-256 | `Employees-Rijndael_256.abs` | **DEC deviation**, see below            |
 | 2     | DES-Single   | `Employees-DES_Single.abs`   | plain DES                               |
 | 3     | DES-Triple   | `Employees-DES_Triple.abs`   | **`TCipher_3TDES`, 24-byte block**      |
-| 4     | Blowfish     | _(none — empty table only)_  | plain Blowfish, verified byte-identical |
+| 4     | Blowfish     | `Employees-Blowfish.abs`     | plain Blowfish, also byte-identical     |
 | 5     | Twofish-128  | `Employees-Twofish_128.abs`  | **DEC deviation**, see below            |
 | 6     | Twofish-256  | `Employees-Twofish_256.abs`  | **DEC deviation**, see below            |
 | 7     | Square       | `Employees-Square.abs`       | faithful to the published cipher        |
@@ -483,9 +483,11 @@ is what proves the harness itself rather than the ciphers.
   independent oracle.
 - ~~Rijndael-256, Square and DES-Triple are still untested — no fixtures.~~ **Resolved**,
   and two of the three turned out to be wrong; see the deviations above.
-- **Blowfish has no fixture with rows.** It is verified byte-identically against the
-  plaintext twin, so this is a much smaller gap than the others were, but it is the last
-  algorithm whose record path rests on an empty table.
+- ~~Blowfish has no fixture with rows.~~ **Resolved.** `Employees-Blowfish.abs` closes
+  the last gap, and unlike Rijndael-256 and DES-Triple it changed nothing: Blowfish read
+  its three rows correctly on the first attempt. Every algorithm's record path now rests
+  on a real file rather than on an empty table. Blowfish is now doubly covered — it is
+  also one of the three verified byte-identically against the plaintext twin.
 - ~~The `ABSP.CRC32` page checksum does not reproduce over the decrypted data.~~
   **Resolved.** `ABSP.CRC32` is `absCRC32` over the decrypted **4056-byte payload**. The
   recorded mismatch (computed `8316267a` vs stored `6b705972`) was the 3676-byte value: an
@@ -1163,10 +1165,9 @@ a key derivation that took an algorithm parameter and ignored it.
       `TestVerifyPassword` tried two casings and passed if either worked.
 
 **All eight algorithms are implemented and all eight are exercised against real
-vendor-produced files.** Seven have an `Employees-*.abs` fixture carrying a real table,
-read end to end: header, password, every page against its ABSP checksum, schema, and all
-three records with their exact values. Blowfish has no fixture with rows, but decrypts
-byte-identically against its plaintext twin.
+vendor-produced files carrying real rows.** Each has an `Employees-*.abs` fixture read end
+to end: header, password, every page against its ABSP checksum, schema, and all three
+records with their exact values.
 
 **Verified byte-identically against the plaintext `Addresses.abs`:** Rijndael-128,
 DES-Single, Blowfish — 13/13 pages over the full payload.
@@ -1187,8 +1188,8 @@ others is faithful to the published cipher. It was the last algorithm returning
 `ErrUnsupportedCipher`; that error is now reserved for algorithm bytes outside the enum.
 
 > The three `Addresses-*` fixtures are encrypted copies of an **empty table**, so they
-> validate header, schema and page decryption byte-exactly but never records. The seven
-> `Employees-*` fixtures cover records, for every algorithm but Blowfish.
+> validate header, schema and page decryption byte-exactly but never records. The eight
+> `Employees-*` fixtures cover records, for every algorithm.
 
 ### Deferred
 
@@ -1196,8 +1197,8 @@ others is faithful to the published cipher. It was the last algorithm returning
       route via DBManager under Wine made the "no fixtures" premise obsolete.
 - [x] ~~Fixtures with rows for Rijndael-256 and DES-Triple~~ — done, and both turned out
       to be decrypting incorrectly.
-- [ ] A fixture with rows for Blowfish — the last algorithm whose record path rests only
-      on an empty table. Cheap to produce with the same Wine recipe.
+- [x] ~~A fixture with rows for Blowfish~~ — done with the same Wine recipe. It is the
+      one fixture that confirmed an implementation instead of correcting it.
 
 ---
 

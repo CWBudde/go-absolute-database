@@ -41,6 +41,7 @@ testdata/*
 !testdata/Employees-Rijndael_256.abs
 !testdata/Employees-DES_Single.abs
 !testdata/Employees-DES_Triple.abs
+!testdata/Employees-Blowfish.abs
 !testdata/Employees-Twofish_128.abs
 !testdata/Employees-Twofish_256.abs
 !testdata/Employees-Square.abs
