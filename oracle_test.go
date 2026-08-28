@@ -56,6 +56,34 @@ var oracleRowCounts = map[string]int{
 	"Addresses-Blowfish.abs":     0,
 	"Addresses-DES_Single.abs":   0,
 	"Addresses-Rijndael_128.abs": 0,
+	"Writes.abs":                 3,
+	"Writes-ins1.abs":            4,
+	"Writes-ins2.abs":            5,
+	"Writes-upd.abs":             3,
+	"Writes-updname.abs":         3,
+	"Writes-idx.abs":             3,
+	"Writes-idx-ins.abs":         4,
+	"Writes-upd2.abs":            3,
+	"Writes-del2.abs":            1,
+	"Writes-del.abs":             2,
+	"Writes-delins.abs":          3,
+}
+
+// unindexedFixtures are the fixtures deliberately created without a user
+// index, because this package refuses to insert into or delete from an indexed
+// table (see ErrIndexNotMaintained) and the write tests need a table it will
+// accept. They are named here rather than detected, so that an index silently
+// disappearing from any other fixture still fails the cross-check below.
+var unindexedFixtures = map[string]bool{
+	"Writes.abs":         true,
+	"Writes-ins1.abs":    true,
+	"Writes-ins2.abs":    true,
+	"Writes-upd.abs":     true,
+	"Writes-updname.abs": true,
+	"Writes-upd2.abs":    true,
+	"Writes-del2.abs":    true,
+	"Writes-del.abs":     true,
+	"Writes-delins.abs":  true,
 }
 
 // fixtureNames returns every testdata/*.abs in sorted order. It skips the test
@@ -212,6 +240,10 @@ func reportDiff(t *testing.T, label string, onlyA, onlyB []recordID) {
 func TestOracleReaderMatchesLeafScan(t *testing.T) {
 	for _, name := range fixtureNames(t) {
 		t.Run(name, func(t *testing.T) {
+			if unindexedFixtures[name] {
+				t.Skip("fixture has no user index by design; see unindexedFixtures")
+			}
+
 			db := openFixture(t, name)
 
 			reader, err := db.OpenTable()

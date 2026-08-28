@@ -1202,19 +1202,142 @@ others is faithful to the published cipher. It was the last algorithm returning
 
 ---
 
-## Phase 7 — Write support: record modification
+## Phase 7 — Write support: record modification — DONE within existing pages
 
 **Goal:** Create, update, and delete records in existing tables.
 
+Records are inserted, updated and deleted through a `TableWriter` (`writer.go`) whose
+changes are buffered in memory until `Commit`.
+
+The claim this phase rests on is stronger than "reads back correctly": **every supported
+operation reproduces the engine's own output byte for byte.** `TestWriterMatchesEngineByteForByte`
+takes a database DBManager produced, applies through this package the one SQL statement
+DBManager was given, and requires the result to equal DBManager's file exactly — all six
+cases pass. A writer that maintained only the record and its occupancy bit would still
+round-trip through this package's own reader and would still be wrong, because the engine
+keeps four further things in step.
+
+### What a write has to keep in step
+
+Eleven vendor files were produced for this, each by copying its predecessor and running a
+single statement in DBManager, so a byte diff isolates exactly one operation. An INSERT
+changes **18 bytes across three pages plus one in the file header**, and every one of them
+is accounted for:
+
+| What                  | Where                                           | INSERT        | UPDATE             | DELETE        |
+| --------------------- | ----------------------------------------------- | ------------- | ------------------ | ------------- |
+| Record bytes          | data page, slot `bitmapBytes + slot*recordSize` | written       | changed field only | left in place |
+| Occupancy bit         | data page, bitmap bit `slot`                    | set           | —                  | cleared       |
+| Per-page record count | record-page index entry for that page           | +1            | —                  | −1            |
+| Table record count    | table info page, payload offset **50**          | +1            | —                  | −1            |
+| Table change counter  | table info page, payload offset **46**          | +1 per record | **+1 per record**  | +1 per record |
+| Page `State`          | `ABSP` header + 4, on every page written        | +1 per write  | +1 per write       | +1 per write  |
+| Database `State`      | file header offset 38                           | +1 per commit | +1 per commit      | +1 per commit |
+
+Two of those rows were only separable because an UPDATE was diffed alongside the inserts:
+offsets 46 and 50 hold the same value in a freshly created database, so an INSERT moves
+both and looks like one field observed twice. `UPDATE Writes SET Salary = 1.5 WHERE Id = 2`
+advances 46 and leaves 50 alone, which is what identifies 46 as a change counter and 50 as
+the record count. A `DELETE` then confirms it from the other side: 46 up, 50 down.
+
+Two further files settle what the change counter counts. Every single-row file moves it by
+one, which is equally consistent with counting transactions and with counting records —
+and the two disagree as soon as one commit touches several rows. `UPDATE ... WHERE Id < 3`
+and `DELETE ... WHERE Id < 3` each affect two rows and each move it by **two**, while the
+page and database `State` counters still move by one. So the change counter counts
+**records touched**, and the `State` counters count writes. Without those two files the
+writer would have been quietly wrong for every multi-row transaction, which is exactly the
+class of bug the single-statement fixtures cannot catch.
+
+The engine leaves a deleted record's bytes in place and reuses the freed slot on the next
+insert — `Writes-del.abs` → `Writes-delins.abs` overwrites only as much of the old record
+as the new one needs. `freeSlot` therefore scans bitmap order rather than appending, which
+is what makes an insert after a delete byte-identical too.
+
+### The internal record-page index
+
+The engine keeps a system index (`systemKeySize` keys) mapping each data page number to
+the number of records on it. Its entries are **6 bytes — a 4-byte key and a 2-byte count —
+not the 10-byte record reference a user index leaf holds**, which `entryStride` assumes for
+every leaf. Confirmed on `RCON0011.abs`, whose 25 entries read as pages 12…28, 31…35, 38…40
+with a count of 12 each, matching its 300 rows over 25 data pages exactly; read with the
+10-byte stride the same page decodes as nonsense. `readRecordPageEntries` reads it with the
+right stride and identifies it by its keys being the table's data pages, so that a second
+system index over BLOB pages is not mistaken for it.
+
+### Counters are only advanced when the file already keeps them
+
+The record count at offset 50 is maintained in the 7.94 files and left at **zero in every
+7.61 customer fixture**, including `RCON0011.abs` with 300 rows. A writer that updated it
+unconditionally would invent a count for files whose engine never kept one, so
+`updateCounters` compares the stored value against what the record-page index reports and
+leaves it alone when the two disagree. The per-page counts, which the 7.61 files _do_
+maintain, are checked the same way and refused with `ErrBookkeepingMismatch` rather than
+overwritten when they do not match.
+
 ### Steps
 
-- [ ] Implement record insertion into data pages (find free slot or append new page)
-- [ ] Implement record update (overwrite in place for fixed-size records)
-- [ ] Implement record deletion (mark as deleted, add to free list)
-- [ ] Implement free space management (reclaim deleted record slots)
-- [ ] Implement transaction support (buffered writes, commit/rollback)
-- [ ] Flush dirty pages to disk
-- [ ] Test: insert, update, delete records; verify with read-back
+- [x] Implement record insertion into data pages (find free slot)
+- [x] Implement record update (overwrite in place for fixed-size records)
+- [x] Implement record deletion (clear the occupancy bit; the bitmap _is_ the free list)
+- [x] Implement free space management — reclaiming a deleted slot is exactly what
+      clearing its bit does, and the next insert takes the lowest free one, as the engine
+      does
+- [x] Implement transaction support (buffered writes, commit/rollback)
+- [x] Flush dirty pages to disk — only pages actually modified are written, so a
+      transaction that changed nothing does not advance any `State` counter
+- [x] Test: insert, update, delete records; verify with read-back **and** against the
+      engine's own bytes
+- [ ] Append a new data page when every existing one is full — currently `ErrTableFull`
+- [ ] Maintain user indexes, so that insert and delete are not refused on an indexed table
+
+### What a user index insert costs — measured, not yet implemented
+
+`Writes-idx.abs` → `Writes-idx-ins.abs` is the same `INSERT` run against a table that also
+carries `CREATE INDEX IdxId ON Writes (Id)`. It changes the eight bytes an unindexed insert
+changes, plus **five more, all on the index page**:
+
+| Offset in the index page's payload | What                                                                                        |
+| ---------------------------------- | ------------------------------------------------------------------------------------------- |
+| `ABSP` + 4                         | the page `State`, +1, like any written page                                                 |
+| 14                                 | `EntryCount` in the B-tree page header, 3 → 4                                               |
+| 51, 56, 60                         | the new leaf entry: 1 null-flag byte + `int32` key, then `PageNo int32` and `ItemNo uint16` |
+
+The leaf entry stride is `KeyPrefixSize + 6` = 11 for this `primaryKeySize` index, so entry
+_i_ starts at `btreeHeaderSize + 11i`; the new entry is number 3, at 51. Only three of its
+eleven bytes differ from the file because the rest of the slot was already zero.
+
+The inserted key sorted last, so nothing had to move. That is the easy case and the only
+one there is evidence for: **an insert whose key sorts into the middle, and one into a full
+leaf that has to split, are not covered by any fixture**, which is why index maintenance is
+still refused rather than half-implemented. Producing those two fixtures is the first step
+of the work, not an afterthought to it.
+
+Also worth recording: `CREATE INDEX IdxId` stores the name `IdxId` nowhere in the file, as
+ASCII or as UTF-16. The index exists only as an extra index page. That is consistent with
+`IndexInfo` carrying no name, and it means an index cannot be addressed by name when the
+time comes.
+
+### Scope boundaries, each an error rather than a silent success
+
+- `ErrIndexNotMaintained` — insert and delete are refused on a table carrying a user
+  index, because they change the set of keys the index must hold. Update is allowed: it
+  changes no key unless it touches an indexed column, and the index format does not record
+  which columns it covers, so the two cases cannot be told apart. That caveat is stated on
+  `Update` and `UpdateColumn`.
+- `ErrTableFull` — no free slot in any existing data page. Growing the table is Phase 8
+  territory.
+- `ErrBlobReferenceLost` — an update may not overwrite a live BLOB reference, because
+  nothing here can free the pages it points at.
+- `ErrBookkeepingMismatch` — the stored counters disagree with the records actually
+  present, so a write cannot bring them forward without guessing.
+- A commit is **not crash-atomic**. Rollback is exact, because nothing is written before
+  `Commit`, but a crash inside `Commit` leaves some pages written. The engine's own
+  journalling is not reproduced.
+- Encrypted files are written as well as read: a modified page is re-checksummed over the
+  new plaintext and re-encrypted, which `TestWriterUpdateRoundTrip` exercises on all eight
+  algorithms. `writePageBuf` refuses the one payload in 2^32 whose checksum comes out zero,
+  because `ReadPage` reads a zero checksum as "this page is in the clear".
 
 ---
 
@@ -1275,6 +1398,13 @@ Columns and row counts below are **measured**, not estimated.
 | `Addresses-Rijndael_128.abs` | 7.94    | 19   | 0    | 0      | decrypts 13/13 pages, password `"Bla"`      |
 | `Addresses-Blowfish.abs`     | 7.94    | 19   | 0    | 0      | decrypts 13/13 pages, password `"Bla"`      |
 | `Addresses-DES_Single.abs`   | 7.94    | 19   | 0    | 0      | decrypts 13/13 pages, password `"Bla"`      |
+| `Writes.abs`                 | 7.94    | 4    | 3    | 3      | unencrypted, no user index — the write base |
+| `Writes-ins1/ins2.abs`       | 7.94    | 4    | 4/5  | 4/5    | engine output for one `INSERT` each         |
+| `Writes-upd/updname.abs`     | 7.94    | 4    | 3    | 3      | engine output for one `UPDATE` each         |
+| `Writes-upd2.abs`            | 7.94    | 4    | 3    | 3      | one `UPDATE` affecting **two** rows         |
+| `Writes-del.abs`             | 7.94    | 4    | 2    | 2      | engine output for one `DELETE`              |
+| `Writes-del2.abs`            | 7.94    | 4    | 1    | 1      | one `DELETE` affecting **two** rows         |
+| `Writes-delins.abs`          | 7.94    | 4    | 3    | 3      | `INSERT` reusing the slot the delete freed  |
 
 "Rows" is the count from the B-tree leaf scan, which is independent of the record
 decoder. "Reader" is what the record iterator returns. They now agree for every fixture,

@@ -3,15 +3,19 @@
 Almost everything in this directory is **deliberately not committed**. The `.abs`
 fixtures the parser is developed against are real customer project data, and
 `.gitignore` excludes `testdata/*` for that reason. A fresh clone therefore has only the
-`Employees-*` fixtures below, and every test that needs one of the others skips (see
-`requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
+`Employees-*` and `Writes*` fixtures below, and every test that needs one of the others
+skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
 validated against real customer files — run `just test` locally for that.
 
 ## The committed fixtures
 
-The eight `Employees-*.abs` files are the exception, one per encryption algorithm. They
-are committed because they are the only fixtures CI can see: without them the encryption
-code is never exercised on a runner at all.
+Two sets are committed: the eight `Employees-*.abs` files, one per encryption algorithm,
+and the eleven `Writes*.abs` files that pin the write path.
+
+### `Employees-*.abs` — one per encryption algorithm
+
+They are committed because without them the encryption code is never exercised on a
+runner at all: every other encrypted fixture is customer data.
 
 All eight hold the identical database and differ only in the cipher:
 
@@ -67,6 +71,51 @@ Because they have no plaintext twin, decryption is checked against each page's `
 checksum, which covers the decrypted payload and so is an oracle needing no twin, and
 against the B-tree leaf scan in `oracle_test.go`.
 
+### `Writes*.abs` — the write path's ground truth
+
+Eleven unencrypted files that differ from one another by exactly one SQL statement. Each was
+made by copying its predecessor and running that single statement in the Absolute Database
+Manager, so a byte diff between a file and its parent shows precisely what the engine
+changes for that operation — and nothing else.
+
+| File                 | Made from         | Statement                                         | Rows |
+| -------------------- | ----------------- | ------------------------------------------------- | ---- |
+| `Writes.abs`         | created fresh     | `CREATE TABLE` + three `INSERT`s, **no index**    | 3    |
+| `Writes-ins1.abs`    | `Writes.abs`      | `INSERT INTO Writes VALUES (4,'Alan',555.5,True)` | 4    |
+| `Writes-ins2.abs`    | `Writes-ins1.abs` | `INSERT ... (5,'Emmy',777.25,False)`              | 5    |
+| `Writes-upd.abs`     | `Writes.abs`      | `UPDATE Writes SET Salary = 1.5 WHERE Id = 2`     | 3    |
+| `Writes-updname.abs` | `Writes.abs`      | `UPDATE Writes SET Name = 'Grazia' WHERE Id = 2`  | 3    |
+| `Writes-upd2.abs`    | `Writes.abs`      | `UPDATE Writes SET Salary = 3.25 WHERE Id < 3`    | 3    |
+| `Writes-del.abs`     | `Writes.abs`      | `DELETE FROM Writes WHERE Id = 2`                 | 2    |
+| `Writes-del2.abs`    | `Writes.abs`      | `DELETE FROM Writes WHERE Id < 3`                 | 1    |
+| `Writes-delins.abs`  | `Writes-del.abs`  | `INSERT ... (6,'Rosa',42.0,True)`                 | 3    |
+| `Writes-idx.abs`     | created fresh     | as `Writes.abs` **plus** `CREATE INDEX IdxId`     | 3    |
+| `Writes-idx-ins.abs` | `Writes-idx.abs`  | `INSERT ... (4,'Alan',555.5,True)` **with** index | 4    |
+
+The table is `Writes` — `Id` INTEGER, `Name` VARCHAR(20), `Salary` FLOAT, `Active`
+BOOLEAN — with the same three rows as `Employees`, no password and, deliberately, **no
+index**: this package refuses to insert into or delete from an indexed table, because it
+cannot yet maintain a B-tree. `oracle_test.go` names them in `unindexedFixtures` so its
+leaf-scan cross-check skips them by name rather than falling back to a silent skip for any
+index-less file.
+
+`TestWriterMatchesEngineByteForByte` applies each statement through this package and
+requires the result to be **byte-identical** to the engine's file. That is what the two
+pairs affecting two rows each (`Writes-upd2.abs`, `Writes-del2.abs`) are for: every
+single-row case moves the table's change counter by one, which cannot distinguish counting
+transactions from counting records. The two-row cases move it by two, and without them the
+writer would have been wrong for every multi-row transaction.
+
+The last two are the odd pair out: they _do_ carry a user index, so this package refuses
+to insert into them (`TestWriterRefusesToStrandAnIndex` pins that). They are committed
+because `Writes-idx-ins.abs` is exactly what the engine produces for the insert that is
+currently refused, and so is the ground truth for implementing index maintenance — see
+PLAN.md, Phase 7.
+
+They contain no customer data and no vendor material, checked the same way as the
+`Employees-*` files: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the table
+name and the invented row values.
+
 ## Regenerating them
 
 They can be recreated on Linux by driving `DBManager.exe` from the SDK under Wine with a
@@ -81,3 +130,9 @@ virtual desktop. Two things make it much easier than it first appears:
 
 Verify the result by reading the file rather than by screenshot: byte 43 is the
 `Encrypted` flag and byte 78 is the algorithm, which must match the table above.
+
+The `Writes*` files use the same route with the encryption checkbox left off, plus
+`File → Open Database` to reopen the copy before running each single-statement script.
+Verify those by bytes too: a derived file must actually differ from its parent
+(`cmp -l parent child | wc -l`), because a script that silently failed to run produces a
+file that is byte-identical to its parent and looks like a valid fixture.

@@ -53,6 +53,7 @@ const (
 	PageTypeSystemDir = 2  // System directory
 	PageTypeFileHdr   = 3  // File header (page 0)
 	PageTypeSchema    = 8  // Schema metadata (zlib-compressed column defs)
+	PageTypeTableInfo = 9  // Table info (record counts)
 	PageTypeData      = 10 // Data page (row storage)
 	PageTypeIndex     = 12 // B-tree index page
 )
@@ -67,6 +68,10 @@ var (
 type File struct {
 	f    *os.File
 	size int64
+
+	// writable is true when the file was opened with OpenForWrite. Every write
+	// path checks it, so a read-only handle can never reach a WriteAt.
+	writable bool
 
 	// Parsed from TABSDBHeader.
 	headerSize       int16
@@ -88,12 +93,18 @@ type File struct {
 
 // Open opens an Absolute Database file for reading.
 func Open(path string) (*File, error) {
-	f, err := os.Open(path)
+	return openDB(path, os.O_RDONLY)
+}
+
+// openDB opens the file with the given access mode and parses its header. It
+// backs both Open and OpenForWrite so that the two cannot drift apart.
+func openDB(path string, flag int) (*File, error) {
+	f, err := os.OpenFile(path, flag, 0)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: %w", err)
 	}
 
-	db := &File{f: f}
+	db := &File{f: f, writable: flag&os.O_RDWR != 0}
 
 	err = db.parseHeader()
 	if err != nil {
@@ -184,6 +195,7 @@ func (db *File) ReadPage(n int) (Page, error) {
 		Number:  n,
 		Data:    buf[:db.pageSize],
 		Payload: buf[pageDataOffset : pageDataOffset+db.payloadSize()],
+		raw:     buf,
 	}
 
 	// The ABSP header stays in the clear even on encrypted pages, so it is
@@ -214,6 +226,12 @@ type Page struct {
 	Data    []byte
 	Payload []byte
 	Header  *DiskPageHeader // nil if no ABSP marker found
+
+	// raw is the whole buffer Data and Payload are cut from: the page's own
+	// block followed by the leading diskPageHeaderOffset bytes of the next one.
+	// The write path needs it, because writing a page back means writing the
+	// ABSP header and the payload, which are contiguous only in this buffer.
+	raw []byte
 }
 
 // IsEmpty returns true if the page's block (Data, the raw pageSize bytes this

@@ -45,6 +45,17 @@ testdata/*
 !testdata/Employees-Twofish_128.abs
 !testdata/Employees-Twofish_256.abs
 !testdata/Employees-Square.abs
+!testdata/Writes.abs
+!testdata/Writes-ins1.abs
+!testdata/Writes-ins2.abs
+!testdata/Writes-upd.abs
+!testdata/Writes-updname.abs
+!testdata/Writes-idx.abs
+!testdata/Writes-idx-ins.abs
+!testdata/Writes-upd2.abs
+!testdata/Writes-del2.abs
+!testdata/Writes-del.abs
+!testdata/Writes-delins.abs
 !testdata/README.md
 
 legacy/

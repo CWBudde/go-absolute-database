@@ -10,19 +10,25 @@
 #   record layout derivation, CRC, RIPEMD, the four in-tree ciphers, and the
 #   fuzz targets.
 #
-#   The exceptions are the eight testdata/Employees-*.abs fixtures, one per
-#   encryption algorithm, which are committed (see testdata/README.md:
-#   synthetic data, no customer content). They are the only real .abs files a
-#   runner sees, so CI does exercise the full encrypted read path end to end --
-#   page decryption against the ABSP checksum, schema, records, and the index
-#   oracle -- for every one of the eight algorithms.
+#   The exceptions are nineteen fixtures that are ours and are committed (see
+#   testdata/README.md: synthetic data, no customer content):
+#
+#     - the eight Employees-*.abs, one per encryption algorithm. CI therefore
+#       does exercise the full encrypted read path end to end -- page decryption
+#       against the ABSP checksum, schema, records, and the index oracle -- for
+#       every one of the eight algorithms.
+#     - the eleven Writes*.abs, which differ from one another by exactly one SQL
+#       statement each, as executed by the vendor's own DB Manager. CI therefore
+#       also runs TestWriterMatchesEngineByteForByte, which requires this
+#       package's insert, update and delete to reproduce the engine's file byte
+#       for byte. That is the strongest assertion in the suite and it does run
+#       on a runner.
 #
 #   Everything else -- all 20 customer fixtures, and the byte-identical
-#   comparison against a plaintext twin -- is validated only on a developer
-#   machine that has them. Run
-#   `just test` (or `just ci`) locally before merging anything that touches the
-#   parser. A green CI run means "nothing obviously broken", not "verified
-#   against real .abs files".
+#   comparison of decryption against a plaintext twin -- is validated only on a
+#   developer machine that has them. Run `just test` (or `just ci`) locally
+#   before merging anything that touches the parser. A green CI run means
+#   "nothing obviously broken", not "verified against real .abs files".
 #
 #   For the same reason there is deliberately no coverage upload here: the
 #   number a runner would produce excludes the fixture-driven paths and would
