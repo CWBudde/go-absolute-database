@@ -34,6 +34,20 @@ const (
 	dbHeaderSize = 76
 )
 
+// The payload model.
+//
+// Each pageSize-byte block on disk carries the 40-byte TABSDiskPageHeader at
+// block offset diskPageHeaderOffset. The payload of page N is the contiguous
+// run of pageSize-diskPageHeaderSize bytes starting right after page N's own
+// header and ending right before page N+1's header:
+//
+//	file[N*pageSize+pageDataOffset : (N+1)*pageSize+diskPageHeaderOffset]
+//
+// For the usual 4096-byte page that is 4056 bytes: 3676 bytes from block N plus
+// the first 380 bytes of block N+1. This is why every .abs file is exactly
+// pageCount*pageSize+diskPageHeaderOffset bytes long — the trailing
+// diskPageHeaderOffset bytes complete the last page's payload.
+
 // Page type constants from the TABSDiskPageHeader.PageType field.
 const (
 	PageTypeSystemDir = 2  // System directory
@@ -139,36 +153,47 @@ func (db *File) Encrypted() bool {
 }
 
 // ReadPage reads a single page by its zero-based page number.
+//
+// A page spans pageSize+diskPageHeaderOffset bytes on disk: the whole block the
+// page starts in plus the leading diskPageHeaderOffset bytes of the next block,
+// which still belong to this page's payload. Both are fetched with one ReadAt.
 func (db *File) ReadPage(n int) (Page, error) {
 	if n < 0 || n >= db.PageCount() {
 		return Page{}, ErrPageOutOfRange
 	}
 
-	data := make([]byte, db.pageSize)
+	buf := make([]byte, db.pageReadSize())
 	offset := int64(n) * int64(db.pageSize)
 
-	_, err := db.f.ReadAt(data, offset)
-	if err != nil && err != io.EOF {
+	read, err := db.f.ReadAt(buf, offset)
+	if read < len(buf) {
+		if err == nil || errors.Is(err, io.EOF) {
+			return Page{}, fmt.Errorf("absdb: reading page %d: %w", n, ErrTruncated)
+		}
+
 		return Page{}, fmt.Errorf("absdb: reading page %d: %w", n, err)
 	}
 
+	// Data and Payload share the same backing array; they overlap in
+	// [pageDataOffset, pageSize). Decrypting the payload in place is therefore
+	// visible through Data as well, which is intended.
 	page := Page{
-		Number: n,
-		Data:   data,
+		Number:  n,
+		Data:    buf[:db.pageSize],
+		Payload: buf[pageDataOffset : pageDataOffset+db.payloadSize()],
 	}
 
-	// Decrypt if needed. Page 0 is never encrypted; empty pages are not encrypted.
-	if n > 0 && db.decryptionKey != nil && !page.IsEmpty() {
-		decrypted, decErr := decryptCBC(db.decryptionKey, data)
-		if decErr != nil {
-			return Page{}, fmt.Errorf("absdb: decrypting page %d: %w", n, decErr)
-		}
-
-		page.Data = decrypted
-	}
-
-	// Parse ABSP header after decryption (it's encrypted on non-zero pages).
+	// The ABSP header stays in the clear even on encrypted pages, so it is
+	// parsed from the raw block before the payload is decrypted.
 	page.Header = parseDiskPageHeader(page.Data)
+
+	// Page 0 is never encrypted; a zero CRC32 marks an unencrypted page.
+	if n > 0 && db.decryptionKey != nil && page.Header != nil && page.Header.CRC32 != 0 {
+		err = db.decryptPayload(page.Payload)
+		if err != nil {
+			return Page{}, fmt.Errorf("absdb: decrypting page %d: %w", n, err)
+		}
+	}
 
 	return page, nil
 }
@@ -221,6 +246,13 @@ func (db *File) parseHeader() error {
 		return errors.New("absdb: invalid page size 0")
 	}
 
+	// A page must at least be able to hold its own disk page header, otherwise
+	// the payload model is not well defined. Real files use 4096, so this only
+	// rejects nonsense. pageSize is a uint16 and therefore bounded above.
+	if int(db.pageSize) < pageDataOffset {
+		return fmt.Errorf("absdb: invalid page size %d", db.pageSize)
+	}
+
 	db.pagesInExtent = binary.LittleEndian.Uint16(buf[28:30])
 	db.totalPageCount = int32(binary.LittleEndian.Uint32(buf[30:34]))
 	db.lastUsedPageNo = int32(binary.LittleEndian.Uint32(buf[34:38]))
@@ -229,6 +261,18 @@ func (db *File) parseHeader() error {
 	db.encrypted = buf[43] != 0
 
 	if db.size < int64(db.pageSize) {
+		return ErrTruncated
+	}
+
+	if db.totalPageCount < 0 {
+		return fmt.Errorf("absdb: invalid total page count %d", db.totalPageCount)
+	}
+
+	// The file must be large enough to hold every announced page, including the
+	// trailing diskPageHeaderOffset bytes that complete the last page's payload.
+	// A longer file is tolerated; a shorter one cannot be trusted and would
+	// otherwise make ScanPages allocate for pages that do not exist.
+	if int64(db.totalPageCount)*int64(db.pageSize)+diskPageHeaderOffset > db.size {
 		return ErrTruncated
 	}
 
@@ -245,13 +289,24 @@ func (db *File) parseHeader() error {
 }
 
 // Page represents a single page read from the database file.
+//
+// Data is the raw pageSize-byte block the page starts in, kept so that the ABSP
+// header at diskPageHeaderOffset can be located at its documented offset.
+// Payload is the page's usable data area: pageSize-diskPageHeaderSize bytes
+// running from pageDataOffset in this block into the first
+// diskPageHeaderOffset bytes of the next block. Data and Payload overlap and
+// share one backing array.
 type Page struct {
-	Number int
-	Data   []byte
-	Header *DiskPageHeader // nil if no ABSP marker found
+	Number  int
+	Data    []byte
+	Payload []byte
+	Header  *DiskPageHeader // nil if no ABSP marker found
 }
 
-// IsEmpty returns true if the page contains only zero bytes.
+// IsEmpty returns true if the page's block (Data, the raw pageSize bytes this
+// page starts in, header included) contains only zero bytes. It deliberately
+// covers the block rather than the payload: an all-zero block carries no ABSP
+// header and is therefore never encrypted.
 func (p Page) IsEmpty() bool {
 	for _, b := range p.Data {
 		if b != 0 {
@@ -262,13 +317,11 @@ func (p Page) IsEmpty() bool {
 	return true
 }
 
-// PageData returns the usable data portion of the page (after the disk page header).
+// PageData returns the usable data portion of the page: everything after this
+// page's disk page header, continuing into the next block up to that block's
+// header. For a 4096-byte page this is 4056 bytes.
 func (p Page) PageData() []byte {
-	if len(p.Data) <= pageDataOffset {
-		return nil
-	}
-
-	return p.Data[pageDataOffset:]
+	return p.Payload
 }
 
 // DiskPageHeader is the 40-byte TABSDiskPageHeader found at offset 0x17C in every page.
@@ -338,6 +391,19 @@ type PageSummary struct {
 	Number int
 	Empty  bool
 	Header *DiskPageHeader
+}
+
+// payloadSize returns the number of usable payload bytes carried by a single
+// page: pageSize minus the disk page header. See "The payload model" above.
+func (db *File) payloadSize() int {
+	return int(db.pageSize) - diskPageHeaderSize
+}
+
+// pageReadSize returns the number of bytes that must be read from disk to cover
+// one full page: the block itself plus the leading part of the following block
+// that still belongs to this page's payload.
+func (db *File) pageReadSize() int {
+	return int(db.pageSize) + diskPageHeaderOffset
 }
 
 // findPageByType returns the first page with the given type, or -1.

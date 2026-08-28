@@ -88,6 +88,23 @@ func (db *File) VerifyPassword(password string) bool {
 	return crc == db.cryptoHeader.ControlCRC
 }
 
+// decryptPayload decrypts a page payload in place using the file's derived key.
+//
+// TODO(phase6): this is a placeholder. The real cipher, mode and IV handling
+// for page payloads are still being reverse-engineered; the current
+// implementation reuses the zero-IV AES-CBC path used for the ControlBlock and
+// is expected to be replaced wholesale.
+func (db *File) decryptPayload(payload []byte) error {
+	plaintext, err := decryptCBC(db.decryptionKey, payload[:len(payload)-len(payload)%aes.BlockSize])
+	if err != nil {
+		return err
+	}
+
+	copy(payload, plaintext)
+
+	return nil
+}
+
 // deriveKey hashes the password using RIPEMD-128 to produce the encryption key.
 func deriveKey(algo CryptoAlgorithm, password string) []byte {
 	// DEC library: password bytes → RIPEMD-128 hash → 16-byte key

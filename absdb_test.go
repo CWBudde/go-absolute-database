@@ -1,7 +1,9 @@
 package absdb
 
 import (
+	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -86,8 +88,8 @@ func TestTS03Header(t *testing.T) {
 func TestAddressesHeader(t *testing.T) {
 	db := openTestFile(t, "Addresses.abs")
 
-	if v := db.Version(); v != 7.1 {
-		t.Errorf("Version() = %v, want 7.1", v)
+	if v := db.Version(); v != 7.94 {
+		t.Errorf("Version() = %v, want 7.94", v)
 	}
 
 	if ps := db.PageSize(); ps != 4096 {
@@ -249,6 +251,146 @@ func TestScanPages(t *testing.T) {
 		} else {
 			t.Logf("Page %2d: no header", s.Number)
 		}
+	}
+}
+
+// craftFile copies a fixture, applies patch to the raw bytes and writes the
+// result to a temporary file whose path is returned.
+func craftFile(t *testing.T, fixture string, patch func([]byte) []byte) string {
+	t.Helper()
+
+	data, err := os.ReadFile(testdataPath(fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "crafted.abs")
+
+	err = os.WriteFile(path, patch(data), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return path
+}
+
+// putPageCount overwrites TotalPageCount at offset 30 of the TABSDBHeader.
+func putPageCount(data []byte, count int32) []byte {
+	binary.LittleEndian.PutUint32(data[30:34], uint32(count))
+
+	return data
+}
+
+func TestPagePayloadSize(t *testing.T) {
+	for _, name := range []string{"TS03.abs", "RREC0011.abs", "Addresses.abs"} {
+		t.Run(name, func(t *testing.T) {
+			db := openTestFile(t, name)
+
+			want := db.PageSize() - diskPageHeaderSize
+
+			for n := range db.PageCount() {
+				p, err := db.ReadPage(n)
+				if err != nil {
+					t.Fatalf("ReadPage(%d): %v", n, err)
+				}
+
+				if len(p.Data) != db.PageSize() {
+					t.Fatalf("page %d: len(Data) = %d, want %d", n, len(p.Data), db.PageSize())
+				}
+
+				if got := len(p.PageData()); got != want {
+					t.Fatalf("page %d: len(PageData()) = %d, want %d", n, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestReadLastPage(t *testing.T) {
+	db := openTestFile(t, "TS03.abs")
+
+	last := db.PageCount() - 1
+
+	p, err := db.ReadPage(last)
+	if err != nil {
+		t.Fatalf("ReadPage(%d): %v", last, err)
+	}
+
+	if len(p.PageData()) != db.PageSize()-diskPageHeaderSize {
+		t.Errorf("last page: len(PageData()) = %d, want %d",
+			len(p.PageData()), db.PageSize()-diskPageHeaderSize)
+	}
+}
+
+// TestFileSizeMatchesPageModel documents the invariant the payload model rests
+// on: the file holds pageCount full pages plus the trailing bytes that complete
+// the last page's payload.
+func TestFileSizeMatchesPageModel(t *testing.T) {
+	for _, name := range []string{"TS03.abs", "RREC0011.abs", "Addresses.abs"} {
+		db := openTestFile(t, name)
+
+		want := int64(db.PageCount())*int64(db.PageSize()) + diskPageHeaderOffset
+		if db.size != want {
+			t.Errorf("%s: size = %d, want %d", name, db.size, want)
+		}
+	}
+}
+
+func TestOpenAbsurdPageCount(t *testing.T) {
+	tests := []struct {
+		name  string
+		count int32
+	}{
+		{"huge", 1 << 30},
+		{"max", math.MaxInt32},
+		{"negative", -1},
+		{"min", math.MinInt32},
+		{"one past end", 15},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := craftFile(t, "TS03.abs", func(data []byte) []byte {
+				return putPageCount(data, tt.count)
+			})
+
+			db, err := Open(path)
+			if err == nil {
+				db.Close()
+				t.Fatalf("Open with totalPageCount %d succeeded, want error", tt.count)
+			}
+		})
+	}
+}
+
+// TestOpenAbsurdPageSize guards the payload slice in ReadPage: a page smaller
+// than its own disk page header has no well-defined payload.
+func TestOpenAbsurdPageSize(t *testing.T) {
+	for _, ps := range []uint16{1, 16, 64, 379, 419} {
+		path := craftFile(t, "TS03.abs", func(data []byte) []byte {
+			binary.LittleEndian.PutUint16(data[26:28], ps)
+
+			return data
+		})
+
+		db, err := Open(path)
+		if err == nil {
+			db.Close()
+			t.Errorf("Open with pageSize %d succeeded, want error", ps)
+		}
+	}
+}
+
+// TestOpenMissingTrailingPayload rejects a file that stops after the last full
+// block: the final page's payload would be incomplete.
+func TestOpenMissingTrailingPayload(t *testing.T) {
+	path := craftFile(t, "TS03.abs", func(data []byte) []byte {
+		return data[:len(data)-1]
+	})
+
+	_, err := Open(path)
+	if !errors.Is(err, ErrTruncated) {
+		t.Errorf("Open truncated file error = %v, want ErrTruncated", err)
 	}
 }
 
