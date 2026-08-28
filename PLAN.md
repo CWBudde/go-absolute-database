@@ -360,14 +360,50 @@ is the next block's first 380 bytes — under the 3676-byte model those stay cip
 0 of 8 pages match and ~3030 of 3040 bytes differ against a known-zero plaintext. A
 fixture with rows near the end of a page would discriminate on the tail as well.
 
+#### Twofish: DEC's key schedule is not reference Twofish
+
+`ABSCipher.pas` is a fork of DEC 3.0, and its `TCipher_Twofish` is **not**
+interchangeable with reference Twofish, so `golang.org/x/crypto/twofish` cannot read
+these files. Everything but one line follows the specification — the two q permutations
+(512 bytes at offset 42587 of `ABSCipher.dcu`) and the MDS table (4096 bytes immediately
+after, at 43099) are byte-for-byte the published ones, and the round function, the RS key
+mapping and the key-dependent S-box setup all match — but the subkey loop reads
+
+```pascal
+SubKey[I shl 1] := A + B;
+B := A + B shr 1;
+SubKey[I shl 1 + 1] := ROL(B, 9);
+```
+
+where the specification calls for `K_{2i+1} = ROL(A + 2B, 9)`. Delphi binds `shr`
+tighter than `+`, so that computes `A + (B shr 1)`: a `shr`/`shl` typo that changes every
+odd subkey. `twofish.go` reproduces it deliberately.
+
+This is verified, not inferred. DEC compiles a self-test vector into each cipher class,
+and `TestDECTwofishSelfTest` reproduces `TCipher_Twofish.TestVector` exactly:
+
+```
+key       "TCipher_Twofish" (15 bytes, zero-padded to 16)
+plaintext 3044ED6E45A496F5F635A2EB3D1A5DD6CB1D09822DBDF560C2B858A191F981B1
+expected  A5535703EF3348799F22B4549705841987BD831C4DAE1213607C7CD198450219
+```
+
+`golang.org/x/crypto/twofish` fails that vector; `newTwofish` passes it. The same
+harness reproduces `TCipher_Blowfish.TestVector` with stdlib Blowfish, which is what
+proves the harness itself right.
+
 #### Caveats
 
-- The three encrypted fixtures are encrypted copies of an **empty table**. They validate
-  header and schema decryption but can **never** validate encrypted _record_
-  decryption. A fixture with rows and a known password is needed.
-- Rijndael-256, Twofish-128/256, Square and DES-Triple are untested — no fixtures.
-  AES-256 and 3DES are stdlib; Twofish and Square would need Go implementations
-  (Square is DEC-specific and would have to be ported).
+- The three `Addresses-*` fixtures are encrypted copies of an **empty table**. They
+  validate header and schema decryption byte-exactly against their plaintext twin, but
+  cannot validate encrypted _record_ decryption.
+- ~~Encrypted record decryption is never validated.~~ **Resolved** by
+  `Employees-Twofish_128.abs` / `Employees-Twofish_256.abs`, created with the
+  ComponentAce DB Manager: a real four-column table with three rows, read end to end.
+  They have no plaintext twin, so they are checked against the ABSP page checksum, which
+  covers the decrypted payload and so is an independent oracle.
+- Rijndael-256, Square and DES-Triple are still untested — no fixtures. AES-256 and 3DES
+  are stdlib; Square is DEC-specific and would have to be ported.
 - ~~The `ABSP.CRC32` page checksum does not reproduce over the decrypted data.~~
   **Resolved.** `ABSP.CRC32` is `absCRC32` over the decrypted **4056-byte payload** — 24
   of 24 encrypted pages across all three fixtures. The recorded mismatch (computed
@@ -1052,17 +1088,21 @@ plaintext `Addresses.abs`, 13/13 pages, over the full payload.
 the 16-byte digest is expanded to two-key 3DES (K1, K2, K1) to fill Go's 24-byte key
 schedule; that expansion is an inference, not a verified fact.
 
-**Unsupported:** Twofish-128/256 and Square return `ErrUnsupportedCipher`. Their key
-derivation is implemented and tested, so only the block cipher is missing. Square is
-DEC-specific and would have to be ported.
+**Verified with rows:** Twofish-128 and Twofish-256 — `twofish.go` implements DEC's
+variant (see the key-schedule note above) and `Employees-Twofish_{128,256}.abs` are read
+end to end: header, password, every page against its ABSP checksum, schema, and all
+three records with their exact values.
 
-> The three encrypted fixtures are encrypted copies of an **empty table**. Header, schema
-> and page decryption are validated byte-exactly; encrypted _record_ decryption never is,
-> and cannot be until a fixture with rows and a known password exists.
+**Unsupported:** Square returns `ErrUnsupportedCipher`. Its key derivation is
+implemented and tested, so only the block cipher is missing; it is DEC-specific and
+would have to be ported.
+
+> The three `Addresses-*` fixtures are encrypted copies of an **empty table**, so they
+> validate header, schema and page decryption byte-exactly but never records. The two
+> `Employees-Twofish_*` fixtures cover records.
 
 ### Deferred
 
-- [ ] Twofish-128/256 — need a Go implementation; no fixtures
 - [ ] Square — DEC-specific, would have to be ported; no fixtures
 - [ ] Fixtures with rows for Rijndael-256 and DES-Triple
 
@@ -1202,6 +1242,7 @@ Planned additions:
 
 ```
 ├── ripemd256.go       # needed for Rijndael-256 / Blowfish / Twofish-256 — Phase 6
+├── twofish.go         # DEC's Twofish variant (see Phase 6)              — Phase 6
 ├── fuzz_test.go       # FuzzOpen, FuzzParseSchema, FuzzReadBlob          — Phase 5d
 ├── .github/workflows/ # CI running `just ci`                             — Phase T
 ├── writer.go          # Record insert/update/delete                      — Phase 7

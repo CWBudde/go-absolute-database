@@ -30,6 +30,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 ## Key Policies
 
 - **Minimal dependencies**: the core read path uses the standard library plus two `golang.org/x` packages, which are maintained by the Go team and are effectively extended stdlib: `golang.org/x/text/encoding/charmap` for Windows-1252 decoding (`reader.go`) and `golang.org/x/crypto/blowfish` for the Blowfish cipher used by encrypted files (`crypto.go`). `github.com/spf13/cobra` is a CLI-only dependency and must not be imported by the library. Anything beyond that needs a reason.
+- **Twofish stays in-tree**: `twofish.go` is not a stylistic preference over `golang.org/x/crypto/twofish`. ABSCipher's Twofish is DEC 3.0's, whose key schedule has a `shr`/`shl` typo that makes it incompatible with reference Twofish, so the x/crypto package cannot read these files. `TestDECTwofishSelfTest` pins this against DEC's own self-test vector — do not "fix" the deviation.
 - **Read-only first**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only. No write code until Phase 7.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.

@@ -130,8 +130,8 @@ var cipherSpecs = map[CryptoAlgorithm]cipherSpec{
 	CryptoDESSingle:   {hashRipeMD128, 8, newDESCipher},
 	CryptoDESTriple:   {hashRipeMD128, 16, newTripleDESCipher},
 	CryptoBlowfish:    {hashRipeMD256, 32, newBlowfishCipher},
-	CryptoTwofish128:  {hashRipeMD128, 16, nil},
-	CryptoTwofish256:  {hashRipeMD256, 32, nil},
+	CryptoTwofish128:  {hashRipeMD128, 16, newTwofishCipher},
+	CryptoTwofish256:  {hashRipeMD256, 32, newTwofishCipher},
 	CryptoSquare:      {hashRipeMD128, 16, nil},
 }
 
@@ -174,6 +174,25 @@ func newBlowfishCipher(key []byte) (cipher.Block, error) {
 	block, err := blowfish.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: blowfish: %w", err)
+	}
+
+	return block, nil
+}
+
+// newTwofishCipher builds Twofish from the derived key. The key length selects
+// the variant, exactly as in DEC: 16 bytes give Twofish-128, 32 bytes
+// Twofish-256. DEC's TCipher_Twofish declares a KeySize of 32 for both, but it
+// keys the cipher from the number of bytes actually passed to Init rather than
+// zero-padding to KeySize — the same TCipher.InitBegin path that makes a
+// 16-byte key produce plain AES-128 for Rijndael-128, which the
+// Addresses-Rijndael_128.abs fixture confirms.
+//
+// This is *not* reference Twofish; see twofish.go for the one-line deviation in
+// DEC's key schedule and why golang.org/x/crypto/twofish cannot be used here.
+func newTwofishCipher(key []byte) (cipher.Block, error) {
+	block, err := newTwofish(key)
+	if err != nil {
+		return nil, fmt.Errorf("absdb: twofish: %w", err)
 	}
 
 	return block, nil

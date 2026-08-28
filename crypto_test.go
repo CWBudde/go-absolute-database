@@ -6,13 +6,18 @@ import (
 	"testing"
 )
 
-// The three encrypted fixtures (Addresses-Rijndael_128.abs,
+// The three Addresses-* encrypted fixtures (Addresses-Rijndael_128.abs,
 // Addresses-Blowfish.abs, Addresses-DES_Single.abs) are encrypted copies of
-// Addresses.abs, which holds an *empty* table. They therefore validate the
-// crypto header, key derivation, the cmCTS mode and full-page decryption
-// byte-for-byte, but they can never validate the decryption of encrypted
-// *records* — there are none. A fixture with rows and a known password is
-// still missing.
+// Addresses.abs, which holds an *empty* table. They validate the crypto header,
+// key derivation, the cmCTS mode and full-page decryption byte-for-byte against
+// their plaintext twin, but they cannot validate the decryption of encrypted
+// *records* — there are none.
+//
+// The two Employees-Twofish_* fixtures close that gap: they carry a real table
+// with three rows, so TestTwofishFixtures reads encrypted schema and encrypted
+// records end to end. They have no plaintext twin, so instead of a byte
+// comparison they are checked against the ABSP page checksum, which is
+// absCRC32 over the *decrypted* payload and so is an independent oracle.
 
 // testPassword is the password of all three encrypted fixtures (capital B).
 const testPassword = "Bla"
@@ -242,9 +247,10 @@ func TestUnlock(t *testing.T) {
 }
 
 // TestUnlockUnsupportedCipher documents the algorithms this package knows about
-// but cannot decrypt.
+// but cannot decrypt. Square is DEC-specific and has no fixture; unlike
+// Twofish, nothing has been reverse-engineered for it yet.
 func TestUnlockUnsupportedCipher(t *testing.T) {
-	for _, algo := range []CryptoAlgorithm{CryptoTwofish128, CryptoTwofish256, CryptoSquare} {
+	for _, algo := range []CryptoAlgorithm{CryptoSquare} {
 		key := deriveKey(algo, testPassword)
 		if key == nil {
 			t.Errorf("deriveKey(%v) = nil, want a derived key", algo)
@@ -311,4 +317,190 @@ func TestEncryptedFileWithoutPassword(t *testing.T) {
 			}
 		})
 	}
+}
+
+// twofishFixtures are encrypted databases holding a real table, created with
+// the ComponentAce Absolute Database Manager. Unlike the Addresses-* fixtures
+// they have no plaintext twin, so decryption is checked against each page's
+// ABSP checksum instead.
+var twofishFixtures = []struct {
+	name      string
+	algorithm CryptoAlgorithm
+}{
+	{"Employees-Twofish_128.abs", CryptoTwofish128},
+	{"Employees-Twofish_256.abs", CryptoTwofish256},
+}
+
+// twofishRows is what the Absolute Database Manager shows for these fixtures.
+var twofishRows = []struct {
+	id     int32
+	name   string
+	salary float64
+	active bool
+}{
+	{1, "Ada", 1234.5, true},
+	{2, "Grace", 2345.75, false},
+	{3, "Kurt", 999.25, true},
+}
+
+// TestTwofishFixtures reads both Twofish variants end to end: header, password
+// verification, per-page decryption, schema and record values.
+func TestTwofishFixtures(t *testing.T) {
+	for _, fixture := range twofishFixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			db, err := OpenWithPassword(requireFixture(t, fixture.name), testPassword)
+			if err != nil {
+				t.Fatalf("OpenWithPassword: %v", err)
+			}
+			defer db.Close()
+
+			ch := db.CryptoHeader()
+			if ch == nil {
+				t.Fatal("expected a crypto header")
+			}
+
+			if ch.Algorithm != fixture.algorithm {
+				t.Errorf("algorithm = %v, want %v", ch.Algorithm, fixture.algorithm)
+			}
+
+			checkPageChecksums(t, db)
+
+			schema, err := db.Schema()
+			if err != nil {
+				t.Fatalf("Schema: %v", err)
+			}
+
+			wantColumns := []string{"Id", "Name", "Salary", "Active"}
+			if len(schema.Columns) != len(wantColumns) {
+				t.Fatalf("got %d columns, want %d", len(schema.Columns), len(wantColumns))
+			}
+
+			for i, want := range wantColumns {
+				if schema.Columns[i].Name != want {
+					t.Errorf("column %d = %q, want %q", i, schema.Columns[i].Name, want)
+				}
+			}
+
+			reader, err := db.OpenTable()
+			if err != nil {
+				t.Fatalf("OpenTable: %v", err)
+			}
+
+			row := 0
+
+			for reader.Next() {
+				if row >= len(twofishRows) {
+					t.Fatalf("more than %d rows", len(twofishRows))
+				}
+
+				want := twofishRows[row]
+				rec := reader.Record()
+
+				if got := rec.Int(0); got != want.id {
+					t.Errorf("row %d Id = %d, want %d", row, got, want.id)
+				}
+
+				if got := rec.String(1); got != want.name {
+					t.Errorf("row %d Name = %q, want %q", row, got, want.name)
+				}
+
+				if got := rec.Float(2); got != want.salary {
+					t.Errorf("row %d Salary = %v, want %v", row, got, want.salary)
+				}
+
+				if got := rec.Bool(3); got != want.active {
+					t.Errorf("row %d Active = %v, want %v", row, got, want.active)
+				}
+
+				row++
+			}
+
+			if err := reader.Err(); err != nil {
+				t.Fatalf("iteration: %v", err)
+			}
+
+			if row != len(twofishRows) {
+				t.Errorf("read %d rows, want %d", row, len(twofishRows))
+			}
+		})
+	}
+}
+
+// TestEncryptedPageChecksums applies the ABSP checksum oracle to every
+// encrypted fixture, Twofish and otherwise. It is independent of the plaintext
+// twin used by TestDecryptedPagesMatchPlaintext.
+func TestEncryptedPageChecksums(t *testing.T) {
+	names := make([]string, 0, len(encryptedFixtures)+len(twofishFixtures))
+	for _, f := range encryptedFixtures {
+		names = append(names, f.name)
+	}
+
+	for _, f := range twofishFixtures {
+		names = append(names, f.name)
+	}
+
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			db, err := OpenWithPassword(requireFixture(t, name), testPassword)
+			if err != nil {
+				t.Fatalf("OpenWithPassword: %v", err)
+			}
+			defer db.Close()
+
+			checkPageChecksums(t, db)
+		})
+	}
+}
+
+// TestTwofishWrongPassword checks the Twofish key derivation rejects near
+// misses rather than producing garbage.
+func TestTwofishWrongPassword(t *testing.T) {
+	for _, fixture := range twofishFixtures {
+		t.Run(fixture.name, func(t *testing.T) {
+			path := requireFixture(t, fixture.name)
+
+			for _, wrong := range []string{"bla", "BLA", "Bl", "Bla ", "", "Blb"} {
+				if _, err := OpenWithPassword(path, wrong); !errors.Is(err, ErrWrongPassword) {
+					t.Errorf("OpenWithPassword(%q) error = %v, want ErrWrongPassword", wrong, err)
+				}
+			}
+
+			db := openTestFile(t, fixture.name)
+			if !db.VerifyPassword(testPassword) {
+				t.Errorf("VerifyPassword(%q) = false, want true", testPassword)
+			}
+		})
+	}
+}
+
+// checkPageChecksums verifies every decrypted page against its ABSP checksum.
+// The checksum is stored in the clear but covers the decrypted payload, so it
+// is an oracle for decryption that needs no plaintext twin.
+func checkPageChecksums(t *testing.T, db *File) {
+	t.Helper()
+
+	verified := 0
+
+	for i := range db.PageCount() {
+		page, err := db.ReadPage(i)
+		if err != nil {
+			t.Fatalf("ReadPage(%d): %v", i, err)
+		}
+
+		if page.Header == nil || page.Header.CRC32 == 0 {
+			continue
+		}
+
+		if got := absCRC32(page.Payload); got != page.Header.CRC32 {
+			t.Errorf("page %d: payload CRC %#08x, want %#08x", i, got, page.Header.CRC32)
+		}
+
+		verified++
+	}
+
+	if verified == 0 {
+		t.Error("no page carried a checksum; the oracle checked nothing")
+	}
+
+	t.Logf("%d pages verified against their ABSP checksum", verified)
 }

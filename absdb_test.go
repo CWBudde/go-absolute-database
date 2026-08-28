@@ -16,9 +16,11 @@ func testdataPath(name string) string {
 // requireFixture returns the path of a fixture in testdata/, skipping the test
 // when it is not there.
 //
-// testdata/ holds real customer data and is deliberately not committed, so on
-// a fresh clone the fixtures are simply absent and the tests that need them
-// have nothing to say. Every path that reaches a fixture — Open, ReadFile,
+// testdata/ mostly holds real customer data and is deliberately not committed,
+// so on a fresh clone the fixtures are simply absent and the tests that need
+// them have nothing to say. (The two Employees-Twofish_* fixtures are the
+// exception: they were generated with the ComponentAce DB Manager and contain
+// no customer data, but they live under the same ignored directory.) Every path that reaches a fixture — Open, ReadFile,
 // OpenWithPassword — should go through here, so that a fresh clone skips
 // cleanly instead of reporting dozens of failures. Any error other than a
 // missing file is still a hard failure.
