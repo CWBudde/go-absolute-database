@@ -260,7 +260,7 @@ func decompressInternalFile(data []byte) ([]byte, error) {
 	case 1: // zlib
 		// The declared decompressed size bounds the output: without it a
 		// crafted page could inflate far beyond the file it came from.
-		result, err := inflateLimited(compressed, decompressedSize)
+		result, err := inflateLimited(compressed, decompressedSize, internalFileInflateBounds)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", ErrCompression, err)
 		}

@@ -973,6 +973,51 @@ next to each, not just the theory.
       `blob.go`. A ceiling stops a bogus declared size being the bomb itself.
 - [x] B-tree entry counts and schema column counts bounded by what the page can hold,
       not by the attacker-controlled count field
+- [x] The zlib ceiling split by source (see below), so an internal file no longer gets
+      a BLOB's expansion allowance
+
+### What a zlib stream is allowed to expand to, and by how much it was too generous
+
+The ceiling above was one number for both zlib streams the format contains, and it was
+set for the looser of the two. A **BLOB** holds user payload of unknown shape, so the
+only bound that cannot reject a legitimate file is zlib's own maximum expansion, 1032:1;
+`maxCompressionRatio = 1000` is that. An **internal file** — the schema, the table info,
+the table catalog — is a format structure, and it inherited the same allowance for no
+reason other than sharing the function.
+
+The gap between allowance and reality is large. Across the 34 compressed internal files
+in the corpus the widest expansion is **4.65x** (`RCON0011.abs`, 36 columns) and none of
+the rest reaches 5x, against 1000x allowed. `maxInternalCompressionRatio = 64` keeps more
+than an order of magnitude of headroom and is asserted against every fixture by
+`TestInternalFileInflateBoundsFitEveryFixture`, which also logs the widest expansion it
+saw so a later tightening has a number to argue against rather than a feeling.
+
+What it buys, measured rather than reasoned: a zlib bomb small enough to fit **one 4 KiB
+page** costs **8.8 ms and 9.7 MB of allocation** before the BLOB bound rejects it, and
+**0.2 us and 105 bytes** before the internal-file bound does. The old bound did hold —
+nothing crashed, the error came back — but it did the work first, on a path every
+`Schema()` call takes.
+
+**What this did not do, contrary to the plan that asked for it.** The item read _"Bound
+`inflateLimited` by the file size before inflating, not only after. A 4 KiB page
+currently costs 9 MiB and 8.7 ms before the limit rejects it, which is why `FuzzOpen`
+manages only a few hundred executions per minute."_ The cost figure is right — it
+reproduces to three digits. The **causal half is wrong**: `FuzzOpen` runs at roughly
+**2700 executions per second**, and did so before this change as well. The "few hundred
+per minute" was read off the fuzzing coordinator's live `execs` display, which only
+advances when a worker returns from a batch and therefore sits at `0/sec` for minutes on
+a target that finds nothing interesting. `go test -fuzz FuzzOpen -fuzztime=3000x` gives
+the honest figure, and an A/B against the previous commit shows 1.05-1.12 s before and
+1.11-1.16 s after — no difference, because the fuzzer almost never constructs a valid
+zlib stream in the first place. The bound is worth having as a bound on what a hostile
+file can make a _caller_ do; it was never what set the fuzzer's throughput. The caveat is
+recorded on `FuzzOpen` itself so the next reader does not re-derive it.
+
+Bounding by the **file size**, which is what the item literally asked for, turned out to
+be the weaker statement in every path: the compressed bytes are themselves in the file,
+so `compressedLen * ratio` already bounds the output by what the file contains, and
+`validateBlobHeader` separately caps a BLOB's declared compressed size at what the pages
+could hold. The ratio is the lever; the file size is not.
 
 ### Panics on malformed input
 
@@ -1603,18 +1648,26 @@ an independent decoder for every fixture.
 
 **Next.**
 
-1. **Clear the remaining lint findings.** The CI lint job is blocking, so CI is red
-   until they are. Four of them are genuinely narrowing integer conversions in
-   `reader.go` and deserve reading rather than suppressing.
-2. **Bound `inflateLimited` by the file size** before inflating, not only after. A 4 KiB
-   page currently costs 9 MiB and 8.7 ms before the limit rejects it, which is why
-   `FuzzOpen` manages only a few hundred executions per minute.
+1. ~~**Clear the remaining lint findings.**~~ Done. `golangci-lint` reports 0 issues and
+   the CI lint job is green.
+2. ~~**Bound `inflateLimited` by the file size.**~~ Done, though not as written: the
+   ceiling is now split by source, tight for internal files and unchanged for BLOBs. The
+   throughput premise the item rested on was wrong and the correction is recorded in
+   Phase 5d — `FuzzOpen` was never slow, the coordinator's live display was misread.
 3. ~~**Phase 5e — multi-table.**~~ Done. It did **not** force a breaking API change in
    the end: the table argument went onto a `*Table` handle instead, so the no-argument
    forms keep working and now report `ErrAmbiguousTable` rather than mixing tables. A
    fixture exercises it — `MultiTable.abs`, three tables, one index.
 4. **Re-tag `v0.1.0`.** The existing tag shares no ancestry with `main`, yet `../Aconiq`
-   requires it with no `replace`. Re-tag from `main` and bump Aconiq.
+   requires it with no `replace`. Re-tag from `main` and bump Aconiq. This is the only
+   item left in this list, and it is not something to do from here: it changes what
+   `../Aconiq` resolves to.
+
+**After that**, the two open Phase 7 items are the next real work — appending a data page
+when every existing one is full, and maintaining user indexes so insert and delete are
+not refused on an indexed table. Both are blocked on fixtures that do not exist yet: an
+index insert whose key sorts into the middle, and one that splits a full leaf. Producing
+those two files under DBManager is the first step, not an afterthought.
 
 **The two largest validation gaps** are not phases, and neither can be closed from here:
 

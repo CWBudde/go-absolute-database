@@ -187,14 +187,15 @@ func exerciseIndexes(db *File) {
 // FuzzOpen drives the whole read path — header, pages, schema, records,
 // indexes and BLOBs — over arbitrary bytes presented as an .abs file.
 //
-// Its execution rate is low (tens per second, against six figures for
-// FuzzParseSchema) and the cause is measured, not mysterious: Schema() lets a
-// zlib stream expand by maxCompressionRatio (1000x) before rejecting it, so a
-// single mutated page costs 9 MiB and 9 ms at a 4 KiB page size, and 155 MiB
-// and 99 ms at the largest page size a uint16 allows. The limit does hold —
-// the error comes back and nothing crashes — but the work happens first.
-// Dropping the target's per-input cost means tightening that bound in
-// blob.go, which is a production change and not this test's to make.
+// A note for anyone tempted to optimise it, because this cost a session once:
+// the coordinator's live "execs" and "execs/sec" only advance when a worker
+// returns from a batch, so on a target that rarely finds anything interesting
+// they read 0/sec for minutes at a time and the total they end on understates
+// the run by an order of magnitude. That display is what "FuzzOpen manages only
+// a few hundred executions per minute" was read off. Measured with a fixed
+// budget instead — go test -fuzz FuzzOpen -fuzztime=3000x — the target runs at
+// roughly 2700 executions per second, and did so before the decompression
+// bounds were tightened as well.
 func FuzzOpen(f *testing.F) {
 	for _, spec := range fuzzSpecs() {
 		f.Add(buildSynthetic(f, spec))

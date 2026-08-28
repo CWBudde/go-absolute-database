@@ -36,17 +36,69 @@ const (
 	// stream, whatever the on-disk header declares.
 	maxDecompressedSize = 256 << 20
 
-	// maxCompressionRatio bounds the expansion factor of a zlib stream, so a
-	// 4 KiB page can never inflate to more than 4 MiB.
+	// maxCompressionRatio bounds the expansion factor of a BLOB stream, so a
+	// 4 KiB page can never inflate to more than 4 MiB. A BLOB holds user
+	// payload of unknown shape, so the only bound that cannot reject a
+	// legitimate file is zlib's own maximum expansion, 1032:1.
 	maxCompressionRatio = 1000
 
 	// minDecompressAllowance keeps very small streams decompressible, which
 	// maxCompressionRatio alone would not allow.
 	minDecompressAllowance = 1 << 20
 
+	// maxInternalCompressionRatio bounds the expansion factor of an internal
+	// file — the schema, the table info and the table catalog. Those are
+	// format structures rather than user payload, and unlike a BLOB they are
+	// inflated on the way to every Schema() call, so the BLOB bound is both
+	// far looser than anything real needs and the most expensive thing a
+	// malformed page can ask for: a zlib bomb that fits one 4 KiB page costs
+	// 8.8 ms and 9.7 MB of allocation before the BLOB bound rejects it, and
+	// 0.2 us before this one does. The widest internal file in the corpus,
+	// RCON0011.abs with 36 columns, expands 4.65x and none of the other 33
+	// reaches 5x, so 64 still leaves more than an order of magnitude of
+	// headroom. TestInternalFileInflateBoundsFitEveryFixture keeps both halves
+	// of that honest.
+	maxInternalCompressionRatio = 64
+
+	// minInternalAllowance is the floor for an internal file, the role
+	// minDecompressAllowance plays for a BLOB. Sixteen pages' worth is far
+	// more than any schema in the corpus needs; the largest is 2430 bytes.
+	minInternalAllowance = 64 << 10
+
+	// maxInternalDecompressedSize is the structural ceiling on an internal
+	// file. Both of the largest structures the format can express —
+	// maxSchemaColumns column definitions and maxCatalogTables catalog
+	// entries — sit well inside it.
+	maxInternalDecompressedSize = 16 << 20
+
 	// decompressSlack tolerates a declared size slightly below what the stream
 	// actually yields (trailing padding).
 	decompressSlack = 4096
+)
+
+// inflateBounds describes how far a zlib stream from one source in the file may
+// legitimately expand. The file has two such sources and what they can honestly
+// ask for differs by more than an order of magnitude, so one shared set of
+// numbers had to be as generous as the looser of them — see
+// maxInternalCompressionRatio for what that cost.
+type inflateBounds struct {
+	ratio   int64 // expansion allowed relative to the compressed length
+	floor   int64 // smallest ceiling, so that short streams stay decompressible
+	hardMax int64 // absolute ceiling, whatever the ratio would allow
+}
+
+var (
+	blobInflateBounds = inflateBounds{
+		ratio:   maxCompressionRatio,
+		floor:   minDecompressAllowance,
+		hardMax: maxDecompressedSize,
+	}
+
+	internalFileInflateBounds = inflateBounds{
+		ratio:   maxInternalCompressionRatio,
+		floor:   minInternalAllowance,
+		hardMax: maxInternalDecompressedSize,
+	}
 )
 
 var (
@@ -287,7 +339,7 @@ func (db *File) readBlobChain(firstPage Page, totalSize int64) ([]byte, error) {
 // the size declared in the BLOB page header; it bounds the output so a crafted
 // stream cannot expand without limit.
 func decompressBlob(compressed []byte, uncompressedSize int64) ([]byte, error) {
-	result, err := inflateLimited(compressed, uncompressedSize)
+	result, err := inflateLimited(compressed, uncompressedSize, blobInflateBounds)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: BLOB decompression: %w", err)
 	}
@@ -297,15 +349,14 @@ func decompressBlob(compressed []byte, uncompressedSize int64) ([]byte, error) {
 
 // inflateLimit returns the maximum number of bytes a zlib stream of the given
 // compressed length may legitimately produce. The declared size is honoured,
-// but only within a ceiling derived from the input length, so that a bogus
-// declaration cannot itself become the bomb.
-func inflateLimit(compressedLen int, declared int64) (int64, error) {
+// but only within a ceiling derived from the input length and the stream's
+// source, so that a bogus declaration cannot itself become the bomb.
+func inflateLimit(compressedLen int, declared int64, b inflateBounds) (int64, error) {
 	if declared < 0 {
 		return 0, fmt.Errorf("negative uncompressed size %d", declared)
 	}
 
-	ceiling := min(max(int64(compressedLen)*maxCompressionRatio, minDecompressAllowance),
-		maxDecompressedSize)
+	ceiling := min(max(int64(compressedLen)*b.ratio, b.floor), b.hardMax)
 
 	if declared > ceiling {
 		return 0, fmt.Errorf("declared uncompressed size %d exceeds limit %d", declared, ceiling)
@@ -317,8 +368,8 @@ func inflateLimit(compressedLen int, declared int64) (int64, error) {
 // inflateLimited zlib-decompresses compressed, producing at most as many bytes
 // as the declared uncompressed size allows. A stream that yields more is
 // rejected rather than read to the end.
-func inflateLimited(compressed []byte, declared int64) ([]byte, error) {
-	limit, err := inflateLimit(len(compressed), declared)
+func inflateLimited(compressed []byte, declared int64, b inflateBounds) ([]byte, error) {
+	limit, err := inflateLimit(len(compressed), declared, b)
 	if err != nil {
 		return nil, err
 	}

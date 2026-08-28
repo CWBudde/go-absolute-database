@@ -617,21 +617,31 @@ func TestDecompressBlob(t *testing.T) {
 func TestInflateLimit(t *testing.T) {
 	tests := []struct {
 		name          string
+		bounds        inflateBounds
 		compressedLen int
 		declared      int64
 		wantErr       bool
 	}{
-		{"small stream gets the floor", 10, minDecompressAllowance, false},
-		{"beyond the floor", 10, minDecompressAllowance + 1, true},
-		{"ratio applies to large input", 1 << 20, 8 << 20, false},
-		{"hard ceiling", 1 << 20, maxDecompressedSize + 1, true},
-		{"negative", 10, -1, true},
-		{"zero", 10, 0, false},
+		{"blob: small stream gets the floor", blobInflateBounds, 10, minDecompressAllowance, false},
+		{"blob: beyond the floor", blobInflateBounds, 10, minDecompressAllowance + 1, true},
+		{"blob: ratio applies to large input", blobInflateBounds, 1 << 20, 8 << 20, false},
+		{"blob: hard ceiling", blobInflateBounds, 1 << 20, maxDecompressedSize + 1, true},
+		{"blob: negative", blobInflateBounds, 10, -1, true},
+		{"blob: zero", blobInflateBounds, 10, 0, false},
+
+		// The internal-file bounds are the tighter of the two: what a BLOB
+		// page may declare, a schema page may not.
+		{"internal: small stream gets the floor", internalFileInflateBounds, 10, minInternalAllowance, false},
+		{"internal: beyond the floor", internalFileInflateBounds, 10, minInternalAllowance + 1, true},
+		{"internal: ratio applies to large input", internalFileInflateBounds, 1 << 20, 8 << 20, false},
+		{"internal: hard ceiling", internalFileInflateBounds, 1 << 20, maxInternalDecompressedSize + 1, true},
+		{"internal: a page-sized stream stays under a megabyte", internalFileInflateBounds, 4096, 1 << 20, true},
+		{"internal: negative", internalFileInflateBounds, 10, -1, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			limit, err := inflateLimit(tt.compressedLen, tt.declared)
+			limit, err := inflateLimit(tt.compressedLen, tt.declared, tt.bounds)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("inflateLimit() = %d, want an error", limit)
@@ -644,10 +654,82 @@ func TestInflateLimit(t *testing.T) {
 				t.Fatalf("inflateLimit(): %v", err)
 			}
 
-			if limit < tt.declared || limit > maxDecompressedSize {
+			if limit < tt.declared || limit > tt.bounds.hardMax {
 				t.Errorf("limit = %d, out of range for declared %d", limit, tt.declared)
 			}
 		})
+	}
+}
+
+// TestInternalFileInflateBoundsFitEveryFixture is what makes the tightened
+// internal-file ratio a measurement rather than a guess: no schema, table info
+// or catalog page in the corpus may come anywhere near the new ceiling. It also
+// records the widest expansion actually observed, so a future tightening has a
+// number to argue against.
+func TestInternalFileInflateBoundsFitEveryFixture(t *testing.T) {
+	names := fixtureNames(t)
+
+	var (
+		worstRatio float64
+		worstFile  string
+		checked    int
+	)
+
+	for _, name := range names {
+		db, err := Open(testdataPath(name))
+		if err != nil {
+			continue
+		}
+
+		for i := range db.PageCount() {
+			page, err := db.ReadPage(i)
+			if err != nil || page.Header == nil {
+				continue
+			}
+
+			switch page.Header.PageType {
+			case PageTypeSchema, PageTypeTableInfo, PageTypeTableList:
+			default:
+				continue
+			}
+
+			data := page.PageData()
+			if len(data) < internalFileHeaderSize || data[9] != 1 {
+				continue
+			}
+
+			compressed := int64(binary.LittleEndian.Uint32(data[1:5]))
+			decompressed := int64(binary.LittleEndian.Uint32(data[5:9]))
+
+			if compressed == 0 {
+				continue
+			}
+
+			checked++
+
+			if _, err := inflateLimit(int(compressed), decompressed, internalFileInflateBounds); err != nil {
+				t.Errorf("%s page %d: %d -> %d rejected by the internal-file bounds: %v",
+					name, i, compressed, decompressed, err)
+			}
+
+			if r := float64(decompressed) / float64(compressed); r > worstRatio {
+				worstRatio, worstFile = r, name
+			}
+		}
+
+		db.Close()
+	}
+
+	if checked == 0 {
+		t.Skip("no compressed internal files in the fixtures")
+	}
+
+	t.Logf("checked %d compressed internal files; widest expansion %.2fx (%s), ratio bound is %d",
+		checked, worstRatio, worstFile, maxInternalCompressionRatio)
+
+	if worstRatio > maxInternalCompressionRatio/4 {
+		t.Errorf("widest expansion %.2fx leaves too little headroom under the bound of %d",
+			worstRatio, maxInternalCompressionRatio)
 	}
 }
 
