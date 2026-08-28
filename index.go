@@ -11,11 +11,41 @@ import (
 const (
 	// btreeHeaderSize is the packed size of TABSBTreePageHeader.
 	btreeHeaderSize = 18
+
+	// leafEntrySuffixSize is the size of the reference stored after the key in
+	// a leaf entry: PageNo int32 + ItemNo uint16.
+	leafEntrySuffixSize = 6
+
+	// internalEntrySuffixSize is the size of the reference stored after the key
+	// in an internal node entry: the child PageNo int32. Internal nodes carry
+	// no item number, so their entries are two bytes shorter than leaf entries.
+	internalEntrySuffixSize = 4
+
+	// systemKeySize is the key size of the engine's internal page indexes.
+	// Their PageNo values are engine internals, not data page numbers.
+	systemKeySize = 4
+
+	// primaryKeySize is the key size of a single-column int32 primary key
+	// index: one null flag byte plus the int32 value.
+	primaryKeySize = 5
+
+	// maxTreeDepth bounds a root-to-leaf descent. Real trees are two or three
+	// levels deep; anything deeper means the page links form a cycle or the
+	// file is corrupt.
+	maxTreeDepth = 64
 )
 
 var (
-	ErrNoIndex     = errors.New("absdb: no index found")
+	// ErrNoIndex is returned when the requested index does not exist.
+	ErrNoIndex = errors.New("absdb: no index found")
+
+	// ErrKeyNotFound is returned when a lookup finds no matching entry.
 	ErrKeyNotFound = errors.New("absdb: key not found")
+
+	// ErrMalformedIndex reports a structurally invalid index: a cyclic page
+	// chain, a descent deeper than maxTreeDepth, an empty internal node, a
+	// non-leaf page in the leaf chain or a zero-length key.
+	ErrMalformedIndex = errors.New("absdb: malformed index")
 )
 
 // BTreePageHeader is the on-disk header at the start of every index page body.
@@ -35,7 +65,7 @@ type BTreePageHeader struct {
 type BTreeEntry struct {
 	Key    []byte // key bytes (KeyPrefixSize bytes)
 	PageNo int32  // referenced page number
-	ItemNo uint16 // referenced item number within the page
+	ItemNo uint16 // referenced item number within the page (leaf entries only)
 }
 
 // RecordID returns the entry's reference as a (PageNo, ItemNo) pair.
@@ -47,14 +77,14 @@ func (e BTreeEntry) RecordID() (int32, uint16) {
 type IndexInfo struct {
 	RootPageNo int  // root page of the B-tree
 	KeySize    int  // key size in bytes
-	EntryCount int  // total entries (for root-only trees)
+	EntryCount int  // entries on the root page (whole tree only for root-only trees)
 	IsInternal bool // true for system indexes (RecordPage, BlobPage)
 }
 
 // parseBTreeHeader reads the TABSBTreePageHeader from index page data.
 func parseBTreeHeader(data []byte) (*BTreePageHeader, error) {
 	if len(data) < btreeHeaderSize {
-		return nil, fmt.Errorf("absdb: index page too short (%d bytes)", len(data))
+		return nil, fmt.Errorf("%w: index page too short (%d bytes)", ErrMalformedIndex, len(data))
 	}
 
 	return &BTreePageHeader{
@@ -70,32 +100,60 @@ func parseBTreeHeader(data []byte) (*BTreePageHeader, error) {
 	}, nil
 }
 
-// readBTreeEntries reads all entries from an index page.
-func readBTreeEntries(data []byte, hdr *BTreePageHeader) []BTreeEntry {
-	keySize := int(hdr.KeyPrefixSize)
-	entrySize := keySize + 6 // key + PageItemID (4 + 2)
-	entries := make([]BTreeEntry, 0, hdr.EntryCount)
+// entryStride returns the on-disk size of one entry on the given node. Leaves
+// store a full record reference (PageNo + ItemNo) behind the key, internal
+// nodes only the child PageNo.
+func entryStride(hdr *BTreePageHeader) int {
+	if hdr.IsLeaf {
+		return int(hdr.KeyPrefixSize) + leafEntrySuffixSize
+	}
 
-	for i := range int(hdr.EntryCount) {
-		off := btreeHeaderSize + i*entrySize
-		if off+entrySize > len(data) {
-			break
-		}
+	return int(hdr.KeyPrefixSize) + internalEntrySuffixSize
+}
+
+// readBTreeEntries reads the entries of one index page.
+//
+// The number of entries read is bounded by what the page can physically hold,
+// never by the untrusted EntryCount field alone, so a crafted page cannot force
+// a large allocation.
+func readBTreeEntries(data []byte, hdr *BTreePageHeader) ([]BTreeEntry, error) {
+	if len(data) < btreeHeaderSize {
+		return nil, fmt.Errorf("%w: index page too short (%d bytes)", ErrMalformedIndex, len(data))
+	}
+
+	keySize := int(hdr.KeyPrefixSize)
+	if keySize == 0 {
+		return nil, fmt.Errorf("%w: zero key size", ErrMalformedIndex)
+	}
+
+	stride := entryStride(hdr)
+
+	count := int(hdr.EntryCount)
+	if capacity := (len(data) - btreeHeaderSize) / stride; count > capacity {
+		count = capacity
+	}
+
+	entries := make([]BTreeEntry, 0, count)
+
+	for i := range count {
+		off := btreeHeaderSize + i*stride
 
 		key := make([]byte, keySize)
 		copy(key, data[off:off+keySize])
 
-		pageNo := int32(binary.LittleEndian.Uint32(data[off+keySize : off+keySize+4]))
-		itemNo := binary.LittleEndian.Uint16(data[off+keySize+4 : off+keySize+6])
-
-		entries = append(entries, BTreeEntry{
+		entry := BTreeEntry{
 			Key:    key,
-			PageNo: pageNo,
-			ItemNo: itemNo,
-		})
+			PageNo: int32(binary.LittleEndian.Uint32(data[off+keySize : off+keySize+4])),
+		}
+
+		if hdr.IsLeaf {
+			entry.ItemNo = binary.LittleEndian.Uint16(data[off+keySize+4 : off+keySize+6])
+		}
+
+		entries = append(entries, entry)
 	}
 
-	return entries
+	return entries, nil
 }
 
 // IndexReader provides index-based lookups on a table.
@@ -109,6 +167,16 @@ type indexRoot struct {
 	pageNo  int
 	header  *BTreePageHeader
 	keySize int
+}
+
+// info converts a discovered root into its public description.
+func (r indexRoot) info() IndexInfo {
+	return IndexInfo{
+		RootPageNo: r.pageNo,
+		KeySize:    r.keySize,
+		EntryCount: int(r.header.EntryCount),
+		IsInternal: r.keySize == systemKeySize,
+	}
 }
 
 // OpenIndex creates an IndexReader by scanning all index pages.
@@ -126,6 +194,7 @@ func (db *File) OpenIndex() (*IndexReader, error) {
 		}
 
 		d := page.PageData()
+
 		hdr, err := parseBTreeHeader(d)
 		if err != nil {
 			continue
@@ -148,46 +217,60 @@ func (db *File) OpenIndex() (*IndexReader, error) {
 	return &IndexReader{db: db, indexes: roots}, nil
 }
 
-// Indexes returns information about all discovered indexes.
+// Indexes returns information about all discovered indexes, system indexes
+// included. Use UserIndexes to get only the indexes over table rows.
 func (ir *IndexReader) Indexes() []IndexInfo {
 	result := make([]IndexInfo, len(ir.indexes))
 
 	for i, root := range ir.indexes {
-		result[i] = IndexInfo{
-			RootPageNo: root.pageNo,
-			KeySize:    root.keySize,
-			EntryCount: int(root.header.EntryCount),
-			IsInternal: root.keySize == 4, // 4-byte keys = system page indexes
-		}
+		result[i] = root.info()
 	}
 
 	return result
 }
 
-// PrimaryKeyIndex returns the root page info for the primary key index.
-// The primary key index has 5-byte keys (1 null flag + 4-byte int32).
-func (ir *IndexReader) PrimaryKeyIndex() (*indexRoot, error) {
-	for i := range ir.indexes {
-		if ir.indexes[i].keySize == 5 {
-			return &ir.indexes[i], nil
-		}
-	}
-
-	return nil, ErrNoIndex
-}
-
-// SecondaryIndexes returns root pages for non-system, non-primary indexes.
-func (ir *IndexReader) SecondaryIndexes() []IndexInfo {
+// UserIndexes returns every index defined over table rows, that is all
+// discovered indexes except the engine's internal page indexes (systemKeySize
+// keys). Only user index entries reference real rows: the PageNo of a system
+// index entry is an engine-internal value, not a data page number.
+func (ir *IndexReader) UserIndexes() []IndexInfo {
 	var result []IndexInfo
 
 	for _, root := range ir.indexes {
-		if root.keySize != 4 && root.keySize != 5 { // not system, not primary
-			result = append(result, IndexInfo{
-				RootPageNo: root.pageNo,
-				KeySize:    root.keySize,
-				EntryCount: int(root.header.EntryCount),
-			})
+		if root.keySize == systemKeySize {
+			continue
 		}
+
+		result = append(result, root.info())
+	}
+
+	return result
+}
+
+// PrimaryKeyIndex returns the user index over the primary key: the one with
+// primaryKeySize keys (1 null flag byte + int32). Tables whose primary key is
+// composite have no such index and yield ErrNoIndex.
+func (ir *IndexReader) PrimaryKeyIndex() (IndexInfo, error) {
+	for _, root := range ir.indexes {
+		if root.keySize == primaryKeySize {
+			return root.info(), nil
+		}
+	}
+
+	return IndexInfo{}, ErrNoIndex
+}
+
+// SecondaryIndexes returns the user indexes other than the primary key index,
+// that is UserIndexes minus the primaryKeySize entry.
+func (ir *IndexReader) SecondaryIndexes() []IndexInfo {
+	var result []IndexInfo
+
+	for _, idx := range ir.UserIndexes() {
+		if idx.KeySize == primaryKeySize {
+			continue
+		}
+
+		result = append(result, idx)
 	}
 
 	return result
@@ -201,11 +284,11 @@ func (ir *IndexReader) FindByPrimaryKey(key int32) (dataPageNo int32, itemNo uin
 		return 0, 0, err
 	}
 
-	// Build the 5-byte search key: [00] + int32 LE.
-	searchKey := make([]byte, 5)
+	// Build the search key: [null flag 00] + int32 LE.
+	searchKey := make([]byte, primaryKeySize)
 	binary.LittleEndian.PutUint32(searchKey[1:], uint32(key))
 
-	entry, err := ir.searchBTree(root.pageNo, searchKey)
+	entry, err := ir.searchTree(root.RootPageNo, searchKey, compareInt32Keys)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -214,7 +297,11 @@ func (ir *IndexReader) FindByPrimaryKey(key int32) (dataPageNo int32, itemNo uin
 }
 
 // FindByStringKey searches a secondary string index for the given value.
-// Uses the first secondary index found with matching key size.
+//
+// Known limitation: index definitions are not parsed yet, so an index cannot be
+// mapped to the column it covers. The lookup therefore always uses the first
+// secondary index of the table and silently returns ErrKeyNotFound for values
+// of any other indexed column.
 func (ir *IndexReader) FindByStringKey(value string) (dataPageNo int32, itemNo uint16, err error) {
 	secondaries := ir.SecondaryIndexes()
 	if len(secondaries) == 0 {
@@ -222,9 +309,13 @@ func (ir *IndexReader) FindByStringKey(value string) (dataPageNo int32, itemNo u
 	}
 
 	idx := secondaries[0]
-	searchKey := makeStringKey(value, idx.KeySize)
 
-	entry, err := ir.searchBTreeString(idx.RootPageNo, searchKey)
+	searchKey, err := makeStringKey(value, idx.KeySize)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	entry, err := ir.searchTree(idx.RootPageNo, searchKey, compareStringKeys)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -238,97 +329,136 @@ func (ir *IndexReader) ScanIndex(rootPageNo int) ([]BTreeEntry, error) {
 	return ir.scanLeaves(rootPageNo)
 }
 
-// searchBTree performs a B-tree search starting from the given root page.
-func (ir *IndexReader) searchBTree(rootPageNo int, searchKey []byte) (BTreeEntry, error) {
+// indexPage reads one index page and parses its B-tree header.
+func (ir *IndexReader) indexPage(pageNo int) ([]byte, *BTreePageHeader, error) {
+	page, err := ir.db.ReadPage(pageNo)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	d := page.PageData()
+
+	hdr, err := parseBTreeHeader(d)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return d, hdr, nil
+}
+
+// searchTree descends from rootPageNo to the leaf that may hold searchKey and
+// returns the entry whose key compares equal under cmp, or ErrKeyNotFound.
+// The descent is bounded by maxTreeDepth so a cyclic child link terminates.
+func (ir *IndexReader) searchTree(
+	rootPageNo int,
+	searchKey []byte,
+	cmp func(a, b []byte) int,
+) (BTreeEntry, error) {
 	pageNo := rootPageNo
 
-	for {
-		page, err := ir.db.ReadPage(pageNo)
+	for range maxTreeDepth {
+		d, hdr, err := ir.indexPage(pageNo)
 		if err != nil {
 			return BTreeEntry{}, err
 		}
 
-		d := page.PageData()
-		hdr, err := parseBTreeHeader(d)
+		entries, err := readBTreeEntries(d, hdr)
 		if err != nil {
 			return BTreeEntry{}, err
 		}
-
-		entries := readBTreeEntries(d, hdr)
 
 		if hdr.IsLeaf {
-			// Binary search in leaf entries.
-			idx := sort.Search(len(entries), func(i int) bool {
-				return bytes.Compare(entries[i].Key, searchKey) >= 0
-			})
-
-			if idx < len(entries) && bytes.Equal(entries[idx].Key, searchKey) {
-				return entries[idx], nil
-			}
-
-			return BTreeEntry{}, ErrKeyNotFound
+			return findInLeaf(entries, searchKey, cmp)
 		}
 
-		// Internal node: find the child to descend into.
-		// Keys in internal nodes act as separators. Find the rightmost key <= searchKey.
-		childIdx := sort.Search(len(entries), func(i int) bool {
-			return bytes.Compare(entries[i].Key, searchKey) > 0
-		})
-
-		if childIdx == 0 {
-			// Search key is less than all keys — go to left subtree.
-			// The leftmost child is referenced by entries[0].
-			pageNo = int(entries[0].PageNo)
-		} else {
-			pageNo = int(entries[childIdx-1].PageNo)
+		if len(entries) == 0 {
+			return BTreeEntry{}, fmt.Errorf("%w: empty internal node at page %d", ErrMalformedIndex, pageNo)
 		}
+
+		pageNo = childPageNo(entries, searchKey, cmp)
 	}
+
+	return BTreeEntry{}, fmt.Errorf("%w: descent from page %d exceeded %d levels",
+		ErrMalformedIndex, rootPageNo, maxTreeDepth)
+}
+
+// findInLeaf binary-searches the sorted leaf entries for searchKey.
+func findInLeaf(entries []BTreeEntry, searchKey []byte, cmp func(a, b []byte) int) (BTreeEntry, error) {
+	idx := sort.Search(len(entries), func(i int) bool {
+		return cmp(entries[i].Key, searchKey) >= 0
+	})
+
+	if idx < len(entries) && cmp(entries[idx].Key, searchKey) == 0 {
+		return entries[idx], nil
+	}
+
+	return BTreeEntry{}, ErrKeyNotFound
+}
+
+// childPageNo picks the child to descend into. Internal node keys act as
+// separators, so the target child is the one behind the rightmost key that is
+// not greater than searchKey; keys below the first separator live in the
+// leftmost child.
+func childPageNo(entries []BTreeEntry, searchKey []byte, cmp func(a, b []byte) int) int {
+	idx := sort.Search(len(entries), func(i int) bool {
+		return cmp(entries[i].Key, searchKey) > 0
+	})
+
+	if idx == 0 {
+		return int(entries[0].PageNo)
+	}
+
+	return int(entries[idx-1].PageNo)
 }
 
 // scanLeaves reads all leaf entries starting from the root, following the
-// leaf chain via RightPageNo links.
+// leaf chain via RightPageNo links. A page that is revisited or that is not a
+// leaf aborts the scan with ErrMalformedIndex instead of looping forever.
 func (ir *IndexReader) scanLeaves(rootPageNo int) ([]BTreeEntry, error) {
-	// First, find the leftmost leaf.
-	leafPageNo, err := ir.findLeftmostLeaf(rootPageNo)
+	pageNo, err := ir.findLeftmostLeaf(rootPageNo)
 	if err != nil {
 		return nil, err
 	}
 
-	// Then scan all leaves via the right-page chain.
 	var allEntries []BTreeEntry
-	pageNo := leafPageNo
+
+	visited := make(map[int]struct{})
 
 	for pageNo >= 0 {
-		page, err := ir.db.ReadPage(pageNo)
+		if _, seen := visited[pageNo]; seen {
+			return nil, fmt.Errorf("%w: leaf chain revisits page %d", ErrMalformedIndex, pageNo)
+		}
+
+		visited[pageNo] = struct{}{}
+
+		d, hdr, err := ir.indexPage(pageNo)
 		if err != nil {
 			return nil, err
 		}
 
-		d := page.PageData()
-		hdr, err := parseBTreeHeader(d)
+		if !hdr.IsLeaf {
+			return nil, fmt.Errorf("%w: page %d in leaf chain is not a leaf", ErrMalformedIndex, pageNo)
+		}
+
+		entries, err := readBTreeEntries(d, hdr)
 		if err != nil {
 			return nil, err
 		}
 
-		entries := readBTreeEntries(d, hdr)
 		allEntries = append(allEntries, entries...)
-
 		pageNo = int(hdr.RightPageNo)
 	}
 
 	return allEntries, nil
 }
 
-// findLeftmostLeaf descends the tree always taking the leftmost child.
+// findLeftmostLeaf descends the tree always taking the leftmost child. The
+// descent is bounded by maxTreeDepth so a cyclic child link terminates.
 func (ir *IndexReader) findLeftmostLeaf(pageNo int) (int, error) {
-	for {
-		page, err := ir.db.ReadPage(pageNo)
-		if err != nil {
-			return 0, err
-		}
+	start := pageNo
 
-		d := page.PageData()
-		hdr, err := parseBTreeHeader(d)
+	for range maxTreeDepth {
+		d, hdr, err := ir.indexPage(pageNo)
 		if err != nil {
 			return 0, err
 		}
@@ -337,55 +467,50 @@ func (ir *IndexReader) findLeftmostLeaf(pageNo int) (int, error) {
 			return pageNo, nil
 		}
 
-		entries := readBTreeEntries(d, hdr)
+		entries, err := readBTreeEntries(d, hdr)
+		if err != nil {
+			return 0, err
+		}
+
 		if len(entries) == 0 {
-			return 0, fmt.Errorf("absdb: empty internal node at page %d", pageNo)
+			return 0, fmt.Errorf("%w: empty internal node at page %d", ErrMalformedIndex, pageNo)
 		}
 
 		pageNo = int(entries[0].PageNo)
 	}
+
+	return 0, fmt.Errorf("%w: descent from page %d exceeded %d levels",
+		ErrMalformedIndex, start, maxTreeDepth)
 }
 
-// searchBTreeString performs a B-tree search for string keys.
-// String keys have garbage bytes after the null terminator, so we compare
-// only up to the null terminator in the string portion (after byte 0).
-func (ir *IndexReader) searchBTreeString(rootPageNo int, searchKey []byte) (BTreeEntry, error) {
-	pageNo := rootPageNo
+// compareInt32Keys compares two int32 index keys: a null flag byte followed by
+// the value in little-endian byte order. Byte-wise comparison must not be used
+// for these keys — the least significant byte comes first, so it orders 256
+// before 2 — while the entries on a page are sorted by value.
+func compareInt32Keys(a, b []byte) int {
+	if len(a) < primaryKeySize || len(b) < primaryKeySize {
+		return bytes.Compare(a, b)
+	}
 
-	for {
-		page, err := ir.db.ReadPage(pageNo)
-		if err != nil {
-			return BTreeEntry{}, err
+	if a[0] != b[0] {
+		if a[0] < b[0] {
+			return -1
 		}
 
-		d := page.PageData()
-		hdr, err := parseBTreeHeader(d)
-		if err != nil {
-			return BTreeEntry{}, err
-		}
+		return 1
+	}
 
-		entries := readBTreeEntries(d, hdr)
+	av := int32(binary.LittleEndian.Uint32(a[1:primaryKeySize]))
 
-		if hdr.IsLeaf {
-			for _, e := range entries {
-				if compareStringKeys(e.Key, searchKey) == 0 {
-					return e, nil
-				}
-			}
+	bv := int32(binary.LittleEndian.Uint32(b[1:primaryKeySize]))
 
-			return BTreeEntry{}, ErrKeyNotFound
-		}
-
-		// Internal node.
-		childIdx := sort.Search(len(entries), func(i int) bool {
-			return compareStringKeys(entries[i].Key, searchKey) > 0
-		})
-
-		if childIdx == 0 {
-			pageNo = int(entries[0].PageNo)
-		} else {
-			pageNo = int(entries[childIdx-1].PageNo)
-		}
+	switch {
+	case av < bv:
+		return -1
+	case av > bv:
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -426,16 +551,17 @@ func extractNullTerminated(data []byte) []byte {
 
 // makeStringKey creates a search key for string indexes.
 // The key format is: [00] + Windows-1252 string padded/truncated to keySize-1 bytes.
-func makeStringKey(value string, keySize int) []byte {
-	key := make([]byte, keySize)
-	// First byte is a null flag (0 = not null).
-	key[0] = 0
-	// Copy the string value, truncating if needed.
-	n := copy(key[1:], []byte(value))
-	// Null-terminate and zero-pad the rest.
-	for i := n + 1; i < keySize; i++ {
-		key[i] = 0
+func makeStringKey(value string, keySize int) ([]byte, error) {
+	// One byte for the null flag plus at least one byte of string.
+	if keySize < 2 {
+		return nil, fmt.Errorf("%w: string key size %d too small", ErrMalformedIndex, keySize)
 	}
 
-	return key
+	// The first byte stays 0 (the null flag: 0 = not null); the string is
+	// copied behind it, truncated if it does not fit, and the rest stays zero,
+	// which both terminates and pads the key.
+	key := make([]byte, keySize)
+	copy(key[1:], value)
+
+	return key, nil
 }
