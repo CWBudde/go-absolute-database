@@ -5,7 +5,6 @@ import (
 	"os"
 	"strconv"
 
-	absdb "github.com/cwbudde/go-absolute-database"
 	"github.com/spf13/cobra"
 )
 
@@ -27,7 +26,7 @@ func blobCmd() *cobra.Command {
 				return fmt.Errorf("invalid col: %s", args[2])
 			}
 
-			db, err := absdb.Open(args[0])
+			db, err := openDatabase(args[0])
 			if err != nil {
 				return err
 			}

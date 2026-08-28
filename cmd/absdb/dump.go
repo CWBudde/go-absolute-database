@@ -20,7 +20,7 @@ func dumpCmd() *cobra.Command {
 		Short: "Dump all records as a table or JSON",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := absdb.Open(args[0])
+			db, err := openDatabase(args[0])
 			if err != nil {
 				return err
 			}
@@ -154,7 +154,7 @@ func formatField(rec absdb.Record, col int, c absdb.Column) string {
 			return "<blob:null>"
 		}
 
-		return fmt.Sprintf("<blob:%dB>", ref.PageNo)
+		return fmt.Sprintf("<blob:page %d, item %d>", ref.PageNo, ref.ItemNo)
 	default:
 		return fmt.Sprintf("<%d bytes>", c.Size)
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 
-	absdb "github.com/cwbudde/go-absolute-database"
 	"github.com/spf13/cobra"
 )
 
@@ -13,7 +12,7 @@ func schemaCmd() *cobra.Command {
 		Short: "Show table column definitions",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := absdb.Open(args[0])
+			db, err := openDatabase(args[0])
 			if err != nil {
 				return err
 			}

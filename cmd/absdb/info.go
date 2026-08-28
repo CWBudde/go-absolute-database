@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 
-	absdb "github.com/cwbudde/go-absolute-database"
 	"github.com/spf13/cobra"
 )
 
@@ -13,7 +12,7 @@ func infoCmd() *cobra.Command {
 		Short: "Show file header information",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := absdb.Open(args[0])
+			db, err := openDatabase(args[0])
 			if err != nil {
 				return err
 			}
@@ -23,7 +22,12 @@ func infoCmd() *cobra.Command {
 			fmt.Printf("Version:    %.2f\n", db.Version())
 			fmt.Printf("Page size:  %d bytes\n", db.PageSize())
 			fmt.Printf("Page count: %d\n", db.PageCount())
-			fmt.Printf("Encrypted:  %v\n", db.Encrypted())
+
+			if ch := db.CryptoHeader(); ch != nil {
+				fmt.Printf("Encrypted:  yes (%s, mode %d)\n", ch.Algorithm, ch.Mode)
+			} else {
+				fmt.Printf("Encrypted:  %v\n", db.Encrypted())
+			}
 
 			schema, err := db.Schema()
 			if err != nil {
