@@ -114,8 +114,10 @@ const (
 type cipherSpec struct {
 	hash    keyHash
 	keySize int
-	// newBlock builds the block cipher; nil means the algorithm is known but
-	// not implementable with the ciphers available to this package.
+	// newBlock builds the block cipher. Every algorithm the format defines now
+	// has one, so no entry is nil; the field is still allowed to be nil, and
+	// newCipherBlock still guards against it, so that a future algorithm can be
+	// listed here with its key derivation before its cipher exists.
 	newBlock func(key []byte) (cipher.Block, error)
 }
 
@@ -132,7 +134,7 @@ var cipherSpecs = map[CryptoAlgorithm]cipherSpec{
 	CryptoBlowfish:    {hashRipeMD256, 32, newBlowfishCipher},
 	CryptoTwofish128:  {hashRipeMD128, 16, newTwofishCipher},
 	CryptoTwofish256:  {hashRipeMD256, 32, newTwofishCipher},
-	CryptoSquare:      {hashRipeMD128, 16, nil},
+	CryptoSquare:      {hashRipeMD128, 16, newSquareCipher},
 }
 
 func newAESCipher(key []byte) (cipher.Block, error) {
@@ -193,6 +195,22 @@ func newTwofishCipher(key []byte) (cipher.Block, error) {
 	block, err := newTwofish(key)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: twofish: %w", err)
+	}
+
+	return block, nil
+}
+
+// newSquareCipher builds Square from the 16-byte RIPEMD-128 digest of the
+// password, the only key size the algorithm allows and the one the
+// algorithm-to-hash mapping supplies for CryptoSquare.
+//
+// Square is DEC-specific: golang.org/x/crypto has no Square at all, so unlike
+// Blowfish or AES there was never an off-the-shelf implementation to reach for.
+// See square.go for the port of DEC 3.0's TCipher_Square.
+func newSquareCipher(key []byte) (cipher.Block, error) {
+	block, err := newSquare(key)
+	if err != nil {
+		return nil, fmt.Errorf("absdb: square: %w", err)
 	}
 
 	return block, nil

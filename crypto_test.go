@@ -246,19 +246,76 @@ func TestUnlock(t *testing.T) {
 	}
 }
 
-// TestUnlockUnsupportedCipher documents the algorithms this package knows about
-// but cannot decrypt. Square is DEC-specific and has no fixture; unlike
-// Twofish, nothing has been reverse-engineered for it yet.
-func TestUnlockUnsupportedCipher(t *testing.T) {
-	for _, algo := range []CryptoAlgorithm{CryptoSquare} {
+// TestAllAlgorithmsSupported records the completeness milestone: all eight
+// TABSCryptoAlgorithm values the format defines are implemented, Square — the
+// last one — included. Every one derives a key and yields a working block.
+func TestAllAlgorithmsSupported(t *testing.T) {
+	algorithms := []CryptoAlgorithm{
+		CryptoRijndael128, CryptoRijndael256, CryptoDESSingle, CryptoDESTriple,
+		CryptoBlowfish, CryptoTwofish128, CryptoTwofish256, CryptoSquare,
+	}
+
+	for _, algo := range algorithms {
 		key := deriveKey(algo, testPassword)
 		if key == nil {
 			t.Errorf("deriveKey(%v) = nil, want a derived key", algo)
+
+			continue
 		}
 
-		_, err := newCipherBlock(algo, key)
+		block, err := newCipherBlock(algo, key)
+		if err != nil {
+			t.Errorf("newCipherBlock(%v) = %v, want a working block", algo, err)
+
+			continue
+		}
+
+		if block.BlockSize() <= 0 {
+			t.Errorf("newCipherBlock(%v) block size = %d, want a positive size",
+				algo, block.BlockSize())
+		}
+	}
+}
+
+// TestUnlockUnsupportedCipher covers what is left of the ErrUnsupportedCipher
+// path. With Square implemented, all eight defined algorithms can be decrypted,
+// so the error is reserved for algorithm bytes outside the enum — a value read
+// from a corrupt or future crypto header.
+func TestUnlockUnsupportedCipher(t *testing.T) {
+	for _, algo := range []CryptoAlgorithm{CryptoAlgorithm(8), CryptoAlgorithm(99), CryptoAlgorithm(255)} {
+		if key := deriveKey(algo, testPassword); key != nil {
+			t.Errorf("deriveKey(%v) = %x, want nil", algo, key)
+		}
+
+		_, err := newCipherBlock(algo, nil)
 		if !errors.Is(err, ErrUnsupportedCipher) {
 			t.Errorf("newCipherBlock(%v) error = %v, want ErrUnsupportedCipher", algo, err)
+		}
+	}
+}
+
+// TestCryptoAlgorithmString covers the names shown by the Absolute Database UI
+// and the fallback for a value outside the enum.
+func TestCryptoAlgorithmString(t *testing.T) {
+	tests := []struct {
+		algo CryptoAlgorithm
+		want string
+	}{
+		{CryptoRijndael128, "Rijndael-128"},
+		{CryptoRijndael256, "Rijndael-256"},
+		{CryptoDESSingle, "DES-Single"},
+		{CryptoDESTriple, "DES-Triple"},
+		{CryptoBlowfish, "Blowfish"},
+		{CryptoTwofish128, "Twofish-128"},
+		{CryptoTwofish256, "Twofish-256"},
+		{CryptoSquare, "Square"},
+		{CryptoAlgorithm(8), "CryptoAlgorithm(8)"},
+		{CryptoAlgorithm(255), "CryptoAlgorithm(255)"},
+	}
+
+	for _, tt := range tests {
+		if got := tt.algo.String(); got != tt.want {
+			t.Errorf("CryptoAlgorithm(%d).String() = %q, want %q", byte(tt.algo), got, tt.want)
 		}
 	}
 }
