@@ -13,13 +13,14 @@ import (
 // their plaintext twin, but they cannot validate the decryption of encrypted
 // *records* — there are none.
 //
-// The two Employees-Twofish_* fixtures close that gap: they carry a real table
-// with three rows, so TestTwofishFixtures reads encrypted schema and encrypted
-// records end to end. They have no plaintext twin, so instead of a byte
-// comparison they are checked against the ABSP page checksum, which is
-// absCRC32 over the *decrypted* payload and so is an independent oracle.
+// The seven Employees-* fixtures close that gap: one per algorithm, each
+// carrying a real table with three rows, so TestEmployeeFixtures reads
+// encrypted schema and encrypted records end to end. They have no plaintext
+// twin, so instead of a byte comparison they are checked against the ABSP page
+// checksum, which is absCRC32 over the *decrypted* payload and so is an
+// independent oracle.
 
-// testPassword is the password of all three encrypted fixtures (capital B).
+// testPassword is the password of every encrypted fixture (capital B).
 const testPassword = "Bla"
 
 // encryptedFixtures lists the encrypted fixtures with their expected algorithm
@@ -376,20 +377,31 @@ func TestEncryptedFileWithoutPassword(t *testing.T) {
 	}
 }
 
-// twofishFixtures are encrypted databases holding a real table, created with
-// the ComponentAce Absolute Database Manager. Unlike the Addresses-* fixtures
-// they have no plaintext twin, so decryption is checked against each page's
-// ABSP checksum instead.
-var twofishFixtures = []struct {
+// employeeFixtures are encrypted databases holding a real table, created with
+// the ComponentAce Absolute Database Manager -- one per encryption algorithm.
+// Unlike the Addresses-* fixtures they have no plaintext twin, so decryption is
+// checked against each page's ABSP checksum instead.
+//
+// They are the whole reason two of these ciphers are correct: Rijndael-256 and
+// DES-Triple were both implemented from inference and both silently wrong until
+// a real file existed to test them against. Blowfish is the one algorithm with
+// no fixture here; it is covered only by the empty-table Addresses-Blowfish.abs.
+var employeeFixtures = []struct {
 	name      string
 	algorithm CryptoAlgorithm
 }{
+	{"Employees-Rijndael_128.abs", CryptoRijndael128},
+	{"Employees-Rijndael_256.abs", CryptoRijndael256},
+	{"Employees-DES_Single.abs", CryptoDESSingle},
+	{"Employees-DES_Triple.abs", CryptoDESTriple},
 	{"Employees-Twofish_128.abs", CryptoTwofish128},
 	{"Employees-Twofish_256.abs", CryptoTwofish256},
+	{"Employees-Square.abs", CryptoSquare},
 }
 
-// twofishRows is what the Absolute Database Manager shows for these fixtures.
-var twofishRows = []struct {
+// employeeRows is what the Absolute Database Manager shows for these
+// fixtures. All of them hold the identical table; only the cipher differs.
+var employeeRows = []struct {
 	id     int32
 	name   string
 	salary float64
@@ -400,10 +412,11 @@ var twofishRows = []struct {
 	{3, "Kurt", 999.25, true},
 }
 
-// TestTwofishFixtures reads both Twofish variants end to end: header, password
-// verification, per-page decryption, schema and record values.
-func TestTwofishFixtures(t *testing.T) {
-	for _, fixture := range twofishFixtures {
+// TestEmployeeFixtures reads every algorithm's fixture end to end: header,
+// password verification, per-page decryption, schema and record values. Seven
+// of the eight defined algorithms are covered.
+func TestEmployeeFixtures(t *testing.T) {
+	for _, fixture := range employeeFixtures {
 		t.Run(fixture.name, func(t *testing.T) {
 			db, err := OpenWithPassword(requireFixture(t, fixture.name), testPassword)
 			if err != nil {
@@ -446,11 +459,11 @@ func TestTwofishFixtures(t *testing.T) {
 			row := 0
 
 			for reader.Next() {
-				if row >= len(twofishRows) {
-					t.Fatalf("more than %d rows", len(twofishRows))
+				if row >= len(employeeRows) {
+					t.Fatalf("more than %d rows", len(employeeRows))
 				}
 
-				want := twofishRows[row]
+				want := employeeRows[row]
 				rec := reader.Record()
 
 				if got := rec.Int(0); got != want.id {
@@ -476,8 +489,8 @@ func TestTwofishFixtures(t *testing.T) {
 				t.Fatalf("iteration: %v", err)
 			}
 
-			if row != len(twofishRows) {
-				t.Errorf("read %d rows, want %d", row, len(twofishRows))
+			if row != len(employeeRows) {
+				t.Errorf("read %d rows, want %d", row, len(employeeRows))
 			}
 		})
 	}
@@ -487,12 +500,12 @@ func TestTwofishFixtures(t *testing.T) {
 // encrypted fixture, Twofish and otherwise. It is independent of the plaintext
 // twin used by TestDecryptedPagesMatchPlaintext.
 func TestEncryptedPageChecksums(t *testing.T) {
-	names := make([]string, 0, len(encryptedFixtures)+len(twofishFixtures))
+	names := make([]string, 0, len(encryptedFixtures)+len(employeeFixtures))
 	for _, f := range encryptedFixtures {
 		names = append(names, f.name)
 	}
 
-	for _, f := range twofishFixtures {
+	for _, f := range employeeFixtures {
 		names = append(names, f.name)
 	}
 
@@ -509,10 +522,10 @@ func TestEncryptedPageChecksums(t *testing.T) {
 	}
 }
 
-// TestTwofishWrongPassword checks the Twofish key derivation rejects near
-// misses rather than producing garbage.
-func TestTwofishWrongPassword(t *testing.T) {
-	for _, fixture := range twofishFixtures {
+// TestEmployeeFixturesWrongPassword checks that every algorithm's key
+// derivation rejects near misses rather than producing garbage.
+func TestEmployeeFixturesWrongPassword(t *testing.T) {
+	for _, fixture := range employeeFixtures {
 		t.Run(fixture.name, func(t *testing.T) {
 			path := requireFixture(t, fixture.name)
 

@@ -128,7 +128,7 @@ type cipherSpec struct {
 // RIPEMD-128 is the non-obvious entry.
 var cipherSpecs = map[CryptoAlgorithm]cipherSpec{
 	CryptoRijndael128: {hashRipeMD128, 16, newAESCipher},
-	CryptoRijndael256: {hashRipeMD256, 32, newAESCipher},
+	CryptoRijndael256: {hashRipeMD256, 32, newRijndaelCipher},
 	CryptoDESSingle:   {hashRipeMD128, 8, newDESCipher},
 	CryptoDESTriple:   {hashRipeMD128, 16, newTripleDESCipher},
 	CryptoBlowfish:    {hashRipeMD256, 32, newBlowfishCipher},
@@ -146,6 +146,22 @@ func newAESCipher(key []byte) (cipher.Block, error) {
 	return block, nil
 }
 
+// newRijndaelCipher builds DEC's Rijndael from the derived 32-byte key.
+//
+// crypto/aes is deliberately still used for CryptoRijndael128: DEC's key
+// schedule coincides with AES for 128- and 192-bit keys, so the stdlib is
+// byte-identical there and is both faster and constant-time. It diverges for
+// 256-bit keys, which is why that one algorithm needs the in-tree
+// implementation. See rijndael.go.
+func newRijndaelCipher(key []byte) (cipher.Block, error) {
+	block, err := newRijndael(key)
+	if err != nil {
+		return nil, fmt.Errorf("absdb: rijndael: %w", err)
+	}
+
+	return block, nil
+}
+
 func newDESCipher(key []byte) (cipher.Block, error) {
 	block, err := des.NewCipher(key) //nolint:gosec // reading legacy files
 	if err != nil {
@@ -155,18 +171,17 @@ func newDESCipher(key []byte) (cipher.Block, error) {
 	return block, nil
 }
 
-// newTripleDESCipher builds two-key Triple DES (K1, K2, K1) from the 16-byte
-// digest, which is how a 16-byte key is fed to a 24-byte 3DES key schedule.
+// newTripleDESCipher builds DEC's TCipher_3TDES from the derived key.
 //
-// Untested: no encrypted fixture uses DES-Triple.
+// This is not two-key EDE Triple DES over an 8-byte block, which is what the
+// name suggests and what this package assumed before a fixture existed. It is
+// DEC's TCipher_3TDES: a 24-byte block, keyed with the 16-byte RIPEMD-128
+// digest zero-extended to 24 so the third DES key is all zeros. See tdes.go,
+// including the swap typo that has to be reproduced.
 func newTripleDESCipher(key []byte) (cipher.Block, error) {
-	full := make([]byte, 0, 24)
-	full = append(full, key...)
-	full = append(full, key[:8]...)
-
-	block, err := des.NewTripleDESCipher(full) //nolint:gosec // reading legacy files
+	block, err := newTripleDES(key)
 	if err != nil {
-		return nil, fmt.Errorf("absdb: 3des: %w", err)
+		return nil, fmt.Errorf("absdb: 3tdes: %w", err)
 	}
 
 	return block, nil

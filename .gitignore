@@ -28,16 +28,22 @@ Thumbs.db
 testdata/*
 !testdata/fuzz/
 
-# Exception: the two Twofish fixtures are ours, not customer data. They were
-# generated with the ComponentAce DB Manager and hold a synthetic Employees
-# table (three invented rows), so they carry no customer content and no vendor
-# material -- only the format's own ABS0LUTEDATABASE/ABSP magic. They are
-# committed because they are the only fixtures CI can use: without them every
-# fixture-backed test skips on a runner and the crypto is never exercised.
-# Keep this list explicit; never widen it to a glob that could catch a real
-# customer file.
+# Exception: the Employees-* fixtures are ours, not customer data. They were
+# generated with the ComponentAce DB Manager and all hold the same synthetic
+# Employees table (three invented rows), so they carry no customer content and
+# no vendor material -- only the format's own ABS0LUTEDATABASE/ABSP magic. One
+# per encryption algorithm, they are committed because they are the only
+# fixtures CI can use: without them every fixture-backed test skips on a runner
+# and the crypto is never exercised at all.
+# Keep this list explicit, one filename per line; never widen it to a glob,
+# which could silently catch a real customer file.
+!testdata/Employees-Rijndael_128.abs
+!testdata/Employees-Rijndael_256.abs
+!testdata/Employees-DES_Single.abs
+!testdata/Employees-DES_Triple.abs
 !testdata/Employees-Twofish_128.abs
 !testdata/Employees-Twofish_256.abs
+!testdata/Employees-Square.abs
 !testdata/README.md
 
 legacy/

@@ -339,35 +339,50 @@ attempts failed.
 
 #### Verification status
 
-Implemented in `crypto.go` / `ripemd256.go` / `crc.go`, asserted in `crypto_test.go`,
-password **`"Bla"`**:
+Implemented in `crypto.go` / `ripemd256.go` / `crc.go` / `twofish.go` / `square.go` /
+`rijndael.go` / `tdes.go`, asserted in `crypto_test.go` and the per-cipher test files,
+password **`"Bla"`**.
 
-```
-Addresses-Rijndael_128.abs   ControlBlock CRC 0xffac4819 == 0xffac4819   13/13 pages byte-identical
-Addresses-DES_Single.abs     ControlBlock CRC 0xd9f59b5b == 0xd9f59b5b   13/13 pages byte-identical
-Addresses-Blowfish.abs       ControlBlock CRC 0x5a2f73e6 == 0x5a2f73e6   13/13 pages byte-identical
-wrong passwords ("bla", "wrong")                                          correctly rejected
-```
+All eight algorithms are implemented and every one is exercised against a real
+vendor-produced `.abs` file:
 
-Every encrypted page decrypts byte-identically to the plaintext `Addresses.abs` over the
-full 4056-byte payload.
+| Value | Cipher       | Fixture with rows            | Notes                                   |
+| ----- | ------------ | ---------------------------- | --------------------------------------- |
+| 0     | Rijndael-128 | `Employees-Rijndael_128.abs` | plain AES-128; DEC's schedule coincides |
+| 1     | Rijndael-256 | `Employees-Rijndael_256.abs` | **DEC deviation**, see below            |
+| 2     | DES-Single   | `Employees-DES_Single.abs`   | plain DES                               |
+| 3     | DES-Triple   | `Employees-DES_Triple.abs`   | **`TCipher_3TDES`, 24-byte block**      |
+| 4     | Blowfish     | _(none — empty table only)_  | plain Blowfish, verified byte-identical |
+| 5     | Twofish-128  | `Employees-Twofish_128.abs`  | **DEC deviation**, see below            |
+| 6     | Twofish-256  | `Employees-Twofish_256.abs`  | **DEC deviation**, see below            |
+| 7     | Square       | `Employees-Square.abs`       | faithful to the published cipher        |
+
+The three `Addresses-*` fixtures additionally decrypt byte-identically to the plaintext
+`Addresses.abs`, 13/13 pages over the full payload, for Rijndael-128, DES-Single and
+Blowfish.
 
 **What actually discriminates the payload extent.** Not the CTS tail: DEC's full-block
 and partial-block rules coincide when the plaintext is zero
-(`E(P XOR F) = E(F) = P XOR E(F)`), and these fixtures are empty tables, so the trailing
+(`E(P XOR F) = E(F) = P XOR E(F)`), and those fixtures are empty tables, so the trailing
 partial block is degenerate and decrypts identically under either model. What settles it
 is the next block's first 380 bytes — under the 3676-byte model those stay ciphertext:
-0 of 8 pages match and ~3030 of 3040 bytes differ against a known-zero plaintext. A
-fixture with rows near the end of a page would discriminate on the tail as well.
+0 of 8 pages match and ~3030 of 3040 bytes differ against a known-zero plaintext.
 
-#### Twofish: DEC's key schedule is not reference Twofish
+#### DEC's ciphers are not the published ciphers
 
-`ABSCipher.pas` is a fork of DEC 3.0, and its `TCipher_Twofish` is **not**
-interchangeable with reference Twofish, so `golang.org/x/crypto/twofish` cannot read
-these files. Everything but one line follows the specification — the two q permutations
-(512 bytes at offset 42587 of `ABSCipher.dcu`) and the MDS table (4096 bytes immediately
-after, at 43099) are byte-for-byte the published ones, and the round function, the RS key
-mapping and the key-dependent S-box setup all match — but the subkey loop reads
+`ABSCipher.pas` is a fork of DEC 3.0, and **three of its eight ciphers deviate from the
+algorithms they are named after**. Each deviation is reproduced deliberately and pinned by
+DEC's own compiled-in self-test vector; "fixing" any of them makes the affected files
+undecryptable.
+
+Two of the three were found only because real fixtures were generated. Both had been
+recorded here as "implemented but untested" while in fact being implemented and wrong.
+
+##### Twofish: a `shr`/`shl` typo in the key schedule
+
+Everything but one line follows the specification — the two q permutations (512 bytes at
+offset 42587 of `ABSCipher.dcu`) and the MDS table (4096 bytes at 43099) are byte-for-byte
+the published ones — but the subkey loop reads
 
 ```pascal
 SubKey[I shl 1] := A + B;
@@ -375,41 +390,107 @@ B := A + B shr 1;
 SubKey[I shl 1 + 1] := ROL(B, 9);
 ```
 
-where the specification calls for `K_{2i+1} = ROL(A + 2B, 9)`. Delphi binds `shr`
-tighter than `+`, so that computes `A + (B shr 1)`: a `shr`/`shl` typo that changes every
-odd subkey. `twofish.go` reproduces it deliberately.
+where the specification calls for `K_{2i+1} = ROL(A + 2B, 9)`. Delphi binds `shr` tighter
+than `+`, so that computes `A + (B shr 1)`: a `shr`/`shl` typo that changes every odd
+subkey. `golang.org/x/crypto/twofish` therefore cannot read these files.
 
-This is verified, not inferred. DEC compiles a self-test vector into each cipher class,
-and `TestDECTwofishSelfTest` reproduces `TCipher_Twofish.TestVector` exactly:
+##### Rijndael-256: a key schedule that is not AES-256
+
+`crypto/aes` is **correct for `Rijndael_128` and wrong for `Rijndael_256`**. Transcribing
+`TCipher_Rijndael.Init` (`Cipher1.pas:2173`) and diffing its expanded key against the
+standard AES expansion word by word:
 
 ```
-key       "TCipher_Twofish" (15 bytes, zero-padded to 16)
+128-bit key (10 rounds)  schedules identical
+192-bit key (12 rounds)  schedules identical
+256-bit key (14 rounds)  diverge at expanded word 12 -- DEC 0x516823b3, AES 0xcda85116
+```
+
+The `if FRounds = 14` branch chains all eight key words (`for I := 1 to 7 do
+K[I] := K[I] xor K[I-1]`), _then_ XORs `SubWord(K[3])` into the already-chained `K[4]`,
+_then_ re-chains `K[5..7]`. Standard AES-256 applies `SubWord` to `w[i-1]` and XORs with
+`w[i-8]` without that extra chaining. The round function itself is ordinary AES.
+
+This is why Rijndael-128 decrypted correctly for months while Rijndael-256 could never
+have worked. `rijndael.go` implements DEC's schedule; `TestRijndaelMatchesAES` pins the
+128/192-bit agreement with `crypto/aes` and `TestRijndael256NotAES` guards the deviation.
+`CryptoRijndael128` still uses `crypto/aes`, which is byte-identical there and both faster
+and constant-time.
+
+##### DES-Triple: the wrong class entirely, plus a swap typo
+
+`DES_Triple` is **not** `TCipher_3DES` and not two-key EDE over an 8-byte block, which is
+what was previously inferred. It is `TCipher_3TDES`:
+
+- **24-byte block**, not 8 (`GetContext` at `Cipher1.pas:2771` overrides `ABufSize := 24`).
+- Keyed with the 16-byte RIPEMD-128 digest **zero-extended to 24**, so the third DES key is
+  all zeros. `Init` zero-fills before `Move(Key, K, Size)`.
+- EDE across three 8-byte sub-blocks with a word swap between stages, and that swap
+  contains a typo:
+
+```pascal
+T := PIntArray(Data)[3]; PIntArray(Data)[3] := PIntArray(Data)[4]; PIntArray(Data)[3] := T;
+```
+
+It assigns to word 3 twice and never to word 4, so only words 1 and 2 are actually
+exchanged. Both variants were tested against `Employees-DES_Triple.abs`: reproducing the
+typo matches the stored ControlBlock CRC `0xd1a0c93f`, and correcting the swap does not.
+
+##### Square: no deviation
+
+Unlike the above, DEC's `TCipher_Square` is faithful to the 1997 Daemen/Knudsen/Rijmen
+cipher. The S-box, the diffusion matrix (the circulant of `2,1,1,3` over GF(2^8) modulo
+`$1F5` — _not_ AES's `$11B`) and the key schedule all match the specification. The only
+oddity is presentational: DEC folds the round constants in as a plain 32-bit
+`1 shl (T - 1)` rather than as field elements, which over the eight rounds Square uses is
+the same sequence 1,2,4..128 either way. It is in-tree only because no Go implementation
+of Square exists anywhere.
+
+#### The self-test vectors, and where they survive
+
+DEC compiles a 32-byte self-test vector into each cipher class. `TCipher.SelfTest` keys
+the cipher with the **class-name string**, zero-padded to `KeySize`, and encrypts DEC's
+32-byte `GetTestVector` plaintext in `cmCTS` with `IVector = nil`, so the feedback register
+starts at `E(0xFF...)` rather than `0xFF...`:
+
+```
 plaintext 3044ED6E45A496F5F635A2EB3D1A5DD6CB1D09822DBDF560C2B858A191F981B1
-expected  A5535703EF3348799F22B4549705841987BD831C4DAE1213607C7CD198450219
+
+TCipher_Rijndael  946D2B5EE0AD1B5CA523A513958B3D2D9387F3374551F6589BE7901B3687F9A9
+TCipher_Twofish   A5535703EF3348799F22B4549705841987BD831C4DAE1213607C7CD198450219
+TCipher_3TDES     0B12E48BD9CD08BFCAAE3E5FF6FE13CD3F706ECD53563F5A800F1B1EFB9A5796
+TCipher_Square    439CA6C467E82E472295668506396AC9182120F74436F1617D1490B1A96856C7
 ```
 
-`golang.org/x/crypto/twofish` fails that vector; `newTwofish` passes it. The same
-harness reproduces `TCipher_Blowfish.TestVector` with stdlib Blowfish, which is what
-proves the harness itself right.
+**These are not in `ABSCipher.dcu`.** ComponentAce replaced every DEC `TestVector` asm stub
+with one that raises `"TCipher_Square.TestVector not implemented 27"`, so byte-scanning the
+Rio-era `.dcu`, `.bpl` or `DBManager.exe` returns nothing. The vectors survive in two
+places: DEC 3.0's own `Cipher.pas`/`Cipher1.pas`, and the 2011-vintage
+`legacy/Utils/Bin/DBImportExport.exe`, where VMT slot 10 of each cipher class still points
+at the original constant (Square at file offset `0xD78B6`, Twofish at `0xD687A`). The two
+sources agree byte for byte, and the Blowfish vector reproduces with stdlib Blowfish, which
+is what proves the harness itself rather than the ciphers.
 
 #### Caveats
 
 - The three `Addresses-*` fixtures are encrypted copies of an **empty table**. They
   validate header and schema decryption byte-exactly against their plaintext twin, but
   cannot validate encrypted _record_ decryption.
-- ~~Encrypted record decryption is never validated.~~ **Resolved** by
-  `Employees-Twofish_128.abs` / `Employees-Twofish_256.abs`, created with the
-  ComponentAce DB Manager: a real four-column table with three rows, read end to end.
-  They have no plaintext twin, so they are checked against the ABSP page checksum, which
-  covers the decrypted payload and so is an independent oracle.
-- Rijndael-256, Square and DES-Triple are still untested — no fixtures. AES-256 and 3DES
-  are stdlib; Square is DEC-specific and would have to be ported.
+- ~~Encrypted record decryption is never validated.~~ **Resolved** by the seven
+  `Employees-*.abs` fixtures, created with the ComponentAce DB Manager: a real four-column
+  table with three rows, read end to end. They have no plaintext twin, so they are checked
+  against the ABSP page checksum, which covers the decrypted payload and so is an
+  independent oracle.
+- ~~Rijndael-256, Square and DES-Triple are still untested — no fixtures.~~ **Resolved**,
+  and two of the three turned out to be wrong; see the deviations above.
+- **Blowfish has no fixture with rows.** It is verified byte-identically against the
+  plaintext twin, so this is a much smaller gap than the others were, but it is the last
+  algorithm whose record path rests on an empty table.
 - ~~The `ABSP.CRC32` page checksum does not reproduce over the decrypted data.~~
-  **Resolved.** `ABSP.CRC32` is `absCRC32` over the decrypted **4056-byte payload** — 24
-  of 24 encrypted pages across all three fixtures. The recorded mismatch (computed
-  `8316267a` vs stored `6b705972`) was the 3676-byte value: an artifact of the old page
-  model, not a different CRC range. The format therefore has a working page-integrity
-  check, pinned by `TestPageCRCIsAbsCRC32OfPayload`.
+  **Resolved.** `ABSP.CRC32` is `absCRC32` over the decrypted **4056-byte payload**. The
+  recorded mismatch (computed `8316267a` vs stored `6b705972`) was the 3676-byte value: an
+  artifact of the old page model, not a different CRC range. Pinned by
+  `TestPageCRCIsAbsCRC32OfPayload`.
 
 ### BLOB compression
 
@@ -1081,30 +1162,42 @@ a key derivation that took an algorithm parameter and ignored it.
       targeted `Addresses.abs`, which is the **unencrypted** fixture, and
       `TestVerifyPassword` tried two casings and passed if either worked.
 
-**Verified:** Rijndael-128, DES-Single, Blowfish — each decrypts byte-identically to the
-plaintext `Addresses.abs`, 13/13 pages, over the full payload.
+**All eight algorithms are implemented and all eight are exercised against real
+vendor-produced files.** Seven have an `Employees-*.abs` fixture carrying a real table,
+read end to end: header, password, every page against its ABSP checksum, schema, and all
+three records with their exact values. Blowfish has no fixture with rows, but decrypts
+byte-identically against its plaintext twin.
 
-**Implemented but untested:** Rijndael-256 and DES-Triple — no fixtures. For DES-Triple
-the 16-byte digest is expanded to two-key 3DES (K1, K2, K1) to fill Go's 24-byte key
-schedule; that expansion is an inference, not a verified fact.
+**Verified byte-identically against the plaintext `Addresses.abs`:** Rijndael-128,
+DES-Single, Blowfish — 13/13 pages over the full payload.
 
-**Verified with rows:** Twofish-128 and Twofish-256 — `twofish.go` implements DEC's
-variant (see the key-schedule note above) and `Employees-Twofish_{128,256}.abs` are read
-end to end: header, password, every page against its ABSP checksum, schema, and all
-three records with their exact values.
+**Found wrong by the new fixtures, then fixed:** Rijndael-256 and DES-Triple. Both were
+previously recorded here as "implemented but untested"; they were implemented and wrong.
+See [DEC's ciphers are not the published ciphers](#decs-ciphers-are-not-the-published-ciphers).
 
-**Unsupported:** Square returns `ErrUnsupportedCipher`. Its key derivation is
-implemented and tested, so only the block cipher is missing; it is DEC-specific and
-would have to be ported.
+- Rijndael-256 used `crypto/aes`, but DEC's key schedule diverges from AES for 256-bit
+  keys. `rijndael.go` now implements DEC's.
+- DES-Triple used two-key EDE `(K1, K2, K1)` over an 8-byte block — an inference that was
+  flagged as such here and turned out to be false in every particular. It is
+  `TCipher_3TDES`: a 24-byte block, third key all zeros, with a swap typo that must be
+  reproduced. `tdes.go` now implements it.
+
+**Ported:** Square — `square.go` implements DEC's `TCipher_Square`, which unlike the
+others is faithful to the published cipher. It was the last algorithm returning
+`ErrUnsupportedCipher`; that error is now reserved for algorithm bytes outside the enum.
 
 > The three `Addresses-*` fixtures are encrypted copies of an **empty table**, so they
-> validate header, schema and page decryption byte-exactly but never records. The two
-> `Employees-Twofish_*` fixtures cover records.
+> validate header, schema and page decryption byte-exactly but never records. The seven
+> `Employees-*` fixtures cover records, for every algorithm but Blowfish.
 
 ### Deferred
 
-- [ ] Square — DEC-specific, would have to be ported; no fixtures
-- [ ] Fixtures with rows for Rijndael-256 and DES-Triple
+- [x] ~~Square — DEC-specific, would have to be ported; no fixtures~~ — done; the fixture
+      route via DBManager under Wine made the "no fixtures" premise obsolete.
+- [x] ~~Fixtures with rows for Rijndael-256 and DES-Triple~~ — done, and both turned out
+      to be decrypting incorrectly.
+- [ ] A fixture with rows for Blowfish — the last algorithm whose record path rests only
+      on an empty table. Cheap to produce with the same Wine recipe.
 
 ---
 
@@ -1243,6 +1336,9 @@ Planned additions:
 ```
 ├── ripemd256.go       # needed for Rijndael-256 / Blowfish / Twofish-256 — Phase 6
 ├── twofish.go         # DEC's Twofish variant (see Phase 6)              — Phase 6
+├── square.go          # DEC's Square (no deviation)                      — Phase 6
+├── rijndael.go        # DEC's Rijndael; needed for Rijndael-256 only     — Phase 6
+├── tdes.go            # DEC's TCipher_3TDES, 24-byte block               — Phase 6
 ├── fuzz_test.go       # FuzzOpen, FuzzParseSchema, FuzzReadBlob          — Phase 5d
 ├── .github/workflows/ # CI running `just ci`                             — Phase T
 ├── writer.go          # Record insert/update/delete                      — Phase 7

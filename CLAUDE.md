@@ -30,11 +30,18 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 ## Key Policies
 
 - **Minimal dependencies**: the core read path uses the standard library plus two `golang.org/x` packages, which are maintained by the Go team and are effectively extended stdlib: `golang.org/x/text/encoding/charmap` for Windows-1252 decoding (`reader.go`) and `golang.org/x/crypto/blowfish` for the Blowfish cipher used by encrypted files (`crypto.go`). `github.com/spf13/cobra` is a CLI-only dependency and must not be imported by the library. Anything beyond that needs a reason.
-- **Twofish stays in-tree**: `twofish.go` is not a stylistic preference over `golang.org/x/crypto/twofish`. ABSCipher's Twofish is DEC 3.0's, whose key schedule has a `shr`/`shl` typo that makes it incompatible with reference Twofish, so the x/crypto package cannot read these files. `TestDECTwofishSelfTest` pins this against DEC's own self-test vector — do not "fix" the deviation.
+- **DEC's ciphers stay in-tree**: `twofish.go`, `square.go`, `rijndael.go` and `tdes.go` are not stylistic preferences over `golang.org/x/crypto` or `crypto/aes`. ABSCipher is a fork of DEC 3.0, and three of its ciphers deviate from the published algorithms, so a correct implementation cannot read these files:
+  - **Twofish** — DEC's key schedule has a `shr`/`shl` typo, so `golang.org/x/crypto/twofish` is incompatible.
+  - **Rijndael-256** — DEC's key schedule matches AES for 128- and 192-bit keys but diverges for 256-bit ones, so `crypto/aes` is correct for `Rijndael_128` and wrong for `Rijndael_256`.
+  - **DES-Triple** — this is DEC's `TCipher_3TDES`, a **24-byte** block, and its word swap contains a typo that must be reproduced.
+  - **Square** — no deviation, but no Go implementation exists anywhere, DEC-specific or otherwise.
+
+  Each is pinned by a `TestDEC*SelfTest` against DEC's own self-test vector and by a real fixture. **Do not "fix" any of these deviations** — every affected file would stop decrypting. The deviations were found by real fixtures, not by reading; two of them shipped as silently wrong code for months.
+
 - **Read-only first**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only. No write code until Phase 7.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.
-- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are `testdata/Employees-Twofish_{128,256}.abs`, which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit and Twofish tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
+- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are the seven `testdata/Employees-*.abs` fixtures, one per encryption algorithm, which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit and `Employees-*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
 - **Windows-1252 aware**: String fields use Windows-1252 encoding by default. Always decode to UTF-8.
 
 ## Formatting and Linting
