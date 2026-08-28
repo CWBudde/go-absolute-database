@@ -34,7 +34,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 - **Read-only first**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only. No write code until Phase 7.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.
-- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — the files are real customer project data and are never committed. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic and unit tests alone. A green CI run therefore does **not** mean the parser was validated against real files; run `just test` locally for that.
+- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are `testdata/Employees-Twofish_{128,256}.abs`, which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit and Twofish tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
 - **Windows-1252 aware**: String fields use Windows-1252 encoding by default. Always decode to UTF-8.
 
 ## Formatting and Linting
@@ -50,4 +50,4 @@ Linting is `golangci-lint` with `default: all` and a curated disable list. Every
 
 ## CI
 
-`.github/workflows/ci.yml` runs build, `go vet`, `gofmt`, `go mod tidy -diff`, race tests, `golangci-lint`, and a short fuzz budget per target. It cannot see `testdata/`, so read the scope note at the top of that file before trusting a green check.
+`.github/workflows/ci.yml` runs build, `go vet`, `gofmt`, `go mod tidy -diff`, race tests, `golangci-lint`, and a short fuzz budget per target. It sees only the two committed Twofish fixtures, not the customer ones, so read the scope note at the top of that file before trusting a green check.

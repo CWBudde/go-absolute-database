@@ -27,4 +27,17 @@ Thumbs.db
 # `testdata/` rule would silently never match.
 testdata/*
 !testdata/fuzz/
+
+# Exception: the two Twofish fixtures are ours, not customer data. They were
+# generated with the ComponentAce DB Manager and hold a synthetic Employees
+# table (three invented rows), so they carry no customer content and no vendor
+# material -- only the format's own ABS0LUTEDATABASE/ABSP magic. They are
+# committed because they are the only fixtures CI can use: without them every
+# fixture-backed test skips on a runner and the crypto is never exercised.
+# Keep this list explicit; never widen it to a glob that could catch a real
+# customer file.
+!testdata/Employees-Twofish_128.abs
+!testdata/Employees-Twofish_256.abs
+!testdata/README.md
+
 legacy/

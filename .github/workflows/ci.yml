@@ -2,17 +2,24 @@
 #
 # SCOPE — please read before trusting a green check:
 #
-#   testdata/ is gitignored on purpose. The .abs fixtures are real customer
-#   project data and are never committed. Every test that opens a fixture calls
-#   t.Skip() when the file is absent, so on a GitHub runner those tests are
-#   SKIPPED, not passed. What CI actually covers is the synthetic and unit
-#   tests: header/page parsing on hand-built buffers, schema and record layout
-#   derivation, CRC, RIPEMD, the crypto key schedule, and the fuzz targets.
+#   testdata/ is gitignored on purpose. Almost every .abs fixture is real
+#   customer project data and is never committed. Every test that opens a
+#   fixture calls t.Skip() when the file is absent, so on a GitHub runner most
+#   of them are SKIPPED, not passed. What CI actually covers is the synthetic
+#   and unit tests: header/page parsing on hand-built buffers, schema and
+#   record layout derivation, CRC, RIPEMD, Twofish, and the fuzz targets.
 #
-#   Real-file validation only happens on a developer machine that has the
-#   fixtures. Run `just test` (or `just ci`) locally before merging anything
-#   that touches the parser. A green CI run means "nothing obviously broken",
-#   not "verified against real .abs files".
+#   The two exceptions are testdata/Employees-Twofish_{128,256}.abs, which are
+#   committed (see testdata/README.md: synthetic data, no customer content).
+#   They are the only real .abs files a runner sees, so CI does exercise the
+#   full encrypted read path end to end -- page decryption against the ABSP
+#   checksum, schema, records, and the index oracle -- but only for Twofish.
+#
+#   Everything else -- all 20 customer fixtures, and Rijndael/DES/Blowfish
+#   decryption -- is validated only on a developer machine that has them. Run
+#   `just test` (or `just ci`) locally before merging anything that touches the
+#   parser. A green CI run means "nothing obviously broken", not "verified
+#   against real .abs files".
 #
 #   For the same reason there is deliberately no coverage upload here: the
 #   number a runner would produce excludes the fixture-driven paths and would
