@@ -341,7 +341,8 @@ func buildSynthetic(t testing.TB, spec synthSpec) []byte {
 	}
 
 	pages := make([]synthPage, 0, 4+len(spec.blobs))
-	pages = append(pages,
+	pages = append(
+		pages,
 		synthPage{pageType: PageTypeFileHdr, objectID: -1, nextPage: -1},
 		synthPage{
 			pageType: PageTypeSchema,

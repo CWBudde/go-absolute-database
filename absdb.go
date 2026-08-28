@@ -128,7 +128,11 @@ func OpenWithPassword(path, password string) (*File, error) {
 
 // Close closes the database file.
 func (db *File) Close() error {
-	return db.f.Close()
+	if err := db.f.Close(); err != nil {
+		return fmt.Errorf("absdb: closing file: %w", err)
+	}
+
+	return nil
 }
 
 // Version returns the database engine version (e.g. 5.13, 7.10, 7.61).
@@ -195,96 +199,6 @@ func (db *File) ReadPage(n int) (Page, error) {
 	}
 
 	return page, nil
-}
-
-func (db *File) parseHeader() error {
-	info, err := db.f.Stat()
-	if err != nil {
-		return fmt.Errorf("absdb: %w", err)
-	}
-
-	db.size = info.Size()
-
-	if db.size < dbHeaderSize {
-		return ErrTruncated
-	}
-
-	buf := make([]byte, dbHeaderSize)
-
-	_, err = db.f.ReadAt(buf, 0)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return fmt.Errorf("absdb: reading header: %w", err)
-	}
-
-	// Validate magic.
-	var magic [16]byte
-	copy(magic[:], buf[:16])
-
-	if magic != Magic {
-		return ErrNotABS
-	}
-
-	// TABSDBHeader layout (packed):
-	//   Signature[16]        offset 0
-	//   HeaderSize  int16    offset 16
-	//   Version     float64  offset 18
-	//   PageSize    uint16   offset 26
-	//   PageCountInExtent uint16 offset 28
-	//   TotalPageCount int32 offset 30
-	//   LastUsedPageNo int32 offset 34
-	//   State       int32    offset 38
-	//   WriteChangesState byte offset 42
-	//   Encrypted   bytebool offset 43
-	//   Reserved[32]         offset 44
-
-	db.headerSize = int16(binary.LittleEndian.Uint16(buf[16:18]))
-	db.version = math.Float64frombits(binary.LittleEndian.Uint64(buf[18:26]))
-
-	db.pageSize = binary.LittleEndian.Uint16(buf[26:28])
-	if db.pageSize == 0 {
-		return errors.New("absdb: invalid page size 0")
-	}
-
-	// A page must at least be able to hold its own disk page header, otherwise
-	// the payload model is not well defined. Real files use 4096, so this only
-	// rejects nonsense. pageSize is a uint16 and therefore bounded above.
-	if int(db.pageSize) < pageDataOffset {
-		return fmt.Errorf("absdb: invalid page size %d", db.pageSize)
-	}
-
-	db.pagesInExtent = binary.LittleEndian.Uint16(buf[28:30])
-	db.totalPageCount = int32(binary.LittleEndian.Uint32(buf[30:34]))
-	db.lastUsedPageNo = int32(binary.LittleEndian.Uint32(buf[34:38]))
-	db.state = int32(binary.LittleEndian.Uint32(buf[38:42]))
-	db.writeChangeState = buf[42]
-	db.encrypted = buf[43] != 0
-
-	if db.size < int64(db.pageSize) {
-		return ErrTruncated
-	}
-
-	if db.totalPageCount < 0 {
-		return fmt.Errorf("absdb: invalid total page count %d", db.totalPageCount)
-	}
-
-	// The file must be large enough to hold every announced page, including the
-	// trailing diskPageHeaderOffset bytes that complete the last page's payload.
-	// A longer file is tolerated; a shorter one cannot be trusted and would
-	// otherwise make ScanPages allocate for pages that do not exist.
-	if int64(db.totalPageCount)*int64(db.pageSize)+diskPageHeaderOffset > db.size {
-		return ErrTruncated
-	}
-
-	// Parse CryptoHeader if encrypted.
-	if db.encrypted {
-		page0 := make([]byte, db.pageSize)
-		if _, err := db.f.ReadAt(page0, 0); err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("absdb: reading page 0 for crypto header: %w", err)
-		}
-		db.cryptoHeader = parseCryptoHeader(page0)
-	}
-
-	return nil
 }
 
 // Page represents a single page read from the database file.
@@ -390,6 +304,97 @@ type PageSummary struct {
 	Number int
 	Empty  bool
 	Header *DiskPageHeader
+}
+
+func (db *File) parseHeader() error {
+	info, err := db.f.Stat()
+	if err != nil {
+		return fmt.Errorf("absdb: %w", err)
+	}
+
+	db.size = info.Size()
+
+	if db.size < dbHeaderSize {
+		return ErrTruncated
+	}
+
+	buf := make([]byte, dbHeaderSize)
+
+	_, err = db.f.ReadAt(buf, 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("absdb: reading header: %w", err)
+	}
+
+	// Validate magic.
+	var magic [16]byte
+	copy(magic[:], buf[:16])
+
+	if magic != Magic {
+		return ErrNotABS
+	}
+
+	// TABSDBHeader layout (packed):
+	//   Signature[16]        offset 0
+	//   HeaderSize  int16    offset 16
+	//   Version     float64  offset 18
+	//   PageSize    uint16   offset 26
+	//   PageCountInExtent uint16 offset 28
+	//   TotalPageCount int32 offset 30
+	//   LastUsedPageNo int32 offset 34
+	//   State       int32    offset 38
+	//   WriteChangesState byte offset 42
+	//   Encrypted   bytebool offset 43
+	//   Reserved[32]         offset 44
+
+	db.headerSize = int16(binary.LittleEndian.Uint16(buf[16:18]))
+	db.version = math.Float64frombits(binary.LittleEndian.Uint64(buf[18:26]))
+
+	db.pageSize = binary.LittleEndian.Uint16(buf[26:28])
+	if db.pageSize == 0 {
+		return errors.New("absdb: invalid page size 0")
+	}
+
+	// A page must at least be able to hold its own disk page header, otherwise
+	// the payload model is not well defined. Real files use 4096, so this only
+	// rejects nonsense. pageSize is a uint16 and therefore bounded above.
+	if int(db.pageSize) < pageDataOffset {
+		return fmt.Errorf("absdb: invalid page size %d", db.pageSize)
+	}
+
+	db.pagesInExtent = binary.LittleEndian.Uint16(buf[28:30])
+	db.totalPageCount = int32(binary.LittleEndian.Uint32(buf[30:34]))
+	db.lastUsedPageNo = int32(binary.LittleEndian.Uint32(buf[34:38]))
+	db.state = int32(binary.LittleEndian.Uint32(buf[38:42]))
+	db.writeChangeState = buf[42]
+	db.encrypted = buf[43] != 0
+
+	if db.size < int64(db.pageSize) {
+		return ErrTruncated
+	}
+
+	if db.totalPageCount < 0 {
+		return fmt.Errorf("absdb: invalid total page count %d", db.totalPageCount)
+	}
+
+	// The file must be large enough to hold every announced page, including the
+	// trailing diskPageHeaderOffset bytes that complete the last page's payload.
+	// A longer file is tolerated; a shorter one cannot be trusted and would
+	// otherwise make ScanPages allocate for pages that do not exist.
+	if int64(db.totalPageCount)*int64(db.pageSize)+diskPageHeaderOffset > db.size {
+		return ErrTruncated
+	}
+
+	// Parse CryptoHeader if encrypted.
+	if db.encrypted {
+		page0 := make([]byte, db.pageSize)
+		if _, err := db.f.ReadAt(page0, 0); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("absdb: reading page 0 for crypto header: %w", err)
+		}
+
+		db.cryptoHeader = parseCryptoHeader(page0)
+	}
+
+	return nil
 }
 
 // payloadSize returns the number of usable payload bytes carried by a single

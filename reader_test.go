@@ -39,6 +39,7 @@ func TestFixtureRowCounts(t *testing.T) {
 			}
 
 			got := 0
+
 			for reader.Next() {
 				reader.Record()
 
@@ -455,6 +456,7 @@ func TestNarrowAndWideAccessors(t *testing.T) {
 	binary.LittleEndian.PutUint16(data[6:8], 65535)                // word
 	binary.LittleEndian.PutUint64(data[8:16], ^uint64(4))          // int64 -5
 	binary.LittleEndian.PutUint64(data[16:24], uint64(12_345_678)) // currency 1234.5678
+
 	for i, u := range []uint16{'H', 'a', 'l', 'l', 'o', 0} {
 		binary.LittleEndian.PutUint16(data[24+2*i:26+2*i], u)
 	}
@@ -587,6 +589,54 @@ func TestRRADEmissionFiles(t *testing.T) {
 				if math.IsNaN(v) || math.IsInf(v, 0) {
 					t.Fatalf("col %d = %v, want finite", col, v)
 				}
+			}
+		})
+	}
+}
+
+// TestNarrowAccessorsRejectOutOfRange checks that the fixed-width accessors
+// report 0 for a value that does not fit them, rather than the truncated low
+// bytes of the stored value — which would be indistinguishable from a real one.
+func TestNarrowAccessorsRejectOutOfRange(t *testing.T) {
+	cols := []Column{{Name: "L", BaseType: BftInt64, FieldType: FieldLargeInt}}
+
+	reader := &Reader{schema: &TableSchema{Columns: cols}}
+	reader.computeRecordLayout()
+
+	record := func(v int64) Record {
+		data := make([]byte, reader.fieldDataSize)
+		binary.LittleEndian.PutUint64(data[0:8], uint64(v))
+
+		return Record{reader: reader, nullFlags: make([]byte, reader.nullFlagBytes), fieldData: data}
+	}
+
+	// Low bytes deliberately non-zero, so that a plain truncating conversion
+	// would return a wrong non-zero value instead of an accidentally right 0.
+	const big = int64(0x7FFF_1234_5678)
+
+	if got := record(big).Int64(0); got != big {
+		t.Errorf("Int64 = %#x, want %#x", got, big)
+	}
+
+	tests := []struct {
+		name string
+		v    int64
+		read func(Record) int64
+	}{
+		{"Int/above", big, func(r Record) int64 { return int64(r.Int(0)) }},
+		{"Int/below", -big, func(r Record) int64 { return int64(r.Int(0)) }},
+		{"Int16/above", big, func(r Record) int64 { return int64(r.Int16(0)) }},
+		{"Int16/below", -big, func(r Record) int64 { return int64(r.Int16(0)) }},
+		{"Uint16/above", big, func(r Record) int64 { return int64(r.Uint16(0)) }},
+		{"Uint16/negative", -1, func(r Record) int64 { return int64(r.Uint16(0)) }},
+		{"Uint32/above", big, func(r Record) int64 { return int64(r.Uint32(0)) }},
+		{"Uint32/negative", -1, func(r Record) int64 { return int64(r.Uint32(0)) }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.read(record(tt.v)); got != 0 {
+				t.Errorf("got %d, want 0 (stored %#x does not fit)", got, tt.v)
 			}
 		})
 	}

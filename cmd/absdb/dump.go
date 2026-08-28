@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -51,7 +52,7 @@ func dumpTable(reader *absdb.Reader, schema *absdb.TableSchema, limit int) error
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 
 	// Header.
-	var headers []string
+	headers := make([]string, 0, len(schema.Columns))
 	for _, c := range schema.Columns {
 		headers = append(headers, c.Name)
 	}
@@ -66,13 +67,14 @@ func dumpTable(reader *absdb.Reader, schema *absdb.TableSchema, limit int) error
 		}
 
 		rec := reader.Record()
-		var vals []string
+		vals := make([]string, 0, len(schema.Columns))
 
 		for i, c := range schema.Columns {
 			vals = append(vals, formatField(rec, i, c))
 		}
 
 		fmt.Fprintln(w, strings.Join(vals, "\t"))
+
 		count++
 	}
 
@@ -135,15 +137,15 @@ func formatField(rec absdb.Record, col int, c absdb.Column) string {
 
 	switch c.BaseType {
 	case absdb.BftInt8, absdb.BftInt16, absdb.BftInt32:
-		return fmt.Sprintf("%d", rec.Int(col))
+		return strconv.Itoa(int(rec.Int(col)))
 	case absdb.BftInt64:
-		return fmt.Sprintf("%d", rec.Int64(col))
+		return strconv.FormatInt(rec.Int64(col), 10)
 	case absdb.BftUint8, absdb.BftUint16, absdb.BftUint32:
-		return fmt.Sprintf("%d", rec.Uint32(col))
+		return strconv.FormatUint(uint64(rec.Uint32(col)), 10)
 	case absdb.BftSingle, absdb.BftDouble, absdb.BftCurrency:
 		return fmt.Sprintf("%g", rec.Float(col))
 	case absdb.BftLogical:
-		return fmt.Sprintf("%v", rec.Bool(col))
+		return strconv.FormatBool(rec.Bool(col))
 	case absdb.BftDate, absdb.BftTime, absdb.BftDateTime:
 		return rec.Time(col).Format("2006-01-02 15:04:05")
 	case absdb.BftVarchar, absdb.BftChar, absdb.BftWideVarchar, absdb.BftWideChar:

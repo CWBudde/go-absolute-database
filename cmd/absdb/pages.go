@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 
 	absdb "github.com/cwbudde/go-absolute-database"
 	"github.com/spf13/cobra"
@@ -54,11 +55,12 @@ func pagesCmd() *cobra.Command {
 				if page.Header != nil {
 					typeName = pageTypeName(page.Header.PageType)
 					if page.Header.NextPageNo >= 0 {
-						next = fmt.Sprintf("%d", page.Header.NextPageNo)
+						next = strconv.Itoa(int(page.Header.NextPageNo))
 					} else {
 						next = "-"
 					}
-					objID = fmt.Sprintf("%d", page.Header.ObjectID)
+
+					objID = strconv.Itoa(int(page.Header.ObjectID))
 				}
 
 				empty := ""

@@ -176,17 +176,26 @@ func (rec Record) IsNull(col int) bool {
 
 // Int returns the value of an integer column widened to int32. Narrower
 // columns (Int8, Uint8, Int16, Uint16) are widened keeping their own sign.
-// Columns that do not store a plain integer return 0.
+// Columns that do not store a plain integer return 0, and so do values that do
+// not fit an int32 — an Int64 or Currency column, or a Uint32 column above
+// MaxInt32. Use Int64 to read those without loss.
 func (rec Record) Int(col int) int32 {
-	v, _ := rec.intValue(col)
+	v := rec.intValue(col)
+	if v < math.MinInt32 || v > math.MaxInt32 {
+		return 0
+	}
 
 	return int32(v)
 }
 
 // Int16 returns the value of a SmallInt column. Columns that do not store a
-// plain integer return 0.
+// plain integer return 0, and so do values outside the int16 range — reading a
+// wider column through Int16 yields 0 rather than its truncated low bytes.
 func (rec Record) Int16(col int) int16 {
-	v, _ := rec.intValue(col)
+	v := rec.intValue(col)
+	if v < math.MinInt16 || v > math.MaxInt16 {
+		return 0
+	}
 
 	return int16(v)
 }
@@ -195,23 +204,31 @@ func (rec Record) Int16(col int) int16 {
 // Currency column this is the raw value, scaled by 10000; use Float for the
 // decimal value.
 func (rec Record) Int64(col int) int64 {
-	v, _ := rec.intValue(col)
-
-	return v
+	return rec.intValue(col)
 }
 
 // Uint16 returns the value of a Word column. Columns that do not store a plain
-// integer return 0.
+// integer return 0, and so do values outside the uint16 range — including the
+// negative value of a signed column, which is not reinterpreted as a large
+// unsigned one.
 func (rec Record) Uint16(col int) uint16 {
-	v, _ := rec.intValue(col)
+	v := rec.intValue(col)
+	if v < 0 || v > math.MaxUint16 {
+		return 0
+	}
 
 	return uint16(v)
 }
 
 // Uint32 returns the value of an unsigned integer column. Narrower columns are
-// zero-extended. Columns that do not store a plain integer return 0.
+// zero-extended. Columns that do not store a plain integer return 0, and so do
+// values outside the uint32 range — including the negative value of a signed
+// column, which is not reinterpreted as a large unsigned one.
 func (rec Record) Uint32(col int) uint32 {
-	v, _ := rec.intValue(col)
+	v := rec.intValue(col)
+	if v < 0 || v > math.MaxUint32 {
+		return 0
+	}
 
 	return uint32(v)
 }
@@ -235,9 +252,7 @@ func (rec Record) Float(col int) float64 {
 			return math.Float64frombits(binary.LittleEndian.Uint64(raw))
 		}
 	case BftCurrency:
-		v, _ := rec.intValue(col)
-
-		return float64(v) / currencyScale
+		return float64(rec.intValue(col)) / currencyScale
 	}
 
 	return 0
@@ -367,21 +382,23 @@ func (rec Record) fieldPrefix(col, width int) []byte {
 }
 
 // intValue decodes an integer column into an int64, sign-extending signed
-// columns. ok is false for columns that do not store a plain integer.
-func (rec Record) intValue(col int) (int64, bool) {
+// columns. Columns that do not store a plain integer, and fields whose stored
+// bytes are truncated, decode to 0 — the same value every accessor built on
+// this one reports for them.
+func (rec Record) intValue(col int) int64 {
 	c, ok := rec.column(col)
 	if !ok {
-		return 0, false
+		return 0
 	}
 
 	width, signed, ok := integerStorage(c)
 	if !ok {
-		return 0, false
+		return 0
 	}
 
 	raw := rec.fieldPrefix(col, width)
 	if raw == nil {
-		return 0, false
+		return 0
 	}
 
 	var v uint64
@@ -394,7 +411,7 @@ func (rec Record) intValue(col int) (int64, bool) {
 		v |= ^uint64(0) << bits
 	}
 
-	return int64(v), true
+	return int64(v)
 }
 
 // integerStorage reports the stored width in bytes and the signedness of an
@@ -505,42 +522,47 @@ func recordsPerPage(payloadLen, recordSize int) int {
 	return n
 }
 
+// fixedFieldStoreSize gives the number of bytes each fixed-width base type
+// occupies in the fixed part of a record. Types whose stored size is derived
+// from the column's declared Size are absent and handled by fieldStoreSize.
+var fixedFieldStoreSize = map[BaseFieldType]int{
+	BftInt8:     1,
+	BftUint8:    1,
+	BftInt16:    2,
+	BftUint16:   2,
+	BftInt32:    4,
+	BftUint32:   4,
+	BftInt64:    8,
+	BftSingle:   4,
+	BftDouble:   8,
+	BftExtended: 10,
+	BftCurrency: 8,
+	BftLogical:  2, // WordBool
+	BftDate:     4,
+	BftTime:     4,
+	BftDateTime: 8, // Date(4) + Time(4)
+	BftBlob:     6, // BLOB reference: PageNo(4) + ItemNo(2)
+	BftClob:     6,
+	BftWideClob: 6,
+}
+
 // fieldStoreSize returns the number of bytes a column occupies in the fixed
 // part of a record.
 func fieldStoreSize(c Column) int {
+	if n, ok := fixedFieldStoreSize[c.BaseType]; ok {
+		return n
+	}
+
+	// The remaining types size themselves from the column's declared Size.
 	switch c.BaseType {
-	case BftInt8, BftUint8:
-		return 1
-	case BftInt16, BftUint16:
-		return 2
-	case BftInt32, BftUint32:
-		return 4
-	case BftInt64:
-		return 8
-	case BftSingle:
-		return 4
-	case BftDouble:
-		return 8
-	case BftExtended:
-		return 10
-	case BftCurrency:
-		return 8
-	case BftLogical:
-		return 2 // WordBool
-	case BftDate, BftTime:
-		return 4
-	case BftDateTime:
-		return 8 // Date(4) + Time(4)
 	case BftVarchar, BftChar:
 		return int(c.Size) + 1
 	case BftWideVarchar, BftWideChar:
 		return (int(c.Size) + 1) * 2
-	case BftBlob, BftClob, BftWideClob:
-		return 6 // BLOB reference: PageNo(4) + ItemNo(2)
-	case BftBytes:
-		return int(c.Size)
 	case BftVarBytes:
 		return int(c.Size) + 2
+	case BftBytes:
+		return int(c.Size)
 	default:
 		return int(c.Size)
 	}

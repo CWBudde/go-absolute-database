@@ -82,72 +82,49 @@ const (
 
 //go:generate stringer -type=FieldType
 
+// fieldTypeNames maps each known field type to its name. This is a table
+// rather than a switch because a 30-arm switch that only ever returns a
+// constant carries no logic worth reading as control flow.
+var fieldTypeNames = map[FieldType]string{
+	FieldUnknown:    "Unknown",
+	FieldChar:       "Char",
+	FieldString:     "String",
+	FieldWideChar:   "WideChar",
+	FieldWideString: "WideString",
+	FieldShortInt:   "ShortInt",
+	FieldSmallInt:   "SmallInt",
+	FieldInteger:    "Integer",
+	FieldLargeInt:   "LargeInt",
+	FieldByte:       "Byte",
+	FieldWord:       "Word",
+	FieldCardinal:   "Cardinal",
+	FieldAutoInc:    "AutoInc",
+	FieldSingle:     "Single",
+	FieldDouble:     "Double",
+	FieldExtended:   "Extended",
+	FieldBoolean:    "Boolean",
+	FieldCurrency:   "Currency",
+	FieldDate:       "Date",
+	FieldTime:       "Time",
+	FieldDateTime:   "DateTime",
+	FieldTimeStamp:  "TimeStamp",
+	FieldBytes:      "Bytes",
+	FieldVarBytes:   "VarBytes",
+	FieldBLOB:       "BLOB",
+	FieldGraphic:    "Graphic",
+	FieldMemo:       "Memo",
+	FieldFmtMemo:    "FmtMemo",
+	FieldWideMemo:   "WideMemo",
+	FieldGUID:       "GUID",
+}
+
 // String returns the field type name.
 func (ft FieldType) String() string {
-	switch ft {
-	case FieldUnknown:
-		return "Unknown"
-	case FieldChar:
-		return "Char"
-	case FieldString:
-		return "String"
-	case FieldWideChar:
-		return "WideChar"
-	case FieldWideString:
-		return "WideString"
-	case FieldShortInt:
-		return "ShortInt"
-	case FieldSmallInt:
-		return "SmallInt"
-	case FieldInteger:
-		return "Integer"
-	case FieldLargeInt:
-		return "LargeInt"
-	case FieldByte:
-		return "Byte"
-	case FieldWord:
-		return "Word"
-	case FieldCardinal:
-		return "Cardinal"
-	case FieldAutoInc:
-		return "AutoInc"
-	case FieldSingle:
-		return "Single"
-	case FieldDouble:
-		return "Double"
-	case FieldExtended:
-		return "Extended"
-	case FieldBoolean:
-		return "Boolean"
-	case FieldCurrency:
-		return "Currency"
-	case FieldDate:
-		return "Date"
-	case FieldTime:
-		return "Time"
-	case FieldDateTime:
-		return "DateTime"
-	case FieldTimeStamp:
-		return "TimeStamp"
-	case FieldBytes:
-		return "Bytes"
-	case FieldVarBytes:
-		return "VarBytes"
-	case FieldBLOB:
-		return "BLOB"
-	case FieldGraphic:
-		return "Graphic"
-	case FieldMemo:
-		return "Memo"
-	case FieldFmtMemo:
-		return "FmtMemo"
-	case FieldWideMemo:
-		return "WideMemo"
-	case FieldGUID:
-		return "GUID"
-	default:
-		return fmt.Sprintf("FieldType(%d)", int(ft))
+	if name, ok := fieldTypeNames[ft]; ok {
+		return name
 	}
+
+	return fmt.Sprintf("FieldType(%d)", int(ft))
 }
 
 // Column describes a single column in a table.
@@ -364,26 +341,9 @@ func parseColumnDef(data []byte, pos int, index int) (Column, int, error) {
 		pos += 6
 	}
 
-	// After the flags (and optional BLOB info), there is variable-length padding
-	// (zeros followed by 0xFF bytes), terminated by a 4-byte sequence:
-	//   0x7F 0x00 <byte> 0xFF
-	// where <byte> is either the baseType echo or 0x00 (varies by version).
-	found := false
-
-	for i := pos; i+3 < len(data); i++ {
-		if data[i] == 0x7F && data[i+1] == 0x00 && data[i+3] == 0xFF {
-			mid := data[i+2]
-			if mid == byte(baseType) || mid == 0x00 {
-				pos = i + 4
-				found = true
-
-				break
-			}
-		}
-	}
-
-	if !found {
-		return Column{}, 0, errors.New("column terminator not found")
+	pos, err := findColumnTerminator(data, pos, baseType)
+	if err != nil {
+		return Column{}, 0, err
 	}
 
 	col := Column{
@@ -396,4 +356,27 @@ func parseColumnDef(data []byte, pos int, index int) (Column, int, error) {
 	}
 
 	return col, pos, nil
+}
+
+// findColumnTerminator scans forward from pos for the sequence that ends a
+// column definition and returns the position just past it.
+//
+// After the flags (and optional BLOB info) there is variable-length padding
+// (zeros followed by 0xFF bytes), terminated by a 4-byte sequence:
+//
+//	0x7F 0x00 <byte> 0xFF
+//
+// where <byte> is either the baseType echo or 0x00 (varies by version).
+func findColumnTerminator(data []byte, pos int, baseType BaseFieldType) (int, error) {
+	for i := pos; i+3 < len(data); i++ {
+		if data[i] != 0x7F || data[i+1] != 0x00 || data[i+3] != 0xFF {
+			continue
+		}
+
+		if mid := data[i+2]; mid == byte(baseType) || mid == 0x00 {
+			return i + 4, nil
+		}
+	}
+
+	return 0, errors.New("column terminator not found")
 }
