@@ -667,58 +667,24 @@ func TestInflateLimit(t *testing.T) {
 // records the widest expansion actually observed, so a future tightening has a
 // number to argue against.
 func TestInternalFileInflateBoundsFitEveryFixture(t *testing.T) {
-	names := fixtureNames(t)
-
 	var (
 		worstRatio float64
 		worstFile  string
 		checked    int
 	)
 
-	for _, name := range names {
-		db, err := Open(testdataPath(name))
-		if err != nil {
-			continue
+	eachCompressedInternalFile(t, func(p internalFilePage) {
+		checked++
+
+		if _, err := inflateLimit(int(p.compressed), p.decompressed, internalFileInflateBounds); err != nil {
+			t.Errorf("%s page %d: %d -> %d rejected by the internal-file bounds: %v",
+				p.fixture, p.pageNo, p.compressed, p.decompressed, err)
 		}
 
-		for i := range db.PageCount() {
-			page, err := db.ReadPage(i)
-			if err != nil || page.Header == nil {
-				continue
-			}
-
-			switch page.Header.PageType {
-			case PageTypeSchema, PageTypeTableInfo, PageTypeTableList:
-			default:
-				continue
-			}
-
-			data := page.PageData()
-			if len(data) < internalFileHeaderSize || data[9] != 1 {
-				continue
-			}
-
-			compressed := int64(binary.LittleEndian.Uint32(data[1:5]))
-			decompressed := int64(binary.LittleEndian.Uint32(data[5:9]))
-
-			if compressed == 0 {
-				continue
-			}
-
-			checked++
-
-			if _, err := inflateLimit(int(compressed), decompressed, internalFileInflateBounds); err != nil {
-				t.Errorf("%s page %d: %d -> %d rejected by the internal-file bounds: %v",
-					name, i, compressed, decompressed, err)
-			}
-
-			if r := float64(decompressed) / float64(compressed); r > worstRatio {
-				worstRatio, worstFile = r, name
-			}
+		if r := float64(p.decompressed) / float64(p.compressed); r > worstRatio {
+			worstRatio, worstFile = r, p.fixture
 		}
-
-		db.Close()
-	}
+	})
 
 	if checked == 0 {
 		t.Skip("no compressed internal files in the fixtures")

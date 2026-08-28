@@ -28,6 +28,11 @@ Thumbs.db
 testdata/*
 !testdata/fuzz/
 
+# The zlib level-1 golden vectors for internal/zlib1. Every case is either
+# synthetic or taken from a committed fixture, so no customer data is
+# involved; see testdata/README.md.
+!testdata/zlib1/
+
 # Exception: the Employees-* fixtures are ours, not customer data. They were
 # generated with the ComponentAce DB Manager and all hold the same synthetic
 # Employees table (three invented rows), so they carry no customer content and
