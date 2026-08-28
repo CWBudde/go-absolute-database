@@ -3,8 +3,10 @@ package absdb
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"time"
+	"unicode/utf16"
 
 	"golang.org/x/text/encoding/charmap"
 )
@@ -12,23 +14,39 @@ import (
 var (
 	ErrNoData     = errors.New("absdb: no data pages found")
 	ErrNoMoreRows = errors.New("absdb: no more rows")
+	ErrBadLayout  = errors.New("absdb: record layout does not match the data")
 )
 
+// currencyScale is the implied divisor of a Delphi Currency value, which is
+// stored as an int64 with four decimal places.
+const currencyScale = 10000
+
 // Reader iterates over data records in a table.
+//
+// The record layout is derived from the schema, not searched for:
+//
+//	nullFlagBytes  = ceil(numColumns / 8)          // spare high bits are set
+//	fieldDataSize  = sum(fieldStoreSize(col))
+//	recordSize     = nullFlagBytes + fieldDataSize // no trailer, no padding
+//	recordsPerPage = max n with ceil(n/8) + n*recordSize <= payload
+//	bitmapBytes    = ceil(recordsPerPage / 8)
+//
+// A data page therefore starts with a bitmapBytes-long occupancy bitmap (bit
+// set = slot occupied), followed by recordsPerPage fixed-size record slots.
 type Reader struct {
 	db     *File
 	schema *TableSchema
 
-	// Computed layout.
-	nullFlagBytes   int // bytes of null flags per record
-	extraBytes      int // version-dependent per-record metadata bytes
+	// Record layout.
+	nullFlagBytes   int // bytes of null flags in front of every record
 	fieldDataSize   int // total bytes for all field values
-	recordSize      int // nullFlagBytes + extraBytes + fieldDataSize
+	recordSize      int // nullFlagBytes + fieldDataSize
 	fieldOffsets    []int
 	fieldStoreSizes []int
 
 	// Page layout.
-	pageHdrSize int // bytes of page header before first record
+	recordsPerPage int // record slots carried by one page payload
+	bitmapBytes    int // occupancy bitmap in front of the first slot
 
 	// Data pages.
 	dataPages []int // page numbers with type 10
@@ -36,13 +54,13 @@ type Reader struct {
 	// Iteration state.
 	pageIdx   int // current data page index
 	pageData  []byte
-	recordIdx int // current record within page
-	maxRecs   int // max records per page
+	recordIdx int // current record slot within the page
 	started   bool
 	err       error
 }
 
 // OpenTable creates a Reader for the table's data records.
+// A table without data pages yields a valid Reader whose Next reports no rows.
 func (db *File) OpenTable() (*Reader, error) {
 	schema, err := db.Schema()
 	if err != nil {
@@ -63,16 +81,17 @@ func (db *File) OpenTable() (*Reader, error) {
 		}
 	}
 
-	if len(dataPages) == 0 {
-		return nil, ErrNoData
-	}
-
 	r := &Reader{
 		db:        db,
 		schema:    schema,
 		dataPages: dataPages,
 	}
 	r.computeLayout()
+
+	err = r.validateLayout()
+	if err != nil {
+		return nil, err
+	}
 
 	return r, nil
 }
@@ -82,15 +101,15 @@ func (r *Reader) Schema() *TableSchema {
 	return r.schema
 }
 
-// Next advances to the next record. Returns false when no more records.
+// Next advances to the next occupied record slot. Returns false when no more
+// records are available. Record may be called any number of times per Next.
 func (r *Reader) Next() bool {
-	if r.err != nil {
+	if r.err != nil || len(r.dataPages) == 0 || r.recordSize <= 0 {
 		return false
 	}
 
 	if !r.started {
 		r.started = true
-
 		r.pageIdx = 0
 
 		err := r.loadPage()
@@ -98,32 +117,11 @@ func (r *Reader) Next() bool {
 			r.err = err
 			return false
 		}
+	} else {
+		r.recordIdx++
 	}
 
-	for {
-		if r.recordIdx < r.maxRecs {
-			recStart := r.pageHeaderSize() + r.recordIdx*r.recordSize
-			if recStart+r.recordSize <= len(r.pageData) && r.isRecordPresent(r.recordIdx) {
-				return true
-			}
-
-			r.recordIdx++
-
-			continue
-		}
-
-		// Move to next data page.
-		r.pageIdx++
-		if r.pageIdx >= len(r.dataPages) {
-			return false
-		}
-
-		err := r.loadPage()
-		if err != nil {
-			r.err = err
-			return false
-		}
-	}
+	return r.seekOccupied()
 }
 
 // Err returns any error encountered during iteration.
@@ -131,15 +129,21 @@ func (r *Reader) Err() error {
 	return r.err
 }
 
-// Record returns the current record.
+// Record returns the record the Reader is currently positioned on. It has no
+// side effects: calling it twice for the same Next returns the same record.
+// Before the first Next, or after Next reported false, it returns a record
+// whose columns all read as NULL.
 func (r *Reader) Record() Record {
-	recStart := r.pageHeaderSize() + r.recordIdx*r.recordSize
-	fieldStart := recStart + r.nullFlagBytes + r.extraBytes
-	r.recordIdx++ // advance for next call to Next()
+	start, ok := r.recordStart(r.recordIdx)
+	if !ok {
+		return Record{reader: r}
+	}
+
+	fieldStart := start + r.nullFlagBytes
 
 	return Record{
 		reader:    r,
-		nullFlags: r.pageData[recStart : recStart+r.nullFlagBytes],
+		nullFlags: r.pageData[start:fieldStart],
 		fieldData: r.pageData[fieldStart : fieldStart+r.fieldDataSize],
 	}
 }
@@ -153,51 +157,271 @@ type Record struct {
 
 // IsNull returns true if the column at the given index is null.
 func (rec Record) IsNull(col int) bool {
+	if rec.reader == nil || rec.reader.schema == nil {
+		return true
+	}
+
 	if col < 0 || col >= len(rec.reader.schema.Columns) {
 		return true
 	}
 
 	byteIdx := col / 8
-	bitIdx := uint(col % 8)
-
 	if byteIdx >= len(rec.nullFlags) {
 		return true
 	}
+
 	// Bit = 1 means null.
-	return rec.nullFlags[byteIdx]&(1<<bitIdx) != 0
+	return rec.nullFlags[byteIdx]&(1<<uint(col%8)) != 0
 }
 
-// Int returns the int32 value of the column.
+// Int returns the value of an integer column widened to int32. Narrower
+// columns (Int8, Uint8, Int16, Uint16) are widened keeping their own sign.
+// Columns that do not store a plain integer return 0.
 func (rec Record) Int(col int) int32 {
-	off := rec.reader.fieldOffsets[col]
-	return int32(binary.LittleEndian.Uint32(rec.fieldData[off : off+4]))
+	v, _ := rec.intValue(col)
+
+	return int32(v)
 }
 
-// Int64 returns the int64 value of the column.
+// Int16 returns the value of a SmallInt column. Columns that do not store a
+// plain integer return 0.
+func (rec Record) Int16(col int) int16 {
+	v, _ := rec.intValue(col)
+
+	return int16(v)
+}
+
+// Int64 returns the value of an integer column widened to int64. For a
+// Currency column this is the raw value, scaled by 10000; use Float for the
+// decimal value.
 func (rec Record) Int64(col int) int64 {
-	off := rec.reader.fieldOffsets[col]
-	return int64(binary.LittleEndian.Uint64(rec.fieldData[off : off+8]))
+	v, _ := rec.intValue(col)
+
+	return v
 }
 
-// Uint32 returns the uint32 value of the column.
+// Uint16 returns the value of a Word column. Columns that do not store a plain
+// integer return 0.
+func (rec Record) Uint16(col int) uint16 {
+	v, _ := rec.intValue(col)
+
+	return uint16(v)
+}
+
+// Uint32 returns the value of an unsigned integer column. Narrower columns are
+// zero-extended. Columns that do not store a plain integer return 0.
 func (rec Record) Uint32(col int) uint32 {
-	off := rec.reader.fieldOffsets[col]
-	return binary.LittleEndian.Uint32(rec.fieldData[off : off+4])
+	v, _ := rec.intValue(col)
+
+	return uint32(v)
 }
 
-// Float returns the float64 value of the column.
+// Float returns the floating-point value of the column: Single is read as a
+// 4-byte IEEE-754 value, Double as an 8-byte one and Currency as its scaled
+// int64. Extended (80-bit) and all other columns return 0.
 func (rec Record) Float(col int) float64 {
-	off := rec.reader.fieldOffsets[col]
-	return math.Float64frombits(binary.LittleEndian.Uint64(rec.fieldData[off : off+8]))
+	c, ok := rec.column(col)
+	if !ok {
+		return 0
+	}
+
+	switch c.BaseType {
+	case BftSingle:
+		if raw := rec.fieldPrefix(col, 4); raw != nil {
+			return float64(math.Float32frombits(binary.LittleEndian.Uint32(raw)))
+		}
+	case BftDouble:
+		if raw := rec.fieldPrefix(col, 8); raw != nil {
+			return math.Float64frombits(binary.LittleEndian.Uint64(raw))
+		}
+	case BftCurrency:
+		v, _ := rec.intValue(col)
+
+		return float64(v) / currencyScale
+	}
+
+	return 0
 }
 
-// String returns the string value of the column, decoded from Windows-1252.
+// String returns the string value of the column. Char and Varchar columns are
+// decoded from Windows-1252, WideChar and WideVarchar from UTF-16LE; both stop
+// at the first null terminator. Other columns return the empty string — BLOB
+// and CLOB columns hold only a reference, use Memo to read their text.
 func (rec Record) String(col int) string {
-	off := rec.reader.fieldOffsets[col]
-	sz := rec.reader.fieldStoreSizes[col]
-	raw := rec.fieldData[off : off+sz]
+	c, ok := rec.column(col)
+	if !ok {
+		return ""
+	}
 
-	// Find null terminator.
+	raw := rec.field(col)
+	if len(raw) == 0 {
+		return ""
+	}
+
+	switch c.BaseType {
+	case BftChar, BftVarchar:
+		return decodeANSI(raw)
+	case BftWideChar, BftWideVarchar:
+		return decodeUTF16(raw)
+	default:
+		return ""
+	}
+}
+
+// Bool returns the boolean value of the column. WordBool is 2 bytes, non-zero
+// meaning true.
+func (rec Record) Bool(col int) bool {
+	raw := rec.fieldPrefix(col, 2)
+	if raw == nil {
+		return false
+	}
+
+	return binary.LittleEndian.Uint16(raw) != 0
+}
+
+// Time returns the time.Time value of a Date, Time, or DateTime column.
+// Any other column, and any truncated field, yields the zero time.
+func (rec Record) Time(col int) time.Time {
+	c, ok := rec.column(col)
+	if !ok {
+		return time.Time{}
+	}
+
+	switch c.BaseType {
+	case BftDate:
+		// Date stored as int32 (days since epoch).
+		if raw := rec.fieldPrefix(col, 4); raw != nil {
+			return delphiDateToTime(int32(binary.LittleEndian.Uint32(raw)))
+		}
+	case BftTime:
+		// Time stored as int32 (milliseconds since midnight).
+		if raw := rec.fieldPrefix(col, 4); raw != nil {
+			return delphiTimeToTime(int32(binary.LittleEndian.Uint32(raw)))
+		}
+	case BftDateTime:
+		// DateTime stored as Date(int32) + Time(int32).
+		if raw := rec.fieldPrefix(col, 8); raw != nil {
+			days := int32(binary.LittleEndian.Uint32(raw[0:4]))
+			ms := int32(binary.LittleEndian.Uint32(raw[4:8]))
+
+			return delphiDateToTime(days).Add(time.Duration(ms) * time.Millisecond)
+		}
+	}
+
+	return time.Time{}
+}
+
+// Bytes returns a copy of the raw stored bytes for the column, or nil if the
+// column index is out of range or its field is truncated.
+func (rec Record) Bytes(col int) []byte {
+	raw := rec.field(col)
+	if raw == nil {
+		return nil
+	}
+
+	result := make([]byte, len(raw))
+	copy(result, raw)
+
+	return result
+}
+
+// --- record field access ---
+
+// column returns the schema column at col, or false if col is out of range.
+func (rec Record) column(col int) (Column, bool) {
+	r := rec.reader
+	if r == nil || r.schema == nil || col < 0 || col >= len(r.schema.Columns) {
+		return Column{}, false
+	}
+
+	return r.schema.Columns[col], true
+}
+
+// field returns the stored bytes of the column, or nil if the column index is
+// out of range or the field does not fit in the record's field data.
+func (rec Record) field(col int) []byte {
+	r := rec.reader
+	if r == nil || col < 0 || col >= len(r.fieldOffsets) {
+		return nil
+	}
+
+	off := r.fieldOffsets[col]
+
+	size := r.fieldStoreSizes[col]
+	if off < 0 || size <= 0 || off+size > len(rec.fieldData) {
+		return nil
+	}
+
+	return rec.fieldData[off : off+size]
+}
+
+// fieldPrefix returns the first width bytes of the column's stored bytes, or
+// nil if the column is out of range, truncated, or narrower than width.
+func (rec Record) fieldPrefix(col, width int) []byte {
+	raw := rec.field(col)
+	if len(raw) < width {
+		return nil
+	}
+
+	return raw[:width]
+}
+
+// intValue decodes an integer column into an int64, sign-extending signed
+// columns. ok is false for columns that do not store a plain integer.
+func (rec Record) intValue(col int) (int64, bool) {
+	c, ok := rec.column(col)
+	if !ok {
+		return 0, false
+	}
+
+	width, signed, ok := integerStorage(c)
+	if !ok {
+		return 0, false
+	}
+
+	raw := rec.fieldPrefix(col, width)
+	if raw == nil {
+		return 0, false
+	}
+
+	var v uint64
+	for i := width - 1; i >= 0; i-- {
+		v = v<<8 | uint64(raw[i])
+	}
+
+	bits := uint(width) * 8
+	if signed && width < 8 && v&(1<<(bits-1)) != 0 {
+		v |= ^uint64(0) << bits
+	}
+
+	return int64(v), true
+}
+
+// integerStorage reports the stored width in bytes and the signedness of an
+// integer column. ok is false for columns that do not store a plain integer.
+func integerStorage(c Column) (width int, signed, ok bool) {
+	switch c.BaseType {
+	case BftInt8:
+		return 1, true, true
+	case BftUint8:
+		return 1, false, true
+	case BftInt16:
+		return 2, true, true
+	case BftUint16:
+		return 2, false, true
+	case BftInt32:
+		return 4, true, true
+	case BftUint32:
+		return 4, false, true
+	case BftInt64, BftCurrency:
+		return 8, true, true
+	default:
+		return 0, false, false
+	}
+}
+
+// decodeANSI decodes a null-terminated Windows-1252 string.
+func decodeANSI(raw []byte) string {
 	end := 0
 	for end < len(raw) && raw[end] != 0 {
 		end++
@@ -207,7 +431,6 @@ func (rec Record) String(col int) string {
 		return ""
 	}
 
-	// Decode Windows-1252 to UTF-8.
 	decoded, err := charmap.Windows1252.NewDecoder().Bytes(raw[:end])
 	if err != nil {
 		return string(raw[:end]) // fallback
@@ -216,74 +439,75 @@ func (rec Record) String(col int) string {
 	return string(decoded)
 }
 
-// Bool returns the boolean value of the column.
-func (rec Record) Bool(col int) bool {
-	off := rec.reader.fieldOffsets[col]
-	// WordBool: 2 bytes, non-zero = true.
-	return binary.LittleEndian.Uint16(rec.fieldData[off:off+2]) != 0
-}
+// decodeUTF16 decodes a UTF-16LE string terminated by a 0x0000 code unit.
+func decodeUTF16(raw []byte) string {
+	units := make([]uint16, 0, len(raw)/2)
 
-// Time returns the time.Time value of a Date, Time, or DateTime column.
-func (rec Record) Time(col int) time.Time {
-	c := rec.reader.schema.Columns[col]
-	off := rec.reader.fieldOffsets[col]
+	for i := 0; i+1 < len(raw); i += 2 {
+		u := binary.LittleEndian.Uint16(raw[i : i+2])
+		if u == 0 {
+			break
+		}
 
-	switch c.BaseType {
-	case BftDate:
-		// Date stored as int32 (days since epoch).
-		days := int32(binary.LittleEndian.Uint32(rec.fieldData[off : off+4]))
-		return delphiDateToTime(days)
-	case BftTime:
-		// Time stored as int32 (milliseconds since midnight).
-		ms := int32(binary.LittleEndian.Uint32(rec.fieldData[off : off+4]))
-		return delphiTimeToTime(ms)
-	case BftDateTime:
-		// DateTime stored as Date(int32) + Time(int32).
-		days := int32(binary.LittleEndian.Uint32(rec.fieldData[off : off+4]))
-		ms := int32(binary.LittleEndian.Uint32(rec.fieldData[off+4 : off+8]))
-		t := delphiDateToTime(days)
-
-		return t.Add(time.Duration(ms) * time.Millisecond)
-	default:
-		return time.Time{}
+		units = append(units, u)
 	}
+
+	if len(units) == 0 {
+		return ""
+	}
+
+	return string(utf16.Decode(units))
 }
 
-// Bytes returns the raw bytes for the column.
-func (rec Record) Bytes(col int) []byte {
-	off := rec.reader.fieldOffsets[col]
-	sz := rec.reader.fieldStoreSizes[col]
-	result := make([]byte, sz)
-	copy(result, rec.fieldData[off:off+sz])
+// --- layout derivation ---
 
-	return result
-}
-
-// --- internal helpers ---
-
+// computeLayout derives the record and page layout from the schema alone.
 func (r *Reader) computeLayout() {
+	r.computeRecordLayout()
+	r.recordsPerPage = recordsPerPage(r.db.payloadSize(), r.recordSize)
+	r.bitmapBytes = (r.recordsPerPage + 7) / 8
+}
+
+// computeRecordLayout derives the field offsets, the null-flag prefix and the
+// record size. It does not depend on the page size.
+func (r *Reader) computeRecordLayout() {
 	cols := r.schema.Columns
 
-	// Compute field storage sizes and offsets.
 	r.fieldOffsets = make([]int, len(cols))
 	r.fieldStoreSizes = make([]int, len(cols))
+
 	offset := 0
 
 	for i, c := range cols {
-		sz := r.fieldStoreSize(c)
+		size := fieldStoreSize(c)
 		r.fieldOffsets[i] = offset
-		r.fieldStoreSizes[i] = sz
-		offset += sz
+		r.fieldStoreSizes[i] = size
+		offset += size
 	}
 
 	r.fieldDataSize = offset
-
-	// Detect the actual record size and null flag bytes by scanning the first data page.
-	// The record size is determined by the spacing between consecutive records.
-	r.detectRecordLayout()
+	r.nullFlagBytes = (len(cols) + 7) / 8
+	r.recordSize = r.nullFlagBytes + r.fieldDataSize
 }
 
-func (r *Reader) fieldStoreSize(c Column) int {
+// recordsPerPage returns the largest n for which an n-bit occupancy bitmap plus
+// n records of recordSize bytes still fit into payloadLen bytes.
+func recordsPerPage(payloadLen, recordSize int) int {
+	if recordSize <= 0 || payloadLen <= 0 {
+		return 0
+	}
+
+	n := payloadLen / recordSize
+	for n > 0 && (n+7)/8+n*recordSize > payloadLen {
+		n--
+	}
+
+	return n
+}
+
+// fieldStoreSize returns the number of bytes a column occupies in the fixed
+// part of a record.
+func fieldStoreSize(c Column) int {
 	switch c.BaseType {
 	case BftInt8, BftUint8:
 		return 1
@@ -322,77 +546,47 @@ func (r *Reader) fieldStoreSize(c Column) int {
 	}
 }
 
-func (r *Reader) pageHeaderSize() int {
-	return r.pageHdrSize
+// validateLayout sanity-checks the derived layout against the first row. The
+// engine sets every null-flag bit beyond the last column, so the spare high
+// bits of the last null-flag byte must all be 1. This is a check, never a
+// search: a mismatch means the layout does not describe this file.
+func (r *Reader) validateLayout() error {
+	spare := r.nullFlagBytes*8 - len(r.schema.Columns)
+	if spare == 0 || len(r.dataPages) == 0 {
+		return nil
+	}
+
+	found := r.Next()
+	rec := r.Record()
+
+	page, slot, err := -1, r.recordIdx, r.err
+	if found {
+		page = r.dataPages[r.pageIdx]
+	}
+
+	// Validating must not consume the first row.
+	r.started, r.pageIdx, r.recordIdx, r.pageData, r.err = false, 0, 0, nil, nil
+
+	if !found || len(rec.nullFlags) < r.nullFlagBytes {
+		return err
+	}
+
+	got := rec.nullFlags[r.nullFlagBytes-1]
+
+	want := byte(0xff) << uint(8-spare)
+	if got&want != want {
+		return fmt.Errorf("%w: page %d slot %d: last null-flag byte %#02x is missing spare bits %#02x "+
+			"(%d columns, %d null-flag bytes, %d-byte records)",
+			ErrBadLayout, page, slot, got, want,
+			len(r.schema.Columns), r.nullFlagBytes, r.recordSize)
+	}
+
+	return nil
 }
 
-// detectRecordLayout scans the first data page to determine the record stride,
-// null flag byte count, and extra per-record metadata bytes.
-//
-// Strategy: the first column is typically AutoInc or RecNo starting at 1.
-// We scan for 01 00 00 00 in the page data, then validate by checking the
-// second record at the computed stride also has a small positive value.
-// The page header size varies because it contains a record occupancy bitmap
-// whose size depends on max records per page.
-func (r *Reader) detectRecordLayout() {
-	if len(r.dataPages) == 0 {
-		return
-	}
-
-	page, err := r.db.ReadPage(r.dataPages[0])
-	if err != nil {
-		return
-	}
-
-	d := page.PageData()
-	if len(d) < 20 {
-		return
-	}
-
-	expectedNullBytes := (len(r.schema.Columns) + 2 + 7) / 8
-	bestScore := math.MinInt
-	bestPageHdr := 0
-	bestExtra := 0
-
-	for pageHdr := 1; pageHdr <= 64 && pageHdr < len(d); pageHdr++ {
-		if r.countPresentSlots(d, pageHdr) == 0 {
-			continue
-		}
-
-		for extra := 0; extra <= 8; extra++ {
-			recSize := expectedNullBytes + extra + r.fieldDataSize
-			if recSize <= 0 || pageHdr+recSize > len(d) {
-				continue
-			}
-
-			score := r.scoreLayoutCandidate(d, pageHdr, expectedNullBytes, extra, recSize)
-			if score > bestScore {
-				bestScore = score
-				bestPageHdr = pageHdr
-				bestExtra = extra
-			}
-		}
-	}
-
-	if bestPageHdr != 0 {
-		r.nullFlagBytes = expectedNullBytes
-		r.extraBytes = bestExtra
-		r.recordSize = r.nullFlagBytes + r.extraBytes + r.fieldDataSize
-		r.pageHdrSize = bestPageHdr
-		return
-	}
-
-	r.nullFlagBytes = expectedNullBytes
-	r.extraBytes = 0
-	r.recordSize = r.nullFlagBytes + r.extraBytes + r.fieldDataSize
-	r.pageHdrSize = 1
-}
+// --- iteration helpers ---
 
 func (r *Reader) loadPage() error {
-	if r.pageIdx >= len(r.dataPages) {
-		return ErrNoMoreRows
-	}
-
 	page, err := r.db.ReadPage(r.dataPages[r.pageIdx])
 	if err != nil {
 		return err
@@ -401,179 +595,60 @@ func (r *Reader) loadPage() error {
 	r.pageData = page.PageData()
 	r.recordIdx = 0
 
-	// Calculate max records that fit in the page data area.
-	usable := len(r.pageData) - r.pageHeaderSize()
-	if usable > 0 && r.recordSize > 0 && r.pageHdrSize > 0 {
-		r.maxRecs = r.pageHdrSize * 8
-	} else {
-		r.maxRecs = 0
-	}
-
 	return nil
 }
 
-func (r *Reader) isRecordPresent(slot int) bool {
-	byteIdx := slot / 8
-	if byteIdx < 0 || byteIdx >= r.pageHdrSize || byteIdx >= len(r.pageData) {
+// seekOccupied advances to the next occupied slot, crossing into further data
+// pages as needed.
+func (r *Reader) seekOccupied() bool {
+	for {
+		for ; r.recordIdx < r.recordsPerPage; r.recordIdx++ {
+			if _, ok := r.recordStart(r.recordIdx); ok {
+				return true
+			}
+		}
+
+		r.pageIdx++
+		if r.pageIdx >= len(r.dataPages) {
+			return false
+		}
+
+		err := r.loadPage()
+		if err != nil {
+			r.err = err
+			return false
+		}
+	}
+}
+
+// recordStart returns the payload offset of the given slot, or false if the
+// slot is out of range, unoccupied, or would run past the end of the payload.
+func (r *Reader) recordStart(slot int) (int, bool) {
+	if slot < 0 || slot >= r.recordsPerPage || r.recordSize <= 0 {
+		return 0, false
+	}
+
+	if !bitSet(r.pageData, slot, r.bitmapBytes) {
+		return 0, false
+	}
+
+	start := r.bitmapBytes + slot*r.recordSize
+	if start+r.recordSize > len(r.pageData) {
+		return 0, false
+	}
+
+	return start, true
+}
+
+// bitSet reports whether the given bit of a little-endian bitmap of bitmapBytes
+// bytes at the start of data is set.
+func bitSet(data []byte, bit, bitmapBytes int) bool {
+	byteIdx := bit / 8
+	if bit < 0 || byteIdx >= bitmapBytes || byteIdx >= len(data) {
 		return false
 	}
 
-	bitIdx := uint(slot % 8)
-	return r.pageData[byteIdx]&(1<<bitIdx) != 0
-}
-
-func (r *Reader) countPresentSlots(pageData []byte, pageHdr int) int {
-	if pageHdr <= 0 || pageHdr > len(pageData) {
-		return 0
-	}
-
-	count := 0
-	for slot := 0; slot < pageHdr*8; slot++ {
-		if pageData[slot/8]&(1<<uint(slot%8)) != 0 {
-			count++
-		}
-	}
-
-	return count
-}
-
-func (r *Reader) scoreLayoutCandidate(pageData []byte, pageHdr, nullBytes, extra, recSize int) int {
-	score := 0
-	firstValues := make([]uint32, 0, 4)
-	recordsScored := 0
-
-	for slot := 0; slot < pageHdr*8 && recordsScored < 4; slot++ {
-		if pageData[slot/8]&(1<<uint(slot%8)) == 0 {
-			continue
-		}
-
-		recStart := pageHdr + slot*recSize
-		if recStart+recSize > len(pageData) {
-			return math.MinInt / 2
-		}
-
-		fieldStart := recStart + nullBytes + extra
-		if fieldStart+r.fieldDataSize > len(pageData) {
-			return math.MinInt / 2
-		}
-
-		recScore, firstValue := r.scoreRecordData(pageData[fieldStart : fieldStart+r.fieldDataSize])
-		score += recScore
-		firstValues = append(firstValues, firstValue)
-		recordsScored++
-	}
-
-	if recordsScored == 0 {
-		return math.MinInt / 2
-	}
-
-	score += recordsScored * 8
-	for i := 1; i < len(firstValues); i++ {
-		switch {
-		case firstValues[i] == firstValues[i-1]+1:
-			score += 10
-		case firstValues[i] > firstValues[i-1]:
-			score += 3
-		default:
-			score -= 8
-		}
-	}
-
-	return score
-}
-
-func (r *Reader) scoreRecordData(fieldData []byte) (int, uint32) {
-	score := 0
-	firstValue := uint32(0)
-	haveFirstValue := false
-
-	for i, c := range r.schema.Columns {
-		off := r.fieldOffsets[i]
-		sz := r.fieldStoreSizes[i]
-		raw := fieldData[off : off+sz]
-
-		switch c.BaseType {
-		case BftInt32, BftUint32:
-			v := binary.LittleEndian.Uint32(raw)
-			if !haveFirstValue {
-				firstValue = v
-				haveFirstValue = true
-			}
-			if v <= 1_000_000_000 {
-				score += 3
-			} else {
-				score -= 8
-			}
-		case BftLogical:
-			v := binary.LittleEndian.Uint16(raw)
-			if v == 0 || v == 1 {
-				score += 3
-			} else {
-				score -= 8
-			}
-		case BftVarchar, BftChar:
-			end := 0
-			for end < len(raw) && raw[end] != 0 {
-				end++
-			}
-
-			if end == 0 {
-				score--
-				continue
-			}
-
-			printable := 0
-			for _, b := range raw[:end] {
-				if b >= 32 || b >= 0x80 {
-					printable++
-				}
-			}
-			if printable*100 >= end*85 {
-				score += 6
-			} else {
-				score -= 8
-			}
-		case BftDouble:
-			bits := binary.LittleEndian.Uint64(raw)
-			v := math.Float64frombits(bits)
-			switch {
-			case bits == 0:
-				score += 1
-			case math.IsNaN(v) || math.IsInf(v, 0):
-				score -= 10
-			default:
-				abs := math.Abs(v)
-				if abs < 1e-100 || abs > 1e100 {
-					score -= 3
-				} else {
-					score += 2
-				}
-			}
-		case BftBlob, BftClob, BftWideClob:
-			ref := readBlobRef(raw)
-			switch {
-			case ref.IsNull():
-				score++
-			case int(ref.PageNo) < 0 || int(ref.PageNo) >= r.db.PageCount():
-				score -= 12
-			default:
-				page, err := r.db.ReadPage(int(ref.PageNo))
-				if err != nil || page.Header == nil || page.Header.PageType != PageTypeBlob {
-					score -= 12
-				} else if ref.ItemNo <= 8 {
-					score += 8
-				} else {
-					score += 4
-				}
-			}
-		}
-	}
-
-	if !haveFirstValue {
-		return math.MinInt / 2, 0
-	}
-
-	return score, firstValue
+	return data[byteIdx]&(1<<uint(bit%8)) != 0
 }
 
 // delphiDateToTime converts a Delphi date integer to time.Time.
@@ -581,6 +656,7 @@ func (r *Reader) scoreRecordData(fieldData []byte) (int, uint32) {
 func delphiDateToTime(days int32) time.Time {
 	// Delphi epoch: day 1 = January 1, 0001.
 	epoch := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+
 	return epoch.AddDate(0, 0, int(days)-1)
 }
 
