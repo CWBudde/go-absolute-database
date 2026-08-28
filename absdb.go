@@ -106,23 +106,22 @@ func Open(path string) (*File, error) {
 
 // OpenWithPassword opens an encrypted Absolute Database file.
 // If the file is not encrypted, the password is ignored.
-// Returns ErrWrongPassword if the password doesn't match.
+//
+// It returns ErrWrongPassword when the password does not match and
+// ErrUnsupportedCipher when the file uses a cipher this package cannot decrypt;
+// the two are distinct because a caller can do nothing about the latter.
 func OpenWithPassword(path, password string) (*File, error) {
 	db, err := Open(path)
 	if err != nil {
 		return nil, err
 	}
 
-	if !db.encrypted {
-		return db, nil
-	}
-
-	if !db.VerifyPassword(password) {
+	err = db.Unlock(password)
+	if err != nil {
 		db.Close()
-		return nil, ErrWrongPassword
-	}
 
-	db.decryptionKey = deriveKey(db.cryptoHeader.Algorithm, password)
+		return nil, err
+	}
 
 	return db, nil
 }

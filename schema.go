@@ -318,7 +318,9 @@ func parseColumnDef(data []byte, pos int, index int) (Column, int, error) {
 		return Column{}, 0, errors.New("name extends beyond data")
 	}
 
-	name := string(data[pos : pos+nameLen])
+	// Column names are Windows-1252 like every other string field on disk;
+	// a name such as "Größe" is mojibake if taken as raw bytes.
+	name := decodeANSI(data[pos : pos+nameLen])
 	pos += nameLen
 
 	// Column ID (uint32).
