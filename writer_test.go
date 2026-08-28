@@ -3,9 +3,11 @@ package absdb
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -831,5 +833,288 @@ func TestWriterUpdateWholeRecord(t *testing.T) {
 
 	if !found {
 		t.Error("the updated record is not in the file after Commit")
+	}
+}
+
+// TestWriterOnMultiTableFileTouchesOnlyItsOwnPages checks that a write through
+// one table's handle stays inside that table.
+//
+// There is no engine-produced file to diff against for a multi-table write, so
+// this asserts the next strongest thing that can be checked without one: which
+// pages moved. Updating a row of Beta may touch Beta's data page, Beta's
+// record-page index, Beta's table-info page and the file header, and nothing
+// belonging to Alpha or Gamma. Before the catalog existed the writer had no
+// notion of which table it was writing, and advanced whichever table-info page
+// came first in the file — Alpha's.
+func TestWriterOnMultiTableFileTouchesOnlyItsOwnPages(t *testing.T) {
+	path := writableCopy(t, "MultiTable.abs")
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading the copy: %v", err)
+	}
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	beta, err := db.Table("Beta")
+	if err != nil {
+		t.Fatalf("Table(Beta): %v", err)
+	}
+
+	w, err := beta.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+
+	reader, err := beta.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	if !reader.Next() {
+		t.Fatal("Beta has no rows")
+	}
+
+	id, ok := reader.RecordID()
+	if !ok {
+		t.Fatal("Beta's first row has no record ID")
+	}
+
+	err = w.UpdateColumn(id, 1, 99.5)
+	if err != nil {
+		t.Fatalf("UpdateColumn: %v", err)
+	}
+
+	err = w.Commit()
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("re-reading the file: %v", err)
+	}
+
+	changed := changedPages(t, before, after, db.PageSize())
+	t.Logf("updating one Beta row changed pages %v", changed)
+
+	// Beta's run is pages 11..16; the file header is page 0.
+	allowed := map[int]bool{0: true, 14: true, 15: true, 16: true}
+	for _, p := range changed {
+		if !allowed[p] {
+			t.Errorf("writing Beta changed page %d, which is not Beta's", p)
+		}
+	}
+
+	if !slices.Contains(changed, 16) {
+		t.Error("Beta's data page 16 was not written")
+	}
+
+	// The other two tables must read exactly as they did.
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopening: %v", err)
+	}
+	defer db.Close()
+
+	for _, tc := range []struct {
+		table string
+		rows  [][]any
+	}{
+		{"Alpha", [][]any{{int64(1), "one"}, {int64(2), "two"}}},
+		{"Gamma", [][]any{{int64(10), int64(100)}}},
+		{"Beta", [][]any{{"aa", 99.5, true}, {"bb", 2.5, false}, {"cc", 3.5, true}}},
+	} {
+		tbl, err := db.Table(tc.table)
+		if err != nil {
+			t.Fatalf("Table(%q): %v", tc.table, err)
+		}
+
+		r, err := tbl.Open()
+		if err != nil {
+			t.Fatalf("%s: Open: %v", tc.table, err)
+		}
+
+		checkRows(t, r, tc.rows)
+	}
+}
+
+// changedPages returns the page numbers whose bytes differ between two
+// versions of the same file.
+func changedPages(t *testing.T, before, after []byte, pageSize int) []int {
+	t.Helper()
+
+	if len(before) != len(after) {
+		t.Fatalf("file length changed from %d to %d", len(before), len(after))
+	}
+
+	seen := map[int]bool{}
+
+	var pages []int
+
+	for i := range before {
+		if before[i] == after[i] {
+			continue
+		}
+
+		page := i / pageSize
+		if !seen[page] {
+			seen[page] = true
+
+			pages = append(pages, page)
+		}
+	}
+
+	return pages
+}
+
+// TestTableInfoCountMatchesRows checks the located record count against the
+// rows actually present, for every table of every fixture.
+//
+// It is the evidence that the counters sit at the end of the table info
+// structure rather than at a fixed offset. Read at fixed offsets 46 and 50 —
+// correct only for a four-column table — most of these files appear to keep no
+// record count at all, and the ones that do are exactly the four-column ones.
+func TestTableInfoCountMatchesRows(t *testing.T) {
+	checked := 0
+
+	for _, name := range fixtureNames(t) {
+		t.Run(name, func(t *testing.T) {
+			db := openFixture(t, name)
+			defer db.Close()
+
+			for _, tbl := range fixtureTables(t, db) {
+				infoPage, err := tbl.infoPageNo()
+				if err != nil || infoPage < 0 {
+					t.Fatalf("%s: infoPageNo: %v", tbl.Name(), err)
+				}
+
+				page, err := db.ReadPage(infoPage)
+				if err != nil {
+					t.Fatalf("%s: ReadPage(%d): %v", tbl.Name(), infoPage, err)
+				}
+
+				payload := page.PageData()
+
+				_, countOff, err := tableInfoOffsets(payload)
+				if err != nil {
+					t.Fatalf("%s: tableInfoOffsets: %v", tbl.Name(), err)
+				}
+
+				stored := int(int32(binary.LittleEndian.Uint32(payload[countOff : countOff+4])))
+
+				reader, err := tbl.Open()
+				if err != nil {
+					t.Fatalf("%s: Open: %v", tbl.Name(), err)
+				}
+
+				rows := 0
+				for reader.Next() {
+					rows++
+				}
+
+				if err := reader.Err(); err != nil {
+					t.Fatalf("%s: iterating: %v", tbl.Name(), err)
+				}
+
+				if stored != rows {
+					t.Errorf("%s: table info says %d records, the reader finds %d", tbl.Name(), stored, rows)
+				}
+
+				checked++
+			}
+		})
+	}
+
+	if checked == 0 {
+		t.Skip("no fixtures present (testdata/ is not committed)")
+	}
+}
+
+// TestTableInfoOffsetsFollowColumnCount pins the shape the offsets are derived
+// from: int32 ColumnCount, eight bytes per column, then the two counters.
+func TestTableInfoOffsetsFollowColumnCount(t *testing.T) {
+	for _, cols := range []int{1, 2, 4, 19, 36} {
+		stored := 4 + 8*cols + tableInfoTrailerSize
+
+		payload := make([]byte, internalFileHeaderSize+stored)
+		payload[0] = internalFileHeaderSize
+		binary.LittleEndian.PutUint32(payload[1:5], uint32(stored))
+		binary.LittleEndian.PutUint32(payload[5:9], uint32(stored))
+
+		changeOff, countOff, err := tableInfoOffsets(payload)
+		if err != nil {
+			t.Fatalf("%d columns: %v", cols, err)
+		}
+
+		wantChange := internalFileHeaderSize + 4 + 8*cols
+		if changeOff != wantChange || countOff != wantChange+4 {
+			t.Errorf("%d columns: offsets %d/%d, want %d/%d",
+				cols, changeOff, countOff, wantChange, wantChange+4)
+		}
+	}
+
+	// A four-column table is where the old fixed constants happened to be
+	// right, and every write fixture has four columns. Keeping it explicit
+	// says why the byte-identity tests could not see the bug.
+	payload := make([]byte, internalFileHeaderSize+44)
+	payload[0] = internalFileHeaderSize
+	binary.LittleEndian.PutUint32(payload[1:5], 44)
+
+	changeOff, countOff, err := tableInfoOffsets(payload)
+	if err != nil {
+		t.Fatalf("four columns: %v", err)
+	}
+
+	if changeOff != 46 || countOff != 50 {
+		t.Errorf("four-column offsets are %d/%d, want 46/50", changeOff, countOff)
+	}
+}
+
+// TestTableInfoOffsetsRejectMalformed checks that a corrupt header cannot make
+// the writer index outside the page.
+func TestTableInfoOffsetsRejectMalformed(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{"too short for a header", make([]byte, internalFileHeaderSize-1)},
+		{
+			"no room for the counters",
+			func() []byte {
+				p := make([]byte, 64)
+				p[0] = internalFileHeaderSize
+				binary.LittleEndian.PutUint32(p[1:5], 4)
+
+				return p
+			}(),
+		},
+		{
+			"declared length runs past the payload",
+			func() []byte {
+				p := make([]byte, 64)
+				p[0] = internalFileHeaderSize
+				binary.LittleEndian.PutUint32(p[1:5], 1<<20)
+
+				return p
+			}(),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := tableInfoOffsets(tc.payload)
+			if !errors.Is(err, ErrBookkeepingMismatch) {
+				t.Errorf("error = %v, want ErrBookkeepingMismatch", err)
+			}
+		})
 	}
 }

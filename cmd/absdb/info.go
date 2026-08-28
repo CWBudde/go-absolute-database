@@ -29,7 +29,12 @@ func infoCmd() *cobra.Command {
 				fmt.Printf("Encrypted:  %v\n", db.Encrypted())
 			}
 
-			schema, err := db.Schema()
+			tbl, err := selectTable(db)
+			if err != nil {
+				return err
+			}
+
+			schema, err := tbl.Schema()
 			if err != nil {
 				fmt.Printf("Schema:     (error: %v)\n", err)
 			} else {

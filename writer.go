@@ -83,14 +83,30 @@ const (
 	// not the 6-byte record reference a user index leaf holds.
 	recordPageEntrySize = systemKeySize + 2
 
-	// tableInfoChangeOffset holds a counter the engine advances on every write
-	// to the table, an update included. It is not the record count: an UPDATE
-	// advances it while leaving the count alone.
-	tableInfoChangeOffset = 46
+	// tableInfoTrailerSize is the size of the two counters at the end of a
+	// table info internal file, which is where they live. The structure is
+	//
+	//	int32 ColumnCount, ColumnCount * 8 bytes, int32 Changes, int32 Records
+	//
+	// so their position depends on how many columns the table has. Every
+	// fixture obeys that shape, across format versions 5.13, 7.61 and 7.94.
+	//
+	// The first version of this code used fixed offsets 46 and 50, which are
+	// the right answer for a four-column table and only for a four-column
+	// table. Every write fixture has four columns, so the byte-identity tests
+	// could not see it; MultiTable.abs, whose tables have two and three, is
+	// what exposed it. It also retires a conclusion drawn from the same bug —
+	// that 7.61 files leave their record count at zero. They do not: read at
+	// the right offset, RCON0011 says 300 and RCFQ0011 says 600, matching
+	// their rows exactly.
+	tableInfoTrailerSize = 8
 
-	// tableInfoCountOffset holds the table's record count. An insert raises it,
-	// a delete lowers it, an update leaves it untouched.
-	tableInfoCountOffset = 50
+	// tableInfoChangesFromEnd and tableInfoCountFromEnd are the two counters'
+	// offsets back from the end of the structure. The changes counter advances
+	// on every write to the table, an update included; the record count is
+	// raised by an insert, lowered by a delete and left alone by an update.
+	tableInfoChangesFromEnd = 8
+	tableInfoCountFromEnd   = 4
 
 	// pageStateOffset is the offset of the State counter within a page block:
 	// four bytes behind the ABSP marker.
@@ -203,20 +219,32 @@ type TableWriter struct {
 	closed  bool
 }
 
-// OpenTableWriter opens the table for modification. It fails with ErrReadOnly
-// unless the file was opened with OpenForWrite.
+// OpenTableWriter opens the database's only table for modification. It fails
+// with ErrReadOnly unless the file was opened with OpenForWrite, and reports
+// ErrAmbiguousTable when the file holds more than one table.
 func (db *File) OpenTableWriter() (*TableWriter, error) {
-	if !db.writable {
+	t, err := db.Table("")
+	if err != nil {
+		return nil, err
+	}
+
+	return t.OpenWriter()
+}
+
+// OpenWriter opens this table for modification. It fails with ErrReadOnly
+// unless the file was opened with OpenForWrite.
+func (t *Table) OpenWriter() (*TableWriter, error) {
+	if !t.db.writable {
 		return nil, ErrReadOnly
 	}
 
-	r, err := db.OpenTable()
+	r, err := t.Open()
 	if err != nil {
 		return nil, err
 	}
 
 	return &TableWriter{
-		db:    db,
+		db:    t.db,
 		r:     r,
 		pages: make(map[int]*pageWriteBuf),
 		delta: make(map[int]int),
@@ -577,7 +605,7 @@ func (w *TableWriter) freeSlot() (RecordID, error) {
 // hold. An update leaves that set alone as long as it does not change an
 // indexed column, which is why Update and UpdateColumn do not call this.
 func (w *TableWriter) checkIndexes() error {
-	ir, err := w.db.OpenIndex()
+	ir, err := w.r.table.OpenIndex()
 	if err != nil {
 		if errors.Is(err, ErrNoIndex) {
 			return nil
@@ -670,7 +698,7 @@ func (w *TableWriter) updatePageCounts() (int, error) {
 // count, which only an insert or a delete moves, and the change counter, which
 // advances by the number of records this transaction touched.
 func (w *TableWriter) updateCounters(before int) error {
-	no, err := w.db.findPageByType(PageTypeTableInfo)
+	no, err := w.r.table.infoPageNo()
 	if err != nil || no < 0 {
 		return err
 	}
@@ -680,7 +708,12 @@ func (w *TableWriter) updateCounters(before int) error {
 		return err
 	}
 
-	count := int(int32(binary.LittleEndian.Uint32(buf.payload[tableInfoCountOffset : tableInfoCountOffset+4])))
+	changeOff, countOff, err := tableInfoOffsets(buf.payload)
+	if err != nil {
+		return err
+	}
+
+	count := int(int32(binary.LittleEndian.Uint32(buf.payload[countOff : countOff+4])))
 	if count != before {
 		// This file's engine does not maintain the counter. Leave it as it is
 		// rather than inventing a value for it.
@@ -698,21 +731,49 @@ func (w *TableWriter) updateCounters(before int) error {
 	}
 
 	binary.LittleEndian.PutUint32(
-		buf.payload[tableInfoCountOffset:tableInfoCountOffset+4], uint32(total),
+		buf.payload[countOff:countOff+4], uint32(total),
 	)
 
 	if w.touched < 0 || w.touched > math.MaxInt32 {
 		return fmt.Errorf("%w: %d records touched", ErrBookkeepingMismatch, w.touched)
 	}
 
-	changes := binary.LittleEndian.Uint32(buf.payload[tableInfoChangeOffset : tableInfoChangeOffset+4])
+	changes := binary.LittleEndian.Uint32(buf.payload[changeOff : changeOff+4])
 	binary.LittleEndian.PutUint32(
-		buf.payload[tableInfoChangeOffset:tableInfoChangeOffset+4], changes+uint32(w.touched),
+		buf.payload[changeOff:changeOff+4], changes+uint32(w.touched),
 	)
 
 	buf.dirty = true
 
 	return nil
+}
+
+// tableInfoOffsets locates the two counters inside a table info page's payload.
+//
+// They sit at the end of the internal file rather than at a fixed offset,
+// because the structure in front of them is eight bytes per column, so their
+// position depends on the table's width. The internal file header's own length
+// field is what says where the end is.
+func tableInfoOffsets(payload []byte) (changeOff, countOff int, err error) {
+	if len(payload) < internalFileHeaderSize {
+		return 0, 0, fmt.Errorf("%w: table info page is %d bytes", ErrBookkeepingMismatch, len(payload))
+	}
+
+	hdrSize := int(payload[0])
+	stored := int(binary.LittleEndian.Uint32(payload[1:5]))
+
+	if hdrSize < internalFileHeaderSize || stored < tableInfoTrailerSize {
+		return 0, 0, fmt.Errorf("%w: table info file declares %d bytes behind a %d-byte header",
+			ErrBookkeepingMismatch, stored, hdrSize)
+	}
+
+	end := hdrSize + stored
+	if end > len(payload) {
+		return 0, 0, fmt.Errorf("%w: table info file ends at %d, past the %d-byte payload",
+			ErrBookkeepingMismatch, end, len(payload))
+	}
+
+	return end - tableInfoChangesFromEnd, end - tableInfoCountFromEnd, nil
 }
 
 // recordPageIndex locates the engine's internal index over this table's data
@@ -724,7 +785,7 @@ func (w *TableWriter) updateCounters(before int) error {
 // file can hold a second system index over its BLOB pages, which this must not
 // pick.
 func (w *TableWriter) recordPageIndex() (int, map[int]int, error) {
-	ir, err := w.db.OpenIndex()
+	ir, err := w.r.table.OpenIndex()
 	if err != nil {
 		return 0, nil, err
 	}

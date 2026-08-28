@@ -1,6 +1,7 @@
 package absdb
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,9 +75,10 @@ func seedFromFixtures(f *testing.F) {
 // bugs. The caps keep every input cheap; the paths themselves are still
 // reached, just not repeated pointlessly.
 const (
-	maxFuzzRows  = 64
-	maxFuzzCols  = 48
-	maxFuzzBlobs = 8
+	maxFuzzRows   = 64
+	maxFuzzCols   = 48
+	maxFuzzBlobs  = 8
+	maxFuzzTables = 8
 )
 
 // exerciseFile drives every read path a caller can reach from an open file.
@@ -86,8 +88,42 @@ func exerciseFile(db *File) {
 	_, _ = db.ScanPages()
 	_, _ = db.Schema()
 
+	exerciseCatalog(db)
 	exerciseRecords(db)
 	exerciseIndexes(db)
+}
+
+// exerciseCatalog walks the table catalog and opens each table it names. A
+// crafted catalog can claim any page numbers it likes, so every handle it
+// yields has to survive being used, not merely being built.
+func exerciseCatalog(db *File) {
+	tables, err := db.Tables()
+	if err != nil {
+		return
+	}
+
+	for i, info := range tables {
+		if i >= maxFuzzTables {
+			return
+		}
+
+		tbl, err := db.Table(info.Name)
+		if err != nil {
+			continue
+		}
+
+		_, _ = tbl.Schema()
+		_, _ = tbl.OpenIndex()
+
+		reader, err := tbl.Open()
+		if err != nil {
+			continue
+		}
+
+		for rows := 0; reader.Next() && rows < maxFuzzRows; rows++ {
+			_ = reader.Record()
+		}
+	}
 }
 
 func exerciseRecords(db *File) {
@@ -347,4 +383,29 @@ func seedFromFixtureBlobs(f *testing.F) {
 			return
 		}
 	}
+}
+
+// FuzzParseTableList targets the table catalog decoder directly, without having
+// to get a well-formed page and internal file header past the reader first.
+func FuzzParseTableList(f *testing.F) {
+	f.Add([]byte(nil))
+	f.Add(make([]byte, tableListEntrySize))
+	f.Add(make([]byte, 3*tableListEntrySize))
+
+	entry := make([]byte, tableListEntrySize)
+	entry[0] = 5
+	copy(entry[1:], "Alpha")
+	binary.LittleEndian.PutUint32(entry[tableNameFieldSize:], 1)
+	f.Add(entry)
+
+	f.Fuzz(func(_ *testing.T, data []byte) {
+		tables, err := parseTableList(data)
+		if err != nil {
+			return
+		}
+
+		for _, info := range tables {
+			_ = info.Name
+		}
+	})
 }

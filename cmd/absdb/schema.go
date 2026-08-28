@@ -18,7 +18,12 @@ func schemaCmd() *cobra.Command {
 			}
 			defer db.Close()
 
-			schema, err := db.Schema()
+			tbl, err := selectTable(db)
+			if err != nil {
+				return err
+			}
+
+			schema, err := tbl.Schema()
 			if err != nil {
 				return err
 			}

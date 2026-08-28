@@ -2,8 +2,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	absdb "github.com/cwbudde/go-absolute-database"
 	"github.com/spf13/cobra"
@@ -12,6 +14,11 @@ import (
 // password holds the value of the persistent --password flag. It is shared by
 // every subcommand through openDatabase.
 var password string
+
+// table holds the value of the persistent --table flag. It is shared by every
+// subcommand that reads one table, through selectTable. Empty means the
+// database's only table.
+var table string
 
 func main() {
 	root := &cobra.Command{
@@ -24,8 +31,11 @@ func main() {
 
 	root.PersistentFlags().StringVarP(&password, "password", "p", "",
 		"Password for encrypted databases")
+	root.PersistentFlags().StringVarP(&table, "table", "t", "",
+		"Table to read (default: the only table)")
 
 	root.AddCommand(infoCmd())
+	root.AddCommand(tablesCmd())
 	root.AddCommand(pagesCmd())
 	root.AddCommand(schemaCmd())
 	root.AddCommand(dumpCmd())
@@ -72,4 +82,30 @@ func openDatabase(path string) (*absdb.File, error) {
 	}
 
 	return db, nil
+}
+
+// selectTable resolves the persistent --table flag against the database. When
+// the flag is empty and the file holds more than one table, the error names
+// them, because "there is more than one" on its own leaves the user guessing.
+func selectTable(db *absdb.File) (*absdb.Table, error) {
+	t, err := db.Table(table)
+	if err == nil {
+		return t, nil
+	}
+
+	if !errors.Is(err, absdb.ErrAmbiguousTable) {
+		return nil, err
+	}
+
+	tables, listErr := db.Tables()
+	if listErr != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(tables))
+	for _, info := range tables {
+		names = append(names, info.Name)
+	}
+
+	return nil, fmt.Errorf("%w: pass --table with one of %s", err, strings.Join(names, ", "))
 }

@@ -565,3 +565,92 @@ func makeStringKey(value string, keySize int) ([]byte, error) {
 
 	return key, nil
 }
+
+// OpenIndex creates an IndexReader over the indexes this table owns.
+//
+// Attribution is by evidence, not by ObjectID: an index page's ABSP header
+// records no owner, so the only thing that ties an index to a table is where
+// its entries point. A user index is this table's when its leaf entries name
+// this table's data pages; the engine's internal record-page index is this
+// table's when its keys are those pages.
+//
+// Two cases are therefore not returned for a multi-table database: an index
+// whose leftmost leaf is empty, which offers no evidence either way, and the
+// engine's BLOB page index, whose keys are BLOB pages and whose owner nothing
+// in the file records. Neither arises for a single-table file, where every
+// index in the file is returned because there is no other table it could
+// belong to.
+func (t *Table) OpenIndex() (*IndexReader, error) {
+	ir, err := t.db.OpenIndex()
+	if err != nil {
+		return nil, err
+	}
+
+	if t.sole || t.unlisted {
+		return ir, nil
+	}
+
+	pages, err := t.dataPages()
+	if err != nil {
+		return nil, err
+	}
+
+	own := make(map[int]bool, len(pages))
+	for _, p := range pages {
+		own[p] = true
+	}
+
+	var kept []indexRoot
+
+	for _, root := range ir.indexes {
+		ok, err := ir.rootReferences(root, own)
+		if err != nil {
+			return nil, err
+		}
+
+		if ok {
+			kept = append(kept, root)
+		}
+	}
+
+	return &IndexReader{db: t.db, indexes: kept}, nil
+}
+
+// rootReferences reports whether the leftmost leaf of an index tree points at
+// pages in own. One leaf is enough: every entry of an index belongs to the same
+// table, so the first one settles it without walking the whole tree.
+func (ir *IndexReader) rootReferences(root indexRoot, own map[int]bool) (bool, error) {
+	leafNo, err := ir.findLeftmostLeaf(root.pageNo)
+	if err != nil {
+		return false, err
+	}
+
+	data, hdr, err := ir.indexPage(leafNo)
+	if err != nil {
+		return false, err
+	}
+
+	entries, err := readBTreeEntries(data, hdr)
+	if err != nil {
+		return false, err
+	}
+
+	for _, e := range entries {
+		// A system index keys pages by number and its PageNo is an internal
+		// value; a user index does the reverse. Either field landing on one of
+		// this table's data pages identifies the owner.
+		if root.keySize == systemKeySize {
+			if len(e.Key) >= 4 && own[int(int32(binary.LittleEndian.Uint32(e.Key[:4])))] {
+				return true, nil
+			}
+
+			continue
+		}
+
+		if own[int(e.PageNo)] {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}

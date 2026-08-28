@@ -168,20 +168,25 @@ var (
 	ErrCompression = errors.New("absdb: decompression failed")
 )
 
-// Schema reads and parses the table schema from the database file.
-// For single-table databases, this returns the schema of the only table.
+// Schema reads and parses the schema of the database's only table. It reports
+// ErrAmbiguousTable when the file holds more than one; use Table to name it.
 func (db *File) Schema() (*TableSchema, error) {
-	// Find the schema page (type 8).
-	schemaPageNo, err := db.findPageByType(PageTypeSchema)
+	t, err := db.Table("")
 	if err != nil {
 		return nil, err
 	}
 
-	if schemaPageNo < 0 {
-		return nil, ErrNoSchema
+	return t.Schema()
+}
+
+// Schema reads and parses this table's column definitions.
+func (t *Table) Schema() (*TableSchema, error) {
+	schemaPageNo, err := t.schemaPageNo()
+	if err != nil {
+		return nil, err
 	}
 
-	page, err := db.ReadPage(schemaPageNo)
+	page, err := t.db.ReadPage(schemaPageNo)
 	if err != nil {
 		return nil, err
 	}
@@ -198,6 +203,26 @@ func (db *File) Schema() (*TableSchema, error) {
 	}
 
 	return parseSchema(decompressed)
+}
+
+// schemaPageNo resolves the page holding this table's column definitions. The
+// catalog names it outright; a file without one falls back to the first schema
+// page, which is what this package did before the catalog was parsed.
+func (t *Table) schemaPageNo() (int, error) {
+	if !t.unlisted {
+		return t.info.SchemaPageNo, nil
+	}
+
+	no, err := t.db.findPageByType(PageTypeSchema)
+	if err != nil {
+		return 0, err
+	}
+
+	if no < 0 {
+		return 0, ErrNoSchema
+	}
+
+	return no, nil
 }
 
 // decompressInternalFile reads the TABSInternalFileHeader and decompresses the payload.

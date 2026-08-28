@@ -56,6 +56,8 @@ testdata/*
 !testdata/Writes-del2.abs
 !testdata/Writes-del.abs
 !testdata/Writes-delins.abs
+!testdata/MultiTable.abs
+!testdata/MultiTable-drop.abs
 !testdata/README.md
 
 legacy/

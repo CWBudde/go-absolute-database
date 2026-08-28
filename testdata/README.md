@@ -3,14 +3,15 @@
 Almost everything in this directory is **deliberately not committed**. The `.abs`
 fixtures the parser is developed against are real customer project data, and
 `.gitignore` excludes `testdata/*` for that reason. A fresh clone therefore has only the
-`Employees-*` and `Writes*` fixtures below, and every test that needs one of the others
-skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
+`Employees-*`, `Writes*` and `MultiTable*` fixtures below, and every test that needs one of
+the others skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
 validated against real customer files — run `just test` locally for that.
 
 ## The committed fixtures
 
-Two sets are committed: the eight `Employees-*.abs` files, one per encryption algorithm,
-and the eleven `Writes*.abs` files that pin the write path.
+Three sets are committed: the eight `Employees-*.abs` files, one per encryption algorithm,
+the eleven `Writes*.abs` files that pin the write path, and the two `MultiTable*.abs` files
+that pin the table catalog.
 
 ### `Employees-*.abs` — one per encryption algorithm
 
@@ -116,6 +117,46 @@ They contain no customer data and no vendor material, checked the same way as th
 `Employees-*` files: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the table
 name and the invented row values.
 
+### `MultiTable*.abs` — the table catalog
+
+Two unencrypted files, the only ones in the corpus holding more than one table. Every other
+fixture, customer files included, has exactly one, which is why the multi-table bug they
+close survived unnoticed for so long.
+
+| File                  | Made from        | Contents                                           |
+| --------------------- | ---------------- | -------------------------------------------------- |
+| `MultiTable.abs`      | created fresh    | `Alpha`, `Beta`, `Gamma` + `CREATE INDEX` on Alpha |
+| `MultiTable-drop.abs` | `MultiTable.abs` | the same, then `DROP TABLE Beta`                   |
+
+The three tables are deliberately different shapes, so that anything reading one through
+another's schema is obvious rather than subtle:
+
+| Table   | Columns                                            | Rows | ID  | Index |
+| ------- | -------------------------------------------------- | ---- | --- | ----- |
+| `Alpha` | `Id` INTEGER, `Name` VARCHAR(20)                   | 2    | 1   | yes   |
+| `Beta`  | `Code` VARCHAR(10), `Amount` FLOAT, `Flag` BOOLEAN | 3    | 4   | no    |
+| `Gamma` | `K` INTEGER, `V` INTEGER                           | 1    | 8   | no    |
+
+Note the IDs: **1, 4, 8**, not 1, 2, 3. Anything that treats a table's ID as its position
+in the catalog reads the wrong pages, and these numbers make that fail loudly.
+
+They earned their place immediately. Before them, `OpenTable()` on `MultiTable.abs`
+returned **six rows for a two-row table** — four of them other tables' bytes decoded
+through Alpha's schema — with no error. They also exposed a bug in the _write_ path that
+the eleven `Writes*` fixtures structurally could not: the table info counters were read at
+fixed offsets that are correct only for a four-column table, and every write fixture has
+four columns. See PLAN.md, Phase 7.
+
+`MultiTable-drop.abs` is the same size as its parent and differs by 45 bytes. It records
+that `DROP TABLE` tombstones the dropped table's pages (`ABSP` `State` = `0x7FFFFFFF`)
+rather than erasing them, and that it compacts the catalog while leaving the last entry
+duplicated at the end — so a parser that ignores the catalog's length field reports the
+surviving table twice.
+
+They contain no customer data and no vendor material, checked the same way as the other
+committed fixtures: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the three
+invented table names and the invented row values, and no UTF-16 strings at all.
+
 ## Regenerating them
 
 They can be recreated on Linux by driving `DBManager.exe` from the SDK under Wine with a
@@ -131,8 +172,10 @@ virtual desktop. Two things make it much easier than it first appears:
 Verify the result by reading the file rather than by screenshot: byte 43 is the
 `Encrypted` flag and byte 78 is the algorithm, which must match the table above.
 
-The `Writes*` files use the same route with the encryption checkbox left off, plus
-`File → Open Database` to reopen the copy before running each single-statement script.
+The `Writes*` and `MultiTable*` files use the same route with the encryption checkbox left
+off, plus `File → Open Database` to reopen the copy before running each single-statement
+script. `DBManager.exe` also accepts the database path as `argv[1]`, which skips that
+dialog entirely.
 Verify those by bytes too: a derived file must actually differ from its parent
 (`cmp -l parent child | wc -l`), because a script that silently failed to run produces a
 file that is byte-identical to its parent and looks like a valid fixture.

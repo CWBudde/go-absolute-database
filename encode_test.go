@@ -78,20 +78,23 @@ func TestEncodeReproducesFixtureRecords(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			db := openFixture(t, name)
 
-			reader, err := db.OpenTable()
-			if err != nil {
-				t.Fatalf("OpenTable: %v", err)
-			}
-
-			records, verbatim, excluded := roundTripTable(t, reader)
-
 			totalFixtures++
-			totalRecords += records
-			verbatimRecords += verbatim
-			excludedColumns += excluded
 
-			t.Logf("%s: %d records, %d byte-identical without canonicalisation, %d BLOB columns copied through",
-				name, records, verbatim, excluded)
+			for _, tbl := range fixtureTables(t, db) {
+				reader, err := tbl.Open()
+				if err != nil {
+					t.Fatalf("%s: Open: %v", tbl.Name(), err)
+				}
+
+				records, verbatim, excluded := roundTripTable(t, reader)
+
+				totalRecords += records
+				verbatimRecords += verbatim
+				excludedColumns += excluded
+
+				t.Logf("%s/%s: %d records, %d byte-identical without canonicalisation, %d BLOB columns copied through",
+					name, tbl.Name(), records, verbatim, excluded)
+			}
 		})
 	}
 

@@ -48,10 +48,19 @@ const (
 // pageCount*pageSize+diskPageHeaderOffset bytes long — the trailing
 // diskPageHeaderOffset bytes complete the last page's payload.
 
+// pageStateFree is the State an ABSP header carries once the engine has
+// released its page. DROP TABLE tombstones the dropped table's whole run of
+// pages this way rather than erasing them: they keep their type, their
+// ObjectID and their contents, and only this field says they are gone.
+// Measured on testdata/MultiTable-drop.abs, where all six of the dropped
+// table's pages carry it and every surviving page carries a plain counter.
+const pageStateFree = math.MaxInt32
+
 // Page type constants from the TABSDiskPageHeader.PageType field.
 const (
 	PageTypeSystemDir = 2  // System directory
 	PageTypeFileHdr   = 3  // File header (page 0)
+	PageTypeTableList = 6  // Table catalog (uncompressed internal file)
 	PageTypeSchema    = 8  // Schema metadata (zlib-compressed column defs)
 	PageTypeTableInfo = 9  // Table info (record counts)
 	PageTypeData      = 10 // Data page (row storage)
@@ -294,6 +303,13 @@ func parseDiskPageHeader(data []byte) *DiskPageHeader {
 		RecPageNo:  int32(binary.LittleEndian.Uint32(data[off+26 : off+30])),
 		RecItemNo:  binary.LittleEndian.Uint16(data[off+30 : off+32]),
 	}
+}
+
+// Freed reports whether the engine has released this page. A freed page keeps
+// its type, its owner and its old contents, so nothing but this distinguishes
+// a dropped table's data page from a live one.
+func (p Page) Freed() bool {
+	return p.Header != nil && p.Header.State == pageStateFree
 }
 
 // ScanPages reads all pages and returns their disk page headers.

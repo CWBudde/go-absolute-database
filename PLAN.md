@@ -71,7 +71,7 @@ Every page carries a 40-byte `TABSDiskPageHeader` at the **fixed offset `0x17C`
 | +30           | 2    | uint16 LE | `RecItemNo`  | `RecordID.ItemNo`                                    |
 | +32           | 8    | byte[8]   | `Reserved`   |                                                      |
 
-`ObjectID` is parsed today but ignored by every consumer — see Phase 5e.
+`ObjectID` is what partitions data pages by table; see Phase 5e.
 
 ### Page payload extent (SOLVED — supersedes two earlier descriptions)
 
@@ -120,7 +120,7 @@ RR240011 28 of 30.
 
 | Value     | Constant            | Role                                                                                                                        |
 | --------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| 2         | `PageTypeSystemDir` | System directory (table catalog lives here — see Phase 5e)                                                                  |
+| 2         | `PageTypeSystemDir` | System directory. A single `int32`; **not** the table catalog, which is type 6                                              |
 | 3         | `PageTypeFileHdr`   | Page 0                                                                                                                      |
 | 8         | `PageTypeSchema`    | Schema metadata (zlib-compressed internal file)                                                                             |
 | 10        | `PageTypeData`      | Data page (occupancy bitmap + fixed-size records)                                                                           |
@@ -508,7 +508,7 @@ Algorithms: None, ZLIB, BZIP, PPM. Compression levels 1–9.
 | 2   | Schema storage location        | **Mostly resolved.** Type-8 page, zlib internal file. But only ~26% of the blob is decoded — ~50% is skipped by a pattern search for `7F 00 <baseType> FF`, and ~24% (index definitions, constraints, table name) is never read.                                                                                                                                                                                                                                                                                      |
 | 3   | Page allocation map            | **Open.** Page types 4/5/6/7/9 are the EAM/PFS/free-space structures and remain unidentified. Not needed for reading.                                                                                                                                                                                                                                                                                                                                                                                                 |
 | 4   | BLOB block layout              | **Resolved for the on-disk form.** Type-11 pages carry three `int64 LE` values at payload offset 0: `ItemCount`, `CompressedSize`, `UncompressedSize` — **24 bytes**, not the 22-byte packed `TABSDiskBLOBHeader` an earlier revision claimed. Verified over all 60 type-11 pages of RPDG0011; read as 22 packed bytes it yields nonsense. `ItemNo` is still ignored, so several BLOBs per page remains unsupported, and every BLOB page in the corpus has `NextPageNo == -1`, so chaining is guarded but unverified. |
-| 5   | Multi-table databases          | **Resolved in principle, unimplemented.** `ABSP.ObjectID` tags every page with its owning table, and `TABSTableListItem { TableName; TableID; MetaDataFilePageNo; ... }` in the type-2 System Directory is the catalog. See Phase 5e.                                                                                                                                                                                                                                                                                 |
+| 5   | Multi-table databases          | **Resolved and implemented (Phase 5e).** `ABSP.ObjectID` tags each data page with its owning table, and the catalog is a 272-byte-per-entry array in the **type-6** internal file — not the type-2 System Directory, which holds a single `int32`. Validated against `MultiTable.abs`.                                                                                                                                                                                                                                |
 | 6   | Record deletion                | **Resolved.** A per-page occupancy bitmap at the head of the data area. No per-record tombstone.                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | 7   | Index page child pointers      | **Resolved and fixed.** Leaf stride `keySize+6`, internal stride `keySize+4`. A second defect was found alongside it: keys are `[null flag] + int32 **little-endian**`, but the search compared them with `bytes.Compare`, which orders 256 before 2 while the page is sorted by value. `FindByPrimaryKey` on RCFQ0011/RMPA0011 went 0/600 → 229/600 (stride alone) → 600/600 (both).                                                                                                                                 |
 | 8   | Record trailer bytes           | **Dissolved — there is no trailer.** Those bytes are the next record's null-flag prefix.                                                                                                                                                                                                                                                                                                                                                                                                                              |
@@ -699,16 +699,17 @@ type Column struct {
 
 type TableSchema struct {
     Columns []Column
-    // Name and Indexes are NOT implemented — Name needs the System Directory
-    // (Phase 5e), Indexes needs the untouched tail of the schema page (Phase 2).
+    // Indexes is NOT implemented — it needs the untouched tail of the schema
+    // page (Phase 2). The table's name is not here: it belongs to the catalog
+    // entry, not the schema page, so it lives on TableInfo (Phase 5e).
 }
 
-// Actual API today (single-table only):
-func (f *File) Schema() (*TableSchema, error)
-
-// Planned for Phase 5e — a BREAKING change to the above:
-func (f *File) Tables() ([]string, error)
-func (f *File) Schema(table string) (*TableSchema, error)
+// Actual API (Phase 5e). The no-argument forms are the single-table
+// convenience and report ErrAmbiguousTable when the file holds more than one.
+func (f *File) Tables() ([]TableInfo, error)
+func (f *File) Table(name string) (*Table, error)  // "" selects the only table
+func (t *Table) Schema() (*TableSchema, error)
+func (f *File) Schema() (*TableSchema, error)      // == f.Table("").Schema()
 ```
 
 ---
@@ -719,8 +720,8 @@ func (f *File) Schema(table string) (*TableSchema, error)
 
 ### Steps
 
-- [~] Locate data pages for a table (page type 10 scan)
-  — collects **every** type-10 page in the file, ignoring `ABSP.ObjectID` (breaks multi-table)
+- [x] Locate data pages for a table (page type 10 scan) — filtered by `ABSP.ObjectID`
+      against the catalog entry's table ID, and freed pages excluded (Phase 5e)
 - [x] Calculate record size from schema — now genuinely calculated. It was a
       576-candidate brute-force search with a plausibility score and a wrong hardcoded
       `nullFlagBytes`; see Phase 5c
@@ -757,8 +758,8 @@ func (f *File) Schema(table string) (*TableSchema, error)
 ```go
 type Reader struct { /* unexported fields */ }
 
-func (f *File) OpenTable() (*Reader, error)   // actual — no table argument
-// func (f *File) OpenTable(name string) (*Reader, error)  // Phase 5e, breaking
+func (t *Table) Open() (*Reader, error)       // the table-scoped form
+func (f *File) OpenTable() (*Reader, error)   // == f.Table("").Open()
 
 func (r *Reader) Schema() *TableSchema
 func (r *Reader) Next() bool
@@ -1011,24 +1012,107 @@ next to each, not just the theory.
 
 ---
 
-## Phase 5e — Multi-table support
+## Phase 5e — Multi-table support — DONE
 
-**Goal:** Support `.abs` files containing more than one table. Everything needed is
-already on disk and partly parsed.
+**Goal:** Support `.abs` files containing more than one table.
 
-Today `Schema()` returns the first type-8 page and `OpenTable()` collects **all**
-type-10 pages regardless of owner, so a second table's rows would be decoded with the
-first table's schema and stride and emitted from the same iterator — silently wrong.
-All 20 fixtures are single-table (`ObjectID == 1` everywhere), so no test would notice.
+The bug this closes was silent, and it is worth stating what it cost, because until
+`MultiTable.abs` existed nothing could show it. `Schema()` returned the first type-8 page
+and `OpenTable()` collected **every** type-10 page in the file regardless of owner, so a
+second table's rows were decoded with the first table's schema and stride and handed back
+from the same iterator. Measured on the three-table fixture: `OpenTable()` returned **six
+rows for a two-row table**, four of them decoded from other tables' bytes (`Id=1643642880`,
+`Name="a"`), with **no error**. All 20 customer fixtures are single-table, so no test would
+ever have noticed.
 
-- [ ] Parse the type-2 System Directory page and its `TABSTableListItem` entries
-      (`TableName`, `TableID`, `MetaDataFilePageNo`)
-- [ ] Implement `Tables() ([]string, error)`
-- [ ] Filter data, index and BLOB pages by `ABSP.ObjectID`
-- [ ] Add `Name` to `TableSchema`
-- [ ] Decide the API: `Schema(table string)` / `OpenTable(name string)` per the
-      original sketch is a **breaking change** to the current no-argument form, so it
-      should land before `../Aconiq` pins a stable version
+### Where the catalog actually is
+
+Not in the type-2 System Directory, as the earlier note here guessed. That page holds a
+single `int32` whose meaning is still unidentified. The catalog is the **type-6** system
+internal file: an array of 272-byte `TABSTableListItem` records with no count of its own,
+whose length comes from the internal file header in front of it.
+
+| Offset | Size | Field                                                                    |
+| ------ | ---- | ------------------------------------------------------------------------ |
+| 0      | 256  | Delphi `ShortString` — one length byte, then 255 bytes of storage        |
+| 256    | 4    | `TableID` — this is what `ABSP.ObjectID` holds on the table's data pages |
+| 260    | 4    | schema page (type 8)                                                     |
+| 264    | 4    | table info page (type 9)                                                 |
+| 268    | 4    | a type-7 system page; role unidentified, so not exported                 |
+
+Verified against all 30 unencrypted fixtures plus the eight encrypted ones: every entry's
+two page numbers land on a page of the type they claim, and every data page's `ObjectID`
+names a table the catalog lists.
+
+### Only data pages record an owner
+
+Schema, table info, index and BLOB pages all carry `ObjectID == 0xFFFFFFFF`. Each table
+gets a fixed six-page run — two type-7, then schema, table info, its internal record-page
+index, then its data page — and the run's position is the only thing tying those five to
+their table, apart from the catalog naming two of them outright.
+
+A **user** index is not in the run at all: `MultiTable.abs`'s single index sits on page 23,
+after all three runs. So it is attributed by evidence instead — an index is a table's when
+its leaf entries point at that table's data pages, which is the same test
+`readRecordPageEntries` already used to tell the record-page index from the BLOB page
+index. Two cases have no evidence and are therefore not returned for a multi-table file: an
+index whose leftmost leaf is empty, and the BLOB page index, whose keys are BLOB pages and
+whose owner nothing in the file records. Neither arises for a single-table file, where
+every index is returned because there is no other table it could belong to.
+
+### DROP TABLE tombstones, it does not erase
+
+`MultiTable-drop.abs` is `MultiTable.abs` with `DROP TABLE Beta`, and differs by **45
+bytes**. The dropped table's six pages keep their type, their `ObjectID` and their
+contents; only their `ABSP` `State` changes, to `0x7FFFFFFF`. `Page.Freed` reports that,
+and a freed page is excluded from a table's data pages — otherwise a table created later
+that reused the dropped ID would inherit its rows.
+
+The catalog is **compacted, not holed**: the entry after the dropped one is copied over it
+and the header's length shrinks by 272, but the copy at the end is left in place. A parser
+that iterated entries without honouring the length field would report the last table twice
+and never notice the dropped one was gone. This package reads the length, which
+`TestDroppedTableIsGoneButItsPagesRemain` pins.
+
+### The API — additive, not breaking
+
+The sketch this plan carried was `Schema(table string)` / `OpenTable(name string)`, a
+breaking change to 93 call sites. What shipped instead is a table handle, which is both
+better Go and non-breaking:
+
+```go
+func (f *File) Tables() ([]TableInfo, error)
+func (f *File) Table(name string) (*Table, error)   // "" selects the only table
+
+func (t *Table) Name() string
+func (t *Table) Info() TableInfo
+func (t *Table) Schema() (*TableSchema, error)
+func (t *Table) Open() (*Reader, error)
+func (t *Table) OpenWriter() (*TableWriter, error)
+func (t *Table) OpenIndex() (*IndexReader, error)
+```
+
+`Schema()`, `OpenTable()` and `OpenTableWriter()` remain, now as `f.Table("")` plus the
+matching call. They keep their meaning for the single-table files that are all this package
+could read before, and report `ErrAmbiguousTable` — naming the tables, in the CLI — instead
+of silently mixing them. `OpenIndex()` on the file stays file-wide and says so; the scoped
+form is on the handle.
+
+A file with **no** catalog at all still reads exactly as it did: `Table("")` falls back to
+the first schema page and every data page. Synthetic fixtures and fuzzer output take that
+path, and it is why the whole existing suite passed the refactor unchanged.
+
+- [x] Parse the table catalog (type-6 internal file, 272-byte entries)
+- [x] Implement `Tables() ([]TableInfo, error)` and `Table(name) (*Table, error)`
+- [x] Filter data pages by `ABSP.ObjectID`, and index pages by leaf-entry evidence
+- [x] Expose the table's name — on `TableInfo`, where it belongs, not on `TableSchema`
+- [x] Decide the API: a handle, additive, no breaking change and no version bump needed
+- [x] `absdb tables` lists the catalog; `--table` scopes `schema`, `dump`, `info`, `blob`
+- [x] Fixtures: `MultiTable.abs` (three tables, one index) and `MultiTable-drop.abs`
+- [x] Fix the table info counter offsets, which multi-table exposed — see Phase 7
+- [ ] BLOB page attribution in a multi-table file: BLOB pages carry no owner and are
+      reached only through a record's `BlobRef`, so nothing needs it yet. No fixture has
+      a BLOB in a multi-table database.
 
 ---
 
@@ -1229,16 +1313,16 @@ is accounted for:
 | Record bytes          | data page, slot `bitmapBytes + slot*recordSize` | written       | changed field only | left in place |
 | Occupancy bit         | data page, bitmap bit `slot`                    | set           | —                  | cleared       |
 | Per-page record count | record-page index entry for that page           | +1            | —                  | −1            |
-| Table record count    | table info page, payload offset **50**          | +1            | —                  | −1            |
-| Table change counter  | table info page, payload offset **46**          | +1 per record | **+1 per record**  | +1 per record |
+| Table record count    | table info file, last `int32`                   | +1            | —                  | −1            |
+| Table change counter  | table info file, second-to-last `int32`         | +1 per record | **+1 per record**  | +1 per record |
 | Page `State`          | `ABSP` header + 4, on every page written        | +1 per write  | +1 per write       | +1 per write  |
 | Database `State`      | file header offset 38                           | +1 per commit | +1 per commit      | +1 per commit |
 
 Two of those rows were only separable because an UPDATE was diffed alongside the inserts:
-offsets 46 and 50 hold the same value in a freshly created database, so an INSERT moves
-both and looks like one field observed twice. `UPDATE Writes SET Salary = 1.5 WHERE Id = 2`
-advances 46 and leaves 50 alone, which is what identifies 46 as a change counter and 50 as
-the record count. A `DELETE` then confirms it from the other side: 46 up, 50 down.
+the two counters hold the same value in a freshly created database, so an INSERT moves both
+and looks like one field observed twice. `UPDATE Writes SET Salary = 1.5 WHERE Id = 2`
+advances the change counter and leaves the record count alone, which is what tells them
+apart. A `DELETE` then confirms it from the other side: changes up, count down.
 
 Two further files settle what the change counter counts. Every single-row file moves it by
 one, which is equally consistent with counting transactions and with counting records —
@@ -1265,15 +1349,40 @@ with a count of 12 each, matching its 300 rows over 25 data pages exactly; read 
 right stride and identifies it by its keys being the table's data pages, so that a second
 system index over BLOB pages is not mistaken for it.
 
-### Counters are only advanced when the file already keeps them
+### Where the two counters actually live — corrected in Phase 5e
 
-The record count at offset 50 is maintained in the 7.94 files and left at **zero in every
-7.61 customer fixture**, including `RCON0011.abs` with 300 rows. A writer that updated it
-unconditionally would invent a count for files whose engine never kept one, so
-`updateCounters` compares the stored value against what the record-page index reports and
-leaves it alone when the two disagree. The per-page counts, which the 7.61 files _do_
-maintain, are checked the same way and refused with `ErrBookkeepingMismatch` rather than
-overwritten when they do not match.
+They are at the **end** of the table info internal file, not at a fixed offset. The
+structure is
+
+```
+int32 ColumnCount, ColumnCount * 8 bytes, int32 Changes, int32 Records
+```
+
+so their position moves with the table's width. Every fixture obeys that shape, across
+5.13, 7.61 and 7.94.
+
+The first version of this writer used payload offsets 46 and 50, which are
+`internalFileHeaderSize + 4 + 8*4` and four bytes past it — the right answer for a
+**four-column** table and only for a four-column table. Every `Writes*` fixture has four
+columns and so does `Employees`, so the byte-identity tests could not see it.
+`MultiTable.abs`, whose three tables have two, three and two columns, is what exposed it:
+an UPDATE through this package left the table info page untouched, because the fixed offset
+read a zero, compared it against three and took the "this file does not keep counters"
+escape hatch.
+
+That escape hatch was itself the artefact. The earlier conclusion recorded here — that the
+record count is "maintained in the 7.94 files and left at zero in every 7.61 customer
+fixture, including `RCON0011.abs` with 300 rows" — was wrong, and wrong for exactly this
+reason: `RCON0011` has 36 columns, so offset 50 landed in the per-column array, which is
+zeroed. Read at the right offset **every fixture keeps both counters and every record count
+matches the rows actually present** — `RCON0011` says 300, `RCFQ0011` says 600, `TS03` says 18. `TestTableInfoCountMatchesRows` asserts that for every table of every fixture, which is
+what makes the layout claim testable rather than plausible.
+
+The `count != before` check is kept even so, now as a genuine bookkeeping guard rather than
+a version quirk: if the stored count disagrees with what the record-page index reports, the
+file is already inconsistent and a write cannot bring it forward without guessing. The
+per-page counts are checked the same way and refused with `ErrBookkeepingMismatch` rather
+than overwritten.
 
 ### Steps
 
@@ -1500,9 +1609,10 @@ an independent decoder for every fixture.
 2. **Bound `inflateLimited` by the file size** before inflating, not only after. A 4 KiB
    page currently costs 9 MiB and 8.7 ms before the limit rejects it, which is why
    `FuzzOpen` manages only a few hundred executions per minute.
-3. **Phase 5e — multi-table**, if any real file needs it. It forces a breaking API
-   change (`Schema()` / `OpenTable()` gain a table argument), so it should land before a
-   stable version is tagged. No fixture exercises it — all 20 are `ObjectID == 1`.
+3. ~~**Phase 5e — multi-table.**~~ Done. It did **not** force a breaking API change in
+   the end: the table argument went onto a `*Table` handle instead, so the no-argument
+   forms keep working and now report `ErrAmbiguousTable` rather than mixing tables. A
+   fixture exercises it — `MultiTable.abs`, three tables, one index.
 4. **Re-tag `v0.1.0`.** The existing tag shares no ancestry with `main`, yet `../Aconiq`
    requires it with no `replace`. Re-tag from `main` and bump Aconiq.
 
@@ -1518,5 +1628,8 @@ an independent decoder for every fixture.
   it, and would also make the CTS tail discriminate between page-extent models instead
   of being degenerate.
 
-**Deferred.** Phases 7–9 (write support, DDL, `database/sql`) remain out of scope until
-there is a concrete use case for writing `.abs` files.
+> Both of those were written before the `Employees-*` fixtures existed and the second is
+> now closed: eight encrypted fixtures with rows, one per algorithm, are committed.
+
+**Deferred.** Phases 8–9 (DDL, `database/sql`) remain out of scope until there is a
+concrete use case. Phase 7 (record writes) is done; Phase 5e (multi-table) is done.

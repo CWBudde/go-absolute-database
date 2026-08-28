@@ -234,6 +234,33 @@ func reportDiff(t *testing.T, label string, onlyA, onlyB []recordID) {
 	}
 }
 
+// fixtureTables returns a handle for every table in a fixture. Most fixtures
+// hold exactly one, but MultiTable.abs holds three with different schemas, so
+// any sweep that opens "the" table would either fail on it or — before the
+// catalog was parsed — read all three tables' pages through the first one's
+// schema.
+func fixtureTables(t *testing.T, db *File) []*Table {
+	t.Helper()
+
+	infos, err := db.Tables()
+	if err != nil {
+		t.Fatalf("Tables: %v", err)
+	}
+
+	tables := make([]*Table, 0, len(infos))
+
+	for _, info := range infos {
+		tbl, err := db.Table(info.Name)
+		if err != nil {
+			t.Fatalf("Table(%q): %v", info.Name, err)
+		}
+
+		tables = append(tables, tbl)
+	}
+
+	return tables
+}
+
 // TestOracleReaderMatchesLeafScan is the cross-check. For every fixture the
 // set of rows the record reader produces must equal the set every user index's
 // leaf chain reports — both in count and in the (PageNo, ItemNo) of each row.
@@ -246,50 +273,67 @@ func TestOracleReaderMatchesLeafScan(t *testing.T) {
 
 			db := openFixture(t, name)
 
-			reader, err := db.OpenTable()
-			if err != nil {
-				t.Fatalf("OpenTable: %v", err)
+			crossChecked := 0
+
+			for _, tbl := range fixtureTables(t, db) {
+				crossChecked += crossCheckTable(t, tbl)
 			}
 
-			readerIDs, err := readerRecordIDs(reader)
-			if err != nil {
-				t.Fatalf("iterating records: %v", err)
-			}
-
-			ir, err := db.OpenIndex()
-			if err != nil {
-				t.Fatalf("OpenIndex: %v", err)
-			}
-
-			userIndexes := ir.UserIndexes()
-			if len(userIndexes) == 0 {
-				t.Fatalf("no user indexes found; cannot cross-check %d reader rows", len(readerIDs))
-			}
-
-			sortedReader := sortIDs(readerIDs)
-
-			for _, idx := range userIndexes {
-				label := fmt.Sprintf("index root %d (keySize %d)", idx.RootPageNo, idx.KeySize)
-
-				leafIDs, err := leafRecordIDs(ir, idx.RootPageNo)
-				if err != nil {
-					t.Errorf("%s: ScanIndex: %v", label, err)
-
-					continue
-				}
-
-				t.Logf("%s: reader %d rows, leaf scan %d entries", label, len(readerIDs), len(leafIDs))
-
-				if len(leafIDs) != len(readerIDs) {
-					t.Errorf("%s: leaf scan reports %d rows, record reader %d",
-						label, len(leafIDs), len(readerIDs))
-				}
-
-				onlyReader, onlyLeaf := diffIDs(sortedReader, sortIDs(leafIDs))
-				reportDiff(t, label, onlyReader, onlyLeaf)
+			// The guard stays at file level: a fixture that lost its index
+			// still fails, even though an individual table of a multi-table
+			// file is allowed to have none.
+			if crossChecked == 0 {
+				t.Fatal("no user indexes found; nothing cross-checked")
 			}
 		})
 	}
+}
+
+// crossCheckTable compares one table's rows against each of its user indexes,
+// and returns the number of indexes it checked.
+func crossCheckTable(t *testing.T, tbl *Table) int {
+	t.Helper()
+
+	reader, err := tbl.Open()
+	if err != nil {
+		t.Fatalf("%s: Open: %v", tbl.Name(), err)
+	}
+
+	readerIDs, err := readerRecordIDs(reader)
+	if err != nil {
+		t.Fatalf("%s: iterating records: %v", tbl.Name(), err)
+	}
+
+	ir, err := tbl.OpenIndex()
+	if err != nil {
+		t.Fatalf("%s: OpenIndex: %v", tbl.Name(), err)
+	}
+
+	userIndexes := ir.UserIndexes()
+	sortedReader := sortIDs(readerIDs)
+
+	for _, idx := range userIndexes {
+		label := fmt.Sprintf("%s: index root %d (keySize %d)", tbl.Name(), idx.RootPageNo, idx.KeySize)
+
+		leafIDs, err := leafRecordIDs(ir, idx.RootPageNo)
+		if err != nil {
+			t.Errorf("%s: ScanIndex: %v", label, err)
+
+			continue
+		}
+
+		t.Logf("%s: reader %d rows, leaf scan %d entries", label, len(readerIDs), len(leafIDs))
+
+		if len(leafIDs) != len(readerIDs) {
+			t.Errorf("%s: leaf scan reports %d rows, record reader %d",
+				label, len(leafIDs), len(readerIDs))
+		}
+
+		onlyReader, onlyLeaf := diffIDs(sortedReader, sortIDs(leafIDs))
+		reportDiff(t, label, onlyReader, onlyLeaf)
+	}
+
+	return len(userIndexes)
 }
 
 // TestOracleUserIndexesAgree checks the user indexes of a fixture against each

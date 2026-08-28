@@ -45,7 +45,12 @@ func extractBlob(path string, row, col int, output string) error {
 	}
 	defer db.Close()
 
-	reader, err := db.OpenTable()
+	tbl, err := selectTable(db)
+	if err != nil {
+		return err
+	}
+
+	reader, err := tbl.Open()
 	if err != nil {
 		return err
 	}

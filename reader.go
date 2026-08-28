@@ -35,6 +35,7 @@ const currencyScale = 10000
 // set = slot occupied), followed by recordsPerPage fixed-size record slots.
 type Reader struct {
 	db     *File
+	table  *Table
 	schema *TableSchema
 
 	// Record layout.
@@ -59,30 +60,33 @@ type Reader struct {
 	err       error
 }
 
-// OpenTable creates a Reader for the table's data records.
-// A table without data pages yields a valid Reader whose Next reports no rows.
+// OpenTable creates a Reader over the database's only table. It reports
+// ErrAmbiguousTable when the file holds more than one; use Table to name it.
 func (db *File) OpenTable() (*Reader, error) {
-	schema, err := db.Schema()
+	t, err := db.Table("")
 	if err != nil {
 		return nil, err
 	}
 
-	// Find all data pages (type 10).
-	var dataPages []int
+	return t.Open()
+}
 
-	for i := range db.PageCount() {
-		page, err := db.ReadPage(i)
-		if err != nil {
-			return nil, err
-		}
+// Open creates a Reader for this table's data records. A table without data
+// pages yields a valid Reader whose Next reports no rows.
+func (t *Table) Open() (*Reader, error) {
+	schema, err := t.Schema()
+	if err != nil {
+		return nil, err
+	}
 
-		if page.Header != nil && page.Header.PageType == PageTypeData {
-			dataPages = append(dataPages, i)
-		}
+	dataPages, err := t.dataPages()
+	if err != nil {
+		return nil, err
 	}
 
 	r := &Reader{
-		db:        db,
+		db:        t.db,
+		table:     t,
 		schema:    schema,
 		dataPages: dataPages,
 	}
