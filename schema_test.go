@@ -364,3 +364,40 @@ func TestParseSchemaArbitraryInput(t *testing.T) {
 		}
 	}
 }
+
+// TestCompressInternalFileReproducesCorpus is compressInternalFile's half of
+// the round trip TestZlib1ReproducesEveryCorpusStream already proves for the
+// deflate encoder alone: every compressed internal file in the corpus must
+// come back byte for byte, header included, when its own decompressed content
+// is fed back through compressInternalFile.
+func TestCompressInternalFileReproducesCorpus(t *testing.T) {
+	var checked int
+
+	eachCompressedInternalFile(t, func(p internalFilePage) {
+		raw, err := decompressInternalFile(p.data)
+		if err != nil {
+			t.Errorf("%s page %d: decompressing: %v", p.fixture, p.pageNo, err)
+			return
+		}
+
+		got, err := compressInternalFile(raw, 1)
+		if err != nil {
+			t.Errorf("%s page %d: compressInternalFile: %v", p.fixture, p.pageNo, err)
+			return
+		}
+
+		hdrSize := int64(p.data[0])
+		want := p.data[:hdrSize+p.compressed]
+
+		checked++
+
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s page %d: compressInternalFile gave %d bytes, engine wrote %d (first difference at %d)",
+				p.fixture, p.pageNo, len(got), len(want), firstDiffOffset(got, want))
+		}
+	})
+
+	if checked == 0 {
+		t.Skip("no compressed internal files in the fixtures")
+	}
+}

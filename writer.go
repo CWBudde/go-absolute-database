@@ -581,13 +581,66 @@ func (db *File) bufferPage(no int) (*pageWriteBuf, error) {
 	}, nil
 }
 
+// bufferPageFresh is bufferPage without the requirement that the page already
+// carry an ABSP header: allocatePages calls it for a page the Page Free Space
+// map says is free, which -- unless the file has been through a drop and a
+// create that both touched it -- has never held one. initPage is what writes
+// the header afterward; a never-used page's block is all zero, which reads
+// back as unencrypted, exactly the state a fresh page should be in.
+func (db *File) bufferPageFresh(no int) (*pageWriteBuf, error) {
+	page, err := db.ReadPage(no)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pageWriteBuf{
+		number:    no,
+		raw:       page.raw,
+		payload:   page.Payload,
+		encrypted: page.Header != nil && page.Header.CRC32 != 0,
+		stateBump: 1,
+	}, nil
+}
+
 func (w *TableWriter) isDataPage(no int) bool {
 	return slices.Contains(w.r.dataPages, no)
+}
+
+// load makes TableWriter a pageLoader, the same buffered-on-first-use
+// capability pageEdit offers the DDL operations in ddl.go. It is what lets
+// growTable call db.allocatePages directly, sharing the allocator rather than
+// duplicating its Page Free Space and Extent Allocation Map bookkeeping.
+func (w *TableWriter) load(no int) (*pageWriteBuf, error) {
+	return w.loadPage(no)
+}
+
+// loadFresh makes TableWriter satisfy pageLoader's other half: buffering a
+// page allocatePages is about to initialize, which may not carry an ABSP
+// header yet. See bufferPageFresh.
+func (w *TableWriter) loadFresh(no int) (*pageWriteBuf, error) {
+	if buf, ok := w.pages[no]; ok {
+		return buf, nil
+	}
+
+	buf, err := w.db.bufferPageFresh(no)
+	if err != nil {
+		return nil, err
+	}
+
+	w.pages[no] = buf
+	w.order = append(w.order, no)
+
+	return buf, nil
 }
 
 // freeSlot finds the first unoccupied slot, scanning data pages in file order
 // and slots in bitmap order — the same order the engine fills them, which is
 // what lets an insert reproduce the engine's own output byte for byte.
+//
+// A table with no data page at all -- freshly created, before its first
+// insert -- and a table whose existing data pages are all full both reach
+// growTable, which allocates one more page and adds it to the engine's
+// record-page index so the new slot is one a reader will find too.
 func (w *TableWriter) freeSlot() (RecordID, error) {
 	for _, no := range w.r.dataPages {
 		buf, err := w.dataPage(no)
@@ -606,7 +659,113 @@ func (w *TableWriter) freeSlot() (RecordID, error) {
 		}
 	}
 
-	return RecordID{}, ErrTableFull
+	if w.r.recordsPerPage <= 0 {
+		return RecordID{}, fmt.Errorf("%w: no record fits a data page of this table's row width", ErrTableFull)
+	}
+
+	no, err := w.growTable()
+	if err != nil {
+		return RecordID{}, err
+	}
+
+	return RecordID{PageNo: no, Slot: 0}, nil
+}
+
+// growTable allocates a new data page for this table and adds it to the
+// engine's record-page index (systemIndexRoots' first result), the index
+// updatePageCounts reads and writes per-page record counts through. It
+// returns the new page's number.
+//
+// This is the one growth path this package implements: a page is always
+// allocated in full, never split from an existing one, so it needs no
+// rebalancing the way an index insert would. It shares db.allocatePages with
+// ddl.go's schema operations via the pageLoader interface, so the Page Free
+// Space and Extent Allocation Map stay in the same state a schema operation
+// would leave them in.
+func (w *TableWriter) growTable() (int, error) {
+	if !w.db.writable {
+		return 0, ErrReadOnly
+	}
+
+	pages, err := w.db.allocatePages(w, 1, PageTypeData, int32(w.r.table.info.ID)) //nolint:gosec // small object ids
+	if err != nil {
+		return 0, err
+	}
+
+	no := pages[0]
+
+	buf, err := w.loadPage(no)
+	if err != nil {
+		return 0, err
+	}
+
+	// Written to disk immediately, not just buffered: in a multi-table file
+	// Table.OpenIndex filters indexes by rootReferences, which reads data
+	// pages fresh from disk to learn which ones belong to this table, and
+	// appendRecordPageEntry's own eager write only helps once that filter can
+	// already see this page as one of this table's own.
+	if err := w.db.writePageBuf(buf); err != nil {
+		return 0, err
+	}
+
+	if err := w.appendRecordPageEntry(no); err != nil {
+		return 0, err
+	}
+
+	w.r.dataPages = append(w.r.dataPages, no)
+
+	return no, nil
+}
+
+// appendRecordPageEntry adds one entry to the table's record-page index leaf:
+// the new data page's number, with a record count of zero. It is the write
+// counterpart of readRecordPageEntries, adding rather than reading a slot of
+// the same recordPageEntrySize layout.
+func (w *TableWriter) appendRecordPageEntry(pageNo int) error {
+	root, _, err := w.db.systemIndexRoots(w.r.table.info)
+	if err != nil {
+		return err
+	}
+
+	buf, err := w.loadPage(root)
+	if err != nil {
+		return err
+	}
+
+	if len(buf.payload) < btreeHeaderSize {
+		return fmt.Errorf("%w: record-page index root is %d bytes", ErrBookkeepingMismatch, len(buf.payload))
+	}
+
+	count := int(binary.LittleEndian.Uint16(buf.payload[14:16]))
+	off := btreeHeaderSize + count*recordPageEntrySize
+
+	if off+recordPageEntrySize > len(buf.payload) {
+		return fmt.Errorf("%w: record-page index root has no room for another entry", ErrTableFull)
+	}
+
+	if pageNo < 0 || pageNo > math.MaxInt32 {
+		return fmt.Errorf("%w: page number %d", ErrBookkeepingMismatch, pageNo)
+	}
+
+	binary.LittleEndian.PutUint32(buf.payload[off:off+4], uint32(pageNo))
+	binary.LittleEndian.PutUint16(buf.payload[off+4:off+6], 0)
+
+	if count+1 > math.MaxUint16 {
+		return fmt.Errorf("%w: %d record-page index entries", ErrBookkeepingMismatch, count+1)
+	}
+
+	binary.LittleEndian.PutUint16(buf.payload[14:16], uint16(count+1))
+
+	buf.dirty = true
+
+	// Written to disk immediately, not just buffered: OpenIndex (checkIndexes,
+	// recordPageIndex) reads this page fresh from disk rather than through
+	// this writer's buffers, and updateTableInfo needs to see this entry when
+	// Commit runs updatePageCounts for the insert that triggered the growth.
+	// flushPages writes it again at Commit, once its State counter has been
+	// bumped along with every other page this transaction touched; this write
+	// is otherwise identical and costs one redundant page write.
+	return w.db.writePageBuf(buf)
 }
 
 // checkIndexes refuses writes that would change the set of keys an index has to

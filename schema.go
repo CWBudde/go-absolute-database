@@ -4,6 +4,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
+
+	"github.com/cwbudde/go-absolute-database/internal/zlib1"
 )
 
 // BaseFieldType represents the low-level storage type (TABSBaseFieldType).
@@ -269,6 +272,43 @@ func decompressInternalFile(data []byte) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("%w: unsupported compression algorithm %d", ErrCompression, compressionAlgo)
 	}
+}
+
+// compressInternalFile is decompressInternalFile's mirror: it prefixes raw
+// with a TABSInternalFileHeader and appends the compressed (algorithm 1) or
+// copied (algorithm 0) payload.
+//
+// Algorithm 1 uses internal/zlib1.Compress, a deflate encoder that reproduces
+// the C zlib library at level 1 byte for byte -- the compressor the engine
+// itself uses for every compressed internal file in the corpus (see
+// TestZlib1ReproducesEveryCorpusStream and this file's own
+// TestCompressInternalFileReproducesCorpus). Go's compress/zlib cannot stand
+// in for it; see the file comment in ddl.go for why.
+func compressInternalFile(raw []byte, algo byte) ([]byte, error) {
+	var payload []byte
+
+	switch algo {
+	case 0: // no compression
+		payload = raw
+	case 1: // zlib
+		payload = zlib1.Compress(raw)
+	default:
+		return nil, fmt.Errorf("%w: unsupported compression algorithm %d", ErrCompression, algo)
+	}
+
+	if len(payload) > math.MaxInt32 || len(raw) > math.MaxInt32 {
+		return nil, fmt.Errorf("%w: internal file of %d bytes is too large to encode", ErrCompression, len(raw))
+	}
+
+	out := make([]byte, internalFileHeaderSize+len(payload))
+	out[0] = internalFileHeaderSize
+	binary.LittleEndian.PutUint32(out[1:5], uint32(len(payload))) //nolint:gosec // bounded above
+	binary.LittleEndian.PutUint32(out[5:9], uint32(len(raw)))     //nolint:gosec // bounded above
+	out[9] = algo
+
+	copy(out[internalFileHeaderSize:], payload)
+
+	return out, nil
 }
 
 // parseSchema parses the decompressed schema blob into a TableSchema.

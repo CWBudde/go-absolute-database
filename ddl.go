@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"strings"
 )
@@ -74,6 +75,17 @@ const (
 	// systemOwner marks a page that belongs to the database rather than to any
 	// table. It is distinct from anyTableID, which means "every table".
 	systemOwner = -2
+
+	// lastObjectIDOffset is the offset of LastObjectID in the database header;
+	// see File.lastObjectID.
+	lastObjectIDOffset = 376
+
+	// noPageNo is -1 reinterpreted as the uint32 binary.LittleEndian.PutUint32
+	// takes, for the int32 page-reference fields (NextPageNo, RecPageNo, a
+	// B-tree node's sibling pointers) that mean "none" at that value. A typed
+	// negative constant cannot convert straight to uint32 even through int32,
+	// so this is spelled as the bit pattern instead.
+	noPageNo uint32 = 0xFFFFFFFF
 )
 
 var (
@@ -379,6 +391,318 @@ func (db *File) setLastUsedPageNo(last int) error {
 	}
 
 	return nil
+}
+
+// setLastObjectID writes the database header's LastObjectID, the mirror of
+// setLastUsedPageNo for the other header field a schema operation that
+// allocates anything has to move forward.
+func (db *File) setLastObjectID(id int32) error {
+	if id == db.lastObjectID {
+		return nil
+	}
+
+	db.lastObjectID = id
+
+	var buf [4]byte
+
+	binary.LittleEndian.PutUint32(buf[:], uint32(id))
+
+	_, err := db.f.WriteAt(buf[:], lastObjectIDOffset)
+	if err != nil {
+		return fmt.Errorf("absdb: writing last object id: %w", err)
+	}
+
+	return nil
+}
+
+// ErrOutOfSpace reports a schema operation that needs more free pages than the
+// file currently has.
+var ErrOutOfSpace = errors.New("absdb: not enough free pages")
+
+// newPageState returns the initial ABSP State a freshly allocated page is
+// stamped with. FINDING 1 of the CREATE TABLE analysis this package was built
+// from: across every fixture, a live page's State is uniformly distributed in
+// [0, 2^30), and byte-identical pages allocated at different times carry
+// different States. The engine seeds it randomly and counts up from there, so
+// this package cannot reproduce the value -- it can only vary it the way the
+// engine does. db.randPageState lets a test pin it instead.
+func (db *File) newPageState() uint32 {
+	if db.randPageState != nil {
+		return db.randPageState()
+	}
+
+	//nolint:gosec // not a security context: the engine's own seed is
+	// unreproducible regardless (see above), so math/rand/v2 only needs to
+	// vary from run to run, and unlike crypto/rand it cannot fail.
+	return rand.N(uint32(1) << 30)
+}
+
+// initPage stamps a freshly allocated page with a complete ABSP header: the
+// marker, a random State (newPageState), the page's type and owner, and no
+// chain link. Every fixture's newly allocated pages carry ObjectID 0xFFFFFFFF
+// except data pages, which this package does not allocate yet -- CREATE TABLE
+// writes no data page, matching PLAN.md.
+//
+// The payload is left zeroed, which is what an unallocated page already is;
+// initPage does not need to clear it, only the caller's later write does.
+func (db *File) initPage(buf *pageWriteBuf, pageType uint16, objectID int32) {
+	h := buf.raw[diskPageHeaderOffset : diskPageHeaderOffset+diskPageHeaderSize]
+
+	clear(h)
+	copy(h[0:4], "ABSP")
+	binary.LittleEndian.PutUint32(h[4:8], db.newPageState())
+	binary.LittleEndian.PutUint16(h[8:10], pageType)
+	binary.LittleEndian.PutUint32(h[10:14], noPageNo) // NextPageNo: no chain yet
+	// CRC32, CRCType, HashType, CipherType, MACType are already zero from clear(h).
+	binary.LittleEndian.PutUint32(h[22:26], uint32(objectID))
+	binary.LittleEndian.PutUint32(h[26:30], noPageNo) // RecPageNo: not a record
+
+	// RecItemNo and the 8 reserved trailing bytes are already zero.
+
+	buf.stateBump = 0 // State was just set outright, like a tombstoned page's.
+	buf.dirty = true
+}
+
+// computeExtentState derives an Extent Allocation Map entry straight from the
+// Page Free Space map. It is what allocation needs and releasePages does not:
+// releasePages only ever downgrades an extent it already knows was full, but
+// a freshly allocated extent can move free -> partial, free -> full or
+// partial -> full depending on how many of its pages a single call just took
+// -- measured on CREATE TABLE Delta, whose five new pages leave their shared
+// extent partial, not full, because three of its eight pages stay free.
+func computeExtentState(pfs []byte, extent, perExtent, pageCount int) byte {
+	allocated, total := 0, 0
+
+	for no := extent * perExtent; no < (extent+1)*perExtent && no < pageCount; no++ {
+		total++
+
+		if pfsAllocated(pfs, no) {
+			allocated++
+		}
+	}
+
+	switch allocated {
+	case 0:
+		return extentFree
+	case total:
+		return extentFull
+	default:
+		return extentPartial
+	}
+}
+
+// pageLoader is the shared capability pageEdit and TableWriter both offer: a
+// page buffered for modification, read and cached on first use. allocatePages
+// works over either, which is what lets a TableWriter grow its own table's
+// data pages (see growTable) through the same allocator the DDL operations in
+// this file use, without either side depending on the other's page set.
+type pageLoader interface {
+	load(no int) (*pageWriteBuf, error)
+	loadFresh(no int) (*pageWriteBuf, error)
+}
+
+// allocatePages reserves n free pages, lowest page number first, and returns
+// their numbers in ascending order. Each page is stamped with a fresh ABSP
+// header via initPage; the caller links any chain and writes the payload.
+//
+// It may be called more than once against the same pageLoader -- CREATE TABLE
+// calls it four times for four different page types -- and the Page Free
+// Space and Extent Allocation Map State bumps accumulate correctly across
+// those calls rather than being overwritten by the last one, because both
+// pages are cached by the loader and the bump counters are reset only on a
+// page's first touch.
+//
+// PLAN.md records the engine allocating the same way: a table created after a
+// drop takes the freed pages before any higher one, and CREATE TABLE Delta on
+// MultiTable.abs took pages 24-28, the file's five lowest free pages.
+func (db *File) allocatePages(w pageLoader, n int, pageType uint16, objectID int32) ([]int, error) {
+	if n <= 0 {
+		return nil, fmt.Errorf("absdb: cannot allocate %d pages", n)
+	}
+
+	pfs, err := w.load(pfsPageNo)
+	if err != nil {
+		return nil, err
+	}
+
+	newPages := findFreePages(pfs.payload, db.PageCount(), n)
+	if len(newPages) < n {
+		return nil, fmt.Errorf("%w: %d free, need %d", ErrOutOfSpace, len(newPages), n)
+	}
+
+	markPagesAllocated(pfs, newPages)
+
+	eam, err := w.load(eamPageNo)
+	if err != nil {
+		return nil, err
+	}
+
+	perExtent := int(db.pagesInExtent)
+	if perExtent <= 0 {
+		return nil, fmt.Errorf("absdb: invalid extent size %d", perExtent)
+	}
+
+	updateExtentMap(pfs.payload, eam, newPages, perExtent, db.PageCount())
+
+	if err := db.initNewPages(w, newPages, pageType, objectID); err != nil {
+		return nil, err
+	}
+
+	highest := max(newPages[len(newPages)-1], int(db.lastUsedPageNo))
+
+	if err := db.setLastUsedPageNo(highest); err != nil {
+		return nil, err
+	}
+
+	return newPages, nil
+}
+
+// findFreePages scans the Page Free Space map for the n lowest-numbered pages
+// it marks free, in ascending order. It may return fewer than n.
+func findFreePages(pfs []byte, pageCount, n int) []int {
+	var free []int
+
+	for no := 0; no < pageCount && len(free) < n; no++ {
+		if !pfsAllocated(pfs, no) {
+			free = append(free, no)
+		}
+	}
+
+	return free
+}
+
+// markPagesAllocated sets each page's Page Free Space bit and accumulates the
+// State bump across however many times allocatePages touches this same
+// buffered page within one pageLoader (see allocatePages' doc comment).
+func markPagesAllocated(pfs *pageWriteBuf, newPages []int) {
+	for _, no := range newPages {
+		pfs.payload[no/8] |= 1 << (no % 8)
+	}
+
+	if !pfs.dirty {
+		pfs.stateBump = 0
+	}
+
+	pfs.stateBump += len(newPages)
+	pfs.dirty = true
+}
+
+// updateExtentMap recomputes and, where it changed, rewrites the Extent
+// Allocation Map entry of every extent newPages touched, accumulating the
+// State bump the same way markPagesAllocated does for the PFS.
+func updateExtentMap(pfs []byte, eam *pageWriteBuf, newPages []int, perExtent, pageCount int) {
+	if !eam.dirty {
+		eam.stateBump = 0
+	}
+
+	changed := 0
+	seenExtent := make(map[int]bool, len(newPages))
+
+	for _, no := range newPages {
+		extent := no / perExtent
+		if seenExtent[extent] {
+			continue
+		}
+
+		seenExtent[extent] = true
+
+		state := computeExtentState(pfs, extent, perExtent, pageCount)
+		if extentState(eam.payload, extent) == state {
+			continue
+		}
+
+		setExtentState(eam.payload, extent, state)
+
+		changed++
+	}
+
+	eam.stateBump += changed
+	if changed > 0 {
+		eam.dirty = true
+	}
+}
+
+// initNewPages gives every newly allocated page a fresh ABSP header.
+func (db *File) initNewPages(w pageLoader, newPages []int, pageType uint16, objectID int32) error {
+	for _, no := range newPages {
+		buf, err := w.loadFresh(no)
+		if err != nil {
+			return err
+		}
+
+		db.initPage(buf, pageType, objectID)
+	}
+
+	return nil
+}
+
+// linkChain sets a page's NextPageNo, the way allocatePages leaves it at -1
+// for a page nothing has chained yet.
+func (db *File) linkChain(w *pageEdit, no, next int) error {
+	buf, err := w.load(no)
+	if err != nil {
+		return err
+	}
+
+	binary.LittleEndian.PutUint32(buf.raw[diskPageHeaderOffset+10:diskPageHeaderOffset+14], uint32(int32(next))) //nolint:gosec // next is a page number or -1
+	buf.dirty = true
+
+	return nil
+}
+
+// freeChainPages tombstones pages a chain no longer needs and returns them to
+// the allocation maps, exactly the way applyDrop frees a whole table's pages.
+func (db *File) freeChainPages(w *pageEdit, pages []int) error {
+	for _, no := range pages {
+		buf, err := w.load(no)
+		if err != nil {
+			return err
+		}
+
+		binary.LittleEndian.PutUint32(buf.raw[pageStateOffset:pageStateOffset+4], uint32(pageStateFree))
+		buf.stateBump = 0
+		buf.dirty = true
+	}
+
+	last, err := db.releasePages(w, pages)
+	if err != nil {
+		return err
+	}
+
+	return db.setLastUsedPageNo(last)
+}
+
+// resizeChain grows or shrinks a page chain to exactly n pages, allocating new
+// pages (lowest free page first, like allocatePages) or freeing trailing ones,
+// and keeps every NextPageNo link in step.
+func (db *File) resizeChain(w *pageEdit, pages []int, n int, pageType uint16, objectID int32) ([]int, error) {
+	for len(pages) < n {
+		added, err := db.allocatePages(w, 1, pageType, objectID)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := db.linkChain(w, pages[len(pages)-1], added[0]); err != nil {
+			return nil, err
+		}
+
+		pages = append(pages, added[0])
+	}
+
+	if len(pages) > n {
+		freed := pages[n:]
+		pages = pages[:n]
+
+		if err := db.linkChain(w, pages[len(pages)-1], -1); err != nil {
+			return nil, err
+		}
+
+		if err := db.freeChainPages(w, freed); err != nil {
+			return nil, err
+		}
+	}
+
+	return pages, nil
 }
 
 // pfsAllocated reports whether the Page Free Space map marks a page allocated.
@@ -767,6 +1091,24 @@ func (w *pageEdit) load(no int) (*pageWriteBuf, error) {
 	}
 
 	buf, err := w.db.bufferPage(no)
+	if err != nil {
+		return nil, err
+	}
+
+	w.pages[no] = buf
+	w.order = append(w.order, no)
+
+	return buf, nil
+}
+
+// loadFresh is load's counterpart for a page allocatePages is about to
+// initialize, which may not carry an ABSP header yet. See bufferPageFresh.
+func (w *pageEdit) loadFresh(no int) (*pageWriteBuf, error) {
+	if buf, ok := w.pages[no]; ok {
+		return buf, nil
+	}
+
+	buf, err := w.db.bufferPageFresh(no)
 	if err != nil {
 		return nil, err
 	}

@@ -61,6 +61,7 @@ const (
 	PageTypeSystemDir = 2  // System directory
 	PageTypeFileHdr   = 3  // File header (page 0)
 	PageTypeTableList = 6  // Table catalog (uncompressed internal file)
+	PageTypeSystem    = 7  // A table's "system" internal file; role unidentified, see TableInfo.systemPageNo
 	PageTypeSchema    = 8  // Schema metadata (zlib-compressed column defs)
 	PageTypeTableInfo = 9  // Table info (record counts)
 	PageTypeData      = 10 // Data page (row storage)
@@ -93,11 +94,25 @@ type File struct {
 	writeChangeState byte
 	encrypted        bool
 
+	// lastObjectID is TABSDBHeader.LastObjectID, at header offset 376: the last
+	// object id the engine has handed out. It is not part of the documented
+	// 76-byte header (dbHeaderSize) -- it sits in the header's otherwise
+	// unaccounted tail, 4 bytes ahead of page 0's own ABSP marker at
+	// diskPageHeaderOffset. See PLAN.md Phase 8 for how CREATE TABLE moves it.
+	lastObjectID int32
+
 	// Parsed from TABSCryptoHeader (nil if not encrypted).
 	cryptoHeader *CryptoHeader
 
 	// Derived from password; nil if not encrypted or no password provided.
 	decryptionKey []byte
+
+	// randPageState supplies a newly allocated page's initial ABSP State. The
+	// engine seeds it with a random, unreproducible 30-bit value (see the
+	// CREATE TABLE analysis in ddl_create.go); this field exists so a test can
+	// pin the value and assert every other byte of an allocation. nil selects
+	// the default source, newPageState's math/rand/v2 generator.
+	randPageState func() uint32
 }
 
 // Open opens an Absolute Database file for reading.
@@ -418,6 +433,8 @@ func (db *File) parseHeader() error {
 		return ErrTruncated
 	}
 
+	db.readLastObjectID()
+
 	// Parse CryptoHeader if encrypted.
 	if db.encrypted {
 		page0 := make([]byte, db.pageSize)
@@ -429,6 +446,23 @@ func (db *File) parseHeader() error {
 	}
 
 	return nil
+}
+
+// readLastObjectID reads LastObjectID, which lives outside the 76-byte buffer
+// parseHeader already read, in the header's otherwise-reserved tail (see the
+// File.lastObjectID doc comment). It is read best-effort: a file too short to
+// carry it is still readable for everything else, and this field only
+// matters to writers.
+func (db *File) readLastObjectID() {
+	if db.size < lastObjectIDOffset+4 {
+		return
+	}
+
+	var objBuf [4]byte
+
+	if _, err := db.f.ReadAt(objBuf[:], lastObjectIDOffset); err == nil {
+		db.lastObjectID = int32(binary.LittleEndian.Uint32(objBuf[:]))
+	}
 }
 
 // payloadSize returns the number of usable payload bytes carried by a single

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"golang.org/x/text/encoding/charmap"
 )
 
 const (
@@ -158,6 +160,144 @@ func (db *File) readInternalFilePages(first int) ([]byte, error) {
 	}
 
 	return out, nil
+}
+
+// internalFilePageChain walks a page chain the same way internalFilePages
+// does, but through a pageEdit's buffers so a link this edit set but has not
+// flushed to disk yet is still followed.
+func (db *File) internalFilePageChain(w *pageEdit, first int) ([]int, error) {
+	pages := []int{first}
+	visited := map[int]bool{first: true}
+
+	for {
+		buf, err := w.load(pages[len(pages)-1])
+		if err != nil {
+			return nil, err
+		}
+
+		next := int32(binary.LittleEndian.Uint32(buf.raw[diskPageHeaderOffset+10 : diskPageHeaderOffset+14]))
+		if next < 0 {
+			return pages, nil
+		}
+
+		if visited[int(next)] {
+			return nil, fmt.Errorf("absdb: internal file at page %d visits page %d twice", first, next)
+		}
+
+		if len(pages) >= maxCatalogPages {
+			return nil, fmt.Errorf("absdb: internal file at page %d is longer than %d pages", first, maxCatalogPages)
+		}
+
+		visited[int(next)] = true
+		pages = append(pages, int(next))
+	}
+}
+
+// writeInternalFilePages writes a complete internal file across a page chain
+// starting at first, the mirror of readInternalFilePages. The chain already
+// linked from first is followed, and grown or shrunk to fit data via
+// resizeChain when its length no longer matches -- a caller writing a fresh
+// internal file passes a chain resizeChain (or allocatePages) has already
+// sized correctly, so neither path runs in that case.
+//
+// The chain's page type and owner are taken from the first page's own ABSP
+// header, so first must already carry one -- allocatePages gives a newly
+// allocated page one before this is ever called on it.
+func (db *File) writeInternalFilePages(w *pageEdit, first int, data []byte) error {
+	head, err := w.load(first)
+	if err != nil {
+		return err
+	}
+
+	pageType := binary.LittleEndian.Uint16(head.raw[diskPageHeaderOffset+8 : diskPageHeaderOffset+10])
+	objectID := int32(binary.LittleEndian.Uint32(head.raw[diskPageHeaderOffset+22 : diskPageHeaderOffset+26]))
+
+	capacity := len(head.payload)
+	if capacity <= 0 {
+		return fmt.Errorf("%w: page %d has no payload capacity", ErrBadCatalog, first)
+	}
+
+	pages, err := db.internalFilePageChain(w, first)
+	if err != nil {
+		return err
+	}
+
+	need := max((len(data)+capacity-1)/capacity, 1)
+
+	pages, err = db.resizeChain(w, pages, need, pageType, objectID)
+	if err != nil {
+		return err
+	}
+
+	off := 0
+
+	for _, no := range pages {
+		buf, err := w.load(no)
+		if err != nil {
+			return err
+		}
+
+		n := min(capacity, len(data)-off)
+
+		copy(buf.payload[:n], data[off:off+n])
+
+		off += n
+		buf.dirty = true
+	}
+
+	return nil
+}
+
+// appendCatalogEntry adds one entry to the table catalog's internal file,
+// growing its stored/decompressed length by tableListEntrySize -- the mirror
+// of removeCatalogEntry, which shrinks it the same way. Like that function, it
+// only supports a catalog stored uncompressed on a single page, which is the
+// only shape any fixture carries.
+func appendCatalogEntry(payload []byte, info TableInfo) error {
+	if len(payload) < internalFileHeaderSize {
+		return fmt.Errorf("%w: catalog page is %d bytes", ErrCatalogNotWritable, len(payload))
+	}
+
+	headerSize := int(payload[0])
+	stored := int(int32(binary.LittleEndian.Uint32(payload[1:5])))
+	decompressed := int(int32(binary.LittleEndian.Uint32(payload[5:9])))
+	algorithm := payload[9]
+
+	switch {
+	case algorithm != 0 || stored != decompressed:
+		return fmt.Errorf("%w: it is compressed with algorithm %d", ErrCatalogNotWritable, algorithm)
+	case headerSize < internalFileHeaderSize || stored < 0 || stored%tableListEntrySize != 0:
+		return fmt.Errorf("%w: %d bytes is not a whole number of entries", ErrCatalogNotWritable, stored)
+	case headerSize+stored+tableListEntrySize > len(payload):
+		return fmt.Errorf("%w: no room for another %d-byte entry", ErrCatalogNotWritable, tableListEntrySize)
+	}
+
+	entry := payload[headerSize+stored : headerSize+stored+tableListEntrySize]
+
+	raw, err := charmap.Windows1252.NewEncoder().Bytes([]byte(info.Name))
+	if err != nil {
+		return fmt.Errorf("%w: %q: %w", ErrStringEncoding, info.Name, err)
+	}
+
+	if len(raw) >= tableNameFieldSize {
+		return fmt.Errorf("%w: %d bytes of name in a %d-byte field", ErrValueRange, len(raw), tableNameFieldSize-1)
+	}
+
+	entry[0] = byte(len(raw)) //nolint:gosec // checked above: len(raw) < tableNameFieldSize (256)
+	copy(entry[1:], raw)
+
+	fields := entry[tableNameFieldSize:]
+	binary.LittleEndian.PutUint32(fields[0:4], uint32(int32(info.ID)))             //nolint:gosec // small object ids
+	binary.LittleEndian.PutUint32(fields[4:8], uint32(int32(info.SchemaPageNo)))   //nolint:gosec // page numbers
+	binary.LittleEndian.PutUint32(fields[8:12], uint32(int32(info.InfoPageNo)))    //nolint:gosec // page numbers
+	binary.LittleEndian.PutUint32(fields[12:16], uint32(int32(info.systemPageNo))) //nolint:gosec // page numbers
+
+	newLen := uint32(stored + tableListEntrySize) //nolint:gosec // bounded by the page-capacity check above
+
+	binary.LittleEndian.PutUint32(payload[1:5], newLen)
+	binary.LittleEndian.PutUint32(payload[5:9], newLen)
+
+	return nil
 }
 
 // nextPageNo returns a page's chain successor, or -1 when it has no header.
