@@ -86,7 +86,7 @@ with **no `State` exclusion**.
 Everything else is refused with `ErrIndexNotMaintained` rather than guessed at: a tree deep
 enough to have split, a key of another shape, a multi-column index (`ErrMultiColumnIndex`), and
 a `DESC` or `NOCASE` index, which orders its leaf differently than this package compares. That
-still covers every indexed customer fixture — they all carry a multi-column index or a
+still covers every indexed private fixture — they all carry a multi-column index or a
 uniqueness constraint this package does not check.
 
 ## Schema operations

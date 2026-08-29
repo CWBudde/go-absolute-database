@@ -655,7 +655,7 @@ func requireFixtureName(t *testing.T, name string) string {
 // that has since expired. It needed six free pages, and at the time nothing
 // in this package could grow a database. MultiTable.abs is the only file in
 // the whole corpus that has six -- Writes.abs has three, every Employees-*.abs
-// has two, and the customer fixtures have between none and five. An
+// has two, and the private fixtures have between none and five. An
 // engine-faithful ALTER TABLE would have been byte-perfect on one fixture and
 // refused on every other file this package exists to read. ddl_grow.go removed
 // that constraint; the rebuild is now unblocked but still not done, and what

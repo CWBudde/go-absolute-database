@@ -88,5 +88,5 @@ show how it chooses a split point and rewrites the parent. Since the fullest obs
 of a possible 367, the split point is evidently not "leaf full", and nothing here reproduces the
 rule. That is why every write path refuses a multi-level tree.
 
-These five trees all live in customer fixtures, which are gitignored; a fresh clone and CI see
+These five trees all live in private fixtures, which are gitignored; a fresh clone and CI see
 none of them.

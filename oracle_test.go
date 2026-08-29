@@ -112,7 +112,7 @@ var unindexedFixtures = map[string]bool{
 }
 
 // fixtureNames returns every testdata/*.abs in sorted order. It skips the test
-// when the directory is absent: testdata holds real customer data and is not
+// when the directory is absent: testdata holds real private project data and is not
 // committed, so a fresh clone has to skip rather than fail.
 func fixtureNames(t *testing.T) []string {
 	t.Helper()

@@ -26,7 +26,7 @@ import (
 // Reproducing that sequence was considered and rejected, and the reason has
 // since expired. It needed six free pages, and at the time nothing here could
 // grow a database: MultiTable.abs is the only file in the corpus that has
-// six, Writes.abs has three, every Employees-*.abs has two, and the customer
+// six, Writes.abs has three, every Employees-*.abs has two, and the private
 // fixtures have between none and five, so an engine-faithful ALTER TABLE
 // would have been byte-perfect on one fixture and refused on every other file
 // this package exists to read. The splice below works on all of them.

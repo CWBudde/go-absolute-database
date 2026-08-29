@@ -17,7 +17,7 @@ Thumbs.db
 
 # testdata
 #
-# testdata/ holds real customer project files and is never committed. The one
+# testdata/ holds real private project files and is never committed. The one
 # exception is the Go fuzzing corpus: `go test -fuzz` writes a reproducer to
 # testdata/fuzz/<Target>/ when it finds a crash, and that reproducer is the
 # regression test. Without this exception a crash found by fuzzing could never
@@ -29,19 +29,19 @@ testdata/*
 !testdata/fuzz/
 
 # The zlib level-1 golden vectors for internal/zlib1. Every case is either
-# synthetic or taken from a committed fixture, so no customer data is
+# synthetic or taken from a committed fixture, so no private data is
 # involved; see testdata/README.md.
 !testdata/zlib1/
 
-# Exception: the Employees-* fixtures are ours, not customer data. They were
+# Exception: the Employees-* fixtures are ours, not private data. They were
 # generated with the ComponentAce DB Manager and all hold the same synthetic
-# Employees table (three invented rows), so they carry no customer content and
+# Employees table (three invented rows), so they carry no private data and
 # no vendor material -- only the format's own ABS0LUTEDATABASE/ABSP magic. One
 # per encryption algorithm, they are committed because they are the only
 # fixtures CI can use: without them every fixture-backed test skips on a runner
 # and the crypto is never exercised at all.
 # Keep this list explicit, one filename per line; never widen it to a glob,
-# which could silently catch a real customer file.
+# which could silently catch a private fixture.
 !testdata/Employees-Rijndael_128.abs
 !testdata/Employees-Rijndael_256.abs
 !testdata/Employees-DES_Single.abs

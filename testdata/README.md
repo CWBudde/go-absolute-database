@@ -1,11 +1,11 @@
 # testdata
 
 Almost everything in this directory is **deliberately not committed**. The `.abs`
-fixtures the parser is developed against are real customer project data, and
+fixtures the parser is developed against are real private project data, and
 `.gitignore` excludes `testdata/*` for that reason. A fresh clone therefore has only the
 `Employees-*`, `Writes*`, `MultiTable*`, `Empty*` and `Constraints` fixtures below, and every
 test that needs one of the others skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
-validated against real customer files — run `just test` locally for that.
+validated against real private project files — run `just test` locally for that.
 
 ## The committed fixtures
 
@@ -18,7 +18,7 @@ encryption algorithm, the fourteen `Writes*.abs` files that pin the write path, 
 ### `Employees-*.abs` — one per encryption algorithm
 
 They are committed because without them the encryption code is never exercised on a
-runner at all: every other encrypted fixture is customer data.
+runner at all: every other encrypted fixture is private data.
 
 All eight hold the identical database and differ only in the cipher:
 
@@ -41,7 +41,7 @@ All eight hold the identical database and differ only in the cipher:
 | `Employees-Twofish_256.abs`  | 6                     | DEC's Twofish variant                                           |
 | `Employees-Square.abs`       | 7                     | Square                                                          |
 
-They contain no customer data — the schema and all three rows are invented — and no
+They contain no private data — the schema and all three rows are invented — and no
 vendor material. This was checked rather than assumed: scanning both the ciphertext and
 the decrypted payload of every file finds no path, user name, vendor string or licence
 code, only the format's own `ABS0LUTEDATABASE` and `ABSP` magic plus the invented table
@@ -121,14 +121,14 @@ column's value. `-idx-del` is the one that changed an implementation: it shows t
 leaving the vacated entry's bytes in place rather than clearing them, which no amount of
 reading would have suggested.
 
-They contain no customer data and no vendor material, checked the same way as the
+They contain no private data and no vendor material, checked the same way as the
 `Employees-*` files: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the table
 name and the invented row values.
 
 ### `MultiTable*.abs` — the table catalog and the schema operations over it
 
 Twelve unencrypted files, the only ones in the corpus holding more than one table. Every
-other fixture, customer files included, has exactly one, which is why the multi-table bug
+other fixture, private files included, has exactly one, which is why the multi-table bug
 they close survived unnoticed for so long.
 
 | File                           | Made from                  | Contents                                             |
@@ -209,7 +209,7 @@ ignores the catalog's length field reports the surviving table twice. Between th
 also pin the two allocation maps: the Page Free Space bitmap on page 0 and the Extent
 Allocation Map on page 1. See docs/format/pages.md.
 
-They contain no customer data and no vendor material, checked the same way as the other
+They contain no private data and no vendor material, checked the same way as the other
 committed fixtures: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the three
 invented table names and the invented row values, and no UTF-16 strings at all.
 
@@ -262,7 +262,7 @@ Twelve two-column tables in one database, each differing from the control in exa
 clause, so that subtracting the control's schema stream isolates a single record. It is to
 the schema tail's constraint records what `Writes.abs`/`Writes-idx.abs` were to its index
 record, and it exists because those records are what made `parseSchemaTail` refuse most real
-customer tables.
+private-fixture tables.
 
 | Table        | Declaration                                       | Isolates                               |
 | ------------ | ------------------------------------------------- | -------------------------------------- |
@@ -284,7 +284,7 @@ old parser read as a reserved zero is the **constraint count**, and there are tw
 tail rather than one — it turned up a **read** bug. `DEFAULT` is not stored as a constraint record
 at all; it lives in the column definition as a typed value, which moves the column terminator.
 `findColumnTerminator` did not know that, so `CDefault` could not be opened at all. Across the
-whole corpus that is the only table whose parse changed: 20 customer tables went from refused to
+whole corpus that is the only table whose parse changed: 20 private-fixture tables went from refused to
 parsed, and `CDefault` from unreadable to readable, with every other column list and row digest
 identical before and after.
 
@@ -333,7 +333,7 @@ The `Writes*`, `MultiTable*`, `Empty*` and `Constraints` files use the same rout
 encryption checkbox left off, opening a copy of the parent through `argv[1]` and typing the
 one statement into the SQL tab.
 **Always work on copies in a scratch directory.** The file dialogs open wherever they were
-last used, and that is often this directory, which is full of irreplaceable customer files.
+last used, and that is often this directory, which is full of irreplaceable private files.
 Verify those by bytes too: a derived file must actually differ from its parent
 (`cmp -l parent child | wc -l`), because a script that silently failed to run produces a
 file that is byte-identical to its parent and looks like a valid fixture.
@@ -346,7 +346,7 @@ that is what the engine writes and what every compressed internal file in the co
 exactly what C zlib 1.2.13 produced for it at level 1.
 
 These are committed, unlike most of this directory, and deliberately so — they let CI check
-the encoder without any `.abs` fixture at all. Nothing here is customer data: every case is
+the encoder without any `.abs` fixture at all. Nothing here is private data: every case is
 either synthetic or a column-definition stream taken from one of the committed `Writes*` /
 `MultiTable*` fixtures.
 

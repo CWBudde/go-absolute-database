@@ -10,7 +10,7 @@ import (
 // Database growth: what the engine does when an allocation finds no free page.
 //
 // Until this file existed every allocation refused with ErrOutOfSpace, which
-// made CREATE TABLE unusable on almost every file in the corpus -- a customer
+// made CREATE TABLE unusable on almost every file in the corpus -- a private
 // fixture carries between zero and five free pages and a CREATE TABLE needs
 // five or six of them. The engine grows the file instead, and
 // ABSDiskEngine.hpp names the machinery it does it with:

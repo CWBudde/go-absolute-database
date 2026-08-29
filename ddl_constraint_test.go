@@ -198,7 +198,7 @@ func checkConstraint(t *testing.T, i int, got constraintRecord,
 // table in every fixture present must have a schema tail this package can read
 // end to end.
 //
-// Before the constraint array was decoded, twenty customer tables failed here:
+// Before the constraint array was decoded, twenty private-fixture tables failed here:
 // the thirteen databases Addresses, RCON0011, RCFQ0011, RMPA0011, RFRQ0011,
 // RGRP0011, RMND0011, RPDG0011, RR240011, RRAD00*, RRAI00*, RREC0011 and TS03,
 // three of them also present as encrypted copies of Addresses. Some failed on
@@ -573,7 +573,7 @@ func TestSchemaTailRefusalsSurvive(t *testing.T) {
 	}
 }
 
-// TestCreateIndexOnConstrainedCustomerTables is the payoff, measured on the
+// TestCreateIndexOnConstrainedPrivateFixtureTables is the payoff, measured on the
 // files this package exists to read. Each of these carries NOT NULL records and
 // a PRIMARY KEY, and every one of them refused CREATE INDEX outright until the
 // constraint array was decoded.
@@ -583,7 +583,7 @@ func TestSchemaTailRefusalsSurvive(t *testing.T) {
 // and the index the operation built agrees with the record reader row for row
 // (crossCheckTable, the same oracle TestOracleReaderMatchesLeafScan applies to
 // the fixtures as shipped).
-func TestCreateIndexOnConstrainedCustomerTables(t *testing.T) {
+func TestCreateIndexOnConstrainedPrivateFixtureTables(t *testing.T) {
 	tests := []struct{ fixture, column string }{
 		{"RRAI0011.abs", "ObjID"},
 		{"RMND0011.abs", "SrcNo"},

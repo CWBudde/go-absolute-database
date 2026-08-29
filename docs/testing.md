@@ -14,7 +14,7 @@ Two populations:
   truth, five of them carrying a user index), twelve `MultiTable*` (the catalog and the schema
   operations over it), five `Empty*` (fresh databases, one setting changed each), and
   `Constraints.abs` (twelve tables, each one clause from a control).
-- **Not committed** — 20 real customer files. They are irreplaceable, are not in git, and must
+- **Not committed** — 20 real private project files. They are irreplaceable, are not in git, and must
   never be. Nothing in the test suite may write to, move, rename or delete anything under
   `testdata/`; a test that needs to modify a fixture copies it into `t.TempDir()` first.
 
@@ -73,7 +73,7 @@ signature, `ABSP`, the invented table names and the invented values appear.
 `.github/workflows/ci.yml` runs build, `go vet`, `gofmt`, `go mod tidy -diff`, race tests,
 `golangci-lint` and a fuzz budget per target.
 
-**CI cannot validate the parser against the customer corpus.** Those fixtures are not in the
+**CI cannot validate the parser against the private corpus.** Those fixtures are not in the
 repository, so their tests skip on a runner; the workflow prints the skip list into the job
 summary and uploads no coverage number, precisely so a green tick does not imply real-file
 validation. That stays a local `just test` responsibility.

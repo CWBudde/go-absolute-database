@@ -116,7 +116,7 @@ func writeBlob(data []byte, output string) error {
 		return err
 	}
 
-	// 0o600, not 0o644: an extracted BLOB is verbatim payload out of a customer
+	// 0o600, not 0o644: an extracted BLOB is verbatim payload out of a private
 	// database, so the file it lands in is readable by its owner only.
 	if err := os.WriteFile(output, data, 0o600); err != nil {
 		return err

@@ -94,7 +94,7 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 	t.Run("index shape the leaf writer cannot reproduce", func(t *testing.T) {
 		// The three refusals maintainableIndexColumn adds on top of the leaf
 		// shape, checked against hand-built records because no committed
-		// fixture reaches them: the customer files that carry these index
+		// fixture reaches them: the private fixtures that carry these index
 		// shapes all declare constraints too, and refuseConstraints stops
 		// their writes first (see TestWriterRefusesAConstrainedTable).
 		for _, c := range []struct {
@@ -136,7 +136,7 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 // Constraints.abs isolates one clause per table, so each case names exactly
 // which one stopped the write. CNone is the control: the same file, the same
 // writer, no constraint, and the write is not refused. Every constrained
-// customer fixture lands here too -- which is most of them -- and that is the
+// private fixture lands here too -- which is most of them -- and that is the
 // intended outcome, not a side effect: before parseSchemaTail decoded the
 // constraint array these tables were refused only when they also carried an
 // index, and only because their tail did not parse.

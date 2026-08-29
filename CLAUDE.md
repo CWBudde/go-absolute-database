@@ -112,7 +112,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   that sits a broader gate: a table declaring **any** constraint refuses every write with
   `ErrConstraintsNotEnforced` (`refuseConstraints` in `writer_index.go`), because nothing here checks
   a `NOT NULL`, a `MINVALUE`/`MAXVALUE` pair or a uniqueness rule, and a write that ignores them
-  leaves the file holding a row the engine would have rejected. **Every constrained customer fixture
+  leaves the file holding a row the engine would have rejected. **Every constrained private fixture
   refuses writes**, indexed or not, and the reason has now changed twice: it used to be that
   `parseSchemaTail` could not read their schema tail at all; `ddl_constraint.go` made that tail
   readable and turned an accidental refusal into a hole — a constrained table with a maintainable
@@ -136,7 +136,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   never widen an exclusion to make a test pass.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.
-- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the fourteen `testdata/Writes*.abs` fixtures (the write path's ground truth, four of them carrying a user index) and the twelve `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), the five `testdata/Empty*.abs` fixtures (what the engine writes for a brand-new database, and how it grows one) and `testdata/Constraints.abs` (twelve tables differing from a control by one column constraint or index variation each), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
+- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real private project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the fourteen `testdata/Writes*.abs` fixtures (the write path's ground truth, four of them carrying a user index) and the twelve `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), the five `testdata/Empty*.abs` fixtures (what the engine writes for a brand-new database, and how it grows one) and `testdata/Constraints.abs` (twelve tables differing from a control by one column constraint or index variation each), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the private fixtures; run `just test` locally for that.
 - **Windows-1252 aware**: String fields use Windows-1252 encoding by default. Always decode to UTF-8.
 
 ## Formatting and Linting
@@ -152,4 +152,4 @@ Linting is `golangci-lint` with `default: all` and a curated disable list. Every
 
 ## CI
 
-`.github/workflows/ci.yml` runs build, `go vet`, `gofmt`, `go mod tidy -diff`, race tests, `golangci-lint`, and a short fuzz budget per target. It sees only the two committed Twofish fixtures, not the customer ones, so read the scope note at the top of that file before trusting a green check.
+`.github/workflows/ci.yml` runs build, `go vet`, `gofmt`, `go mod tidy -diff`, race tests, `golangci-lint`, and a short fuzz budget per target. It sees only the two committed Twofish fixtures, not the private ones, so read the scope note at the top of that file before trusting a green check.

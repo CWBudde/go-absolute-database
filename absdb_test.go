@@ -16,10 +16,10 @@ func testdataPath(name string) string {
 // requireFixture returns the path of a fixture in testdata/, skipping the test
 // when it is not there.
 //
-// testdata/ mostly holds real customer data and is deliberately not committed,
+// testdata/ mostly holds real private project data and is deliberately not committed,
 // so on a fresh clone the fixtures are simply absent and the tests that need
 // them have nothing to say. (The eight Employees-* fixtures are the exception:
-// they were generated with the ComponentAce DB Manager and contain no customer
+// they were generated with the ComponentAce DB Manager and contain no private
 // data, but they live under the same ignored directory.) Every path that
 // reaches a fixture — Open, ReadFile, OpenWithPassword — should go through
 // here, so that a fresh clone skips cleanly instead of reporting dozens of

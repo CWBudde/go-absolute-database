@@ -117,11 +117,11 @@ just ci          # everything CI runs, plus the parts CI cannot
 ```
 
 **A green CI badge is narrower than it looks.** `testdata/` is gitignored: most fixtures are real
-customer project files and are never committed, and every test that opens one skips when the file
+private project files and are never committed, and every test that opens one skips when the file
 is absent. What CI covers is the synthetic and unit tests plus the forty committed fixtures, which
 are ours — they hold invented tables and invented values. Those forty do exercise the full
 encrypted read path for all eight algorithms and the byte-for-byte write tests, but validation
-against the customer corpus happens locally only. [`docs/testing.md`](docs/testing.md) is explicit
+against the private corpus happens locally only. [`docs/testing.md`](docs/testing.md) is explicit
 about the boundary.
 
 ## Provenance and legal basis

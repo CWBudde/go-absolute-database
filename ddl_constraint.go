@@ -10,7 +10,7 @@ import (
 //
 // This is the region parseSchemaTail used to refuse outright. Every table
 // carrying a NOT NULL, PRIMARY KEY, UNIQUE or MINVALUE/MAXVALUE clause has one,
-// which is nearly every real customer table, so the refusal took CREATE INDEX,
+// which is nearly every real private-fixture table, so the refusal took CREATE INDEX,
 // DROP INDEX, DROP COLUMN and index maintenance with it.
 //
 // # How it was decoded
@@ -88,7 +88,7 @@ import (
 //
 // Kind 1, a non-zero reserved field, a count other than 1, and a non-zero pad
 // byte are all refused with ErrSchemaTailNotUnderstood rather than guessed at.
-// A wrong guess here rewrites a real customer database, and the corpus is the
+// A wrong guess here rewrites a real private project database, and the corpus is the
 // only evidence there is.
 
 // constraintKind identifies which clause of the SDK manual's CREATE TABLE

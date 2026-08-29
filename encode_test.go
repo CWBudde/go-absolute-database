@@ -110,7 +110,7 @@ func TestEncodeReproducesFixtureRecords(t *testing.T) {
 // roundTripFixtures lists the fixtures the round-trip test walks: the eight
 // committed Employees-* files by name, so their absence shows up as a skip,
 // plus every other .abs file in testdata/, which on this machine is real
-// customer data that a fresh clone simply does not have.
+// private data that a fresh clone simply does not have.
 func roundTripFixtures(t *testing.T) []string {
 	t.Helper()
 

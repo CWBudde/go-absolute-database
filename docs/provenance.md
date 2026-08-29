@@ -107,26 +107,53 @@ Art. 8 / §69g(2) does **not** neutralise this one: it voids terms contrary to A
 law points the same way — §3(1) Nr. 2 GeschGehG permits reverse engineering of a lawfully
 obtained product, but subject to any contractual restriction on acquiring the secret.
 
-Whether that clause binds this project depends on a fact no document here settles: **which of the
-seven EULA variants in the SDK package, if any, was actually accepted.** If no Absolute Database
-licence was ever taken out — `.abs` files reaching us because customers' own installations wrote
-them — then no contract was formed and the analysis reduces to copyright, where _SAS v WPL_
-governs and the position is comfortable.
+**The operative licence is the Personal edition**, whose EULA is `Licenses/Personal.txt` in the
+SDK package. Its §2 makes installation itself acceptance, so a contract very likely exists. Two
+arguments say §4 does not reach this work, and both are arguments rather than certainties:
 
-This is the one item on which a lawyer, or written permission from ComponentAce, is worth more
-than further reasoning in this file. Record the answer here when it is known.
+- **"using this Software" probably means building on it.** Read against its sibling in §7 —
+  "distribute the Software or any of its parts as a part of a component, a library or a
+  developer's toolkit" — the pair addresses wrapping and shipping ComponentAce's engine. This
+  library never links it, never bundles it and redistributes no byte of it; it was informed by
+  studying the Software, which is what §69d(3) and §69e exist to permit.
+- **§307 BGB.** These are AGB. A blanket, perpetual ban on ever writing an independent
+  interoperable library is a candidate for _unangemessene Benachteiligung_, read against the
+  policy §69e embodies. German scrutiny of standard terms is not the US default.
+
+Note also that Personal §4 licenses the Software "for personal usage only" and prohibits usage by
+a company. This project and Aconiq are personal, unpaid and MIT-licensed, which fits. **If either
+ever becomes a company product or is used commercially, that clause is breached independently of
+§4's library ban, and this section must be revisited before that happens.**
+
+The clean resolution is written permission from ComponentAce. The Personal edition is free, the
+format is long-established, and this library competes with nothing they sell, so asking is cheap.
+Record the answer here when it is known.
 
 ## What must never be committed
 
 `testdata/` is gitignored except for an explicit filename allowlist in `.gitignore`. Never widen
-it with a glob — a glob could catch a customer file.
+it with a glob — a glob could catch a private fixture.
 
-The 20 customer fixtures derived from SoundPlan project files contain German street addresses
-and real project data. They are **irreplaceable**: not in git, not recoverable. Nothing may
-write to, move, rename or delete anything under `testdata/` or `<sdk>`; a test that needs to
-modify a fixture copies it into `t.TempDir()` first.
+The 20 private fixtures are real SoundPLAN project files, obtained lawfully and held with
+permission. They contain German street addresses and real project data, which makes them
+**personal data under the GDPR**, not merely confidential. Three rules follow and none of them is
+negotiable:
 
-Extracted BLOBs are customer payload and are written `0o600`.
+- They are never committed, never uploaded, never pasted into an issue, a CI log, a bug report or
+  a model context, and never leave the machine they are on. The allowlist in `.gitignore` is what
+  enforces the first of those; the rest is discipline.
+- Nothing may write to, move, rename or delete anything under `testdata/` or `<sdk>`. They are
+  **irreplaceable**: not in git, not recoverable. A test that needs to modify a fixture copies it
+  into `t.TempDir()` first.
+- Nothing anywhere in this repository may describe whose files they are or which projects they
+  came from. This document is public.
+
+They exist because parser correctness cannot be established against synthetic data alone — real
+files carry the shapes an inventor of test data does not think of. Where a finding they produce
+can be pinned by a committed synthetic fixture or a golden vector instead, prefer that: the
+long-term goal is that no private file is load-bearing for any claim this package makes.
+
+Extracted BLOBs are private project payload and are written `0o600`.
 
 ## Committed fixtures
 

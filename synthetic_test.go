@@ -15,7 +15,7 @@ import (
 
 // Synthetic .abs files.
 //
-// testdata/ holds real customer data and is not committed, so on a fresh clone
+// testdata/ holds real private project data and is not committed, so on a fresh clone
 // every fixture-backed test skips and the parser would go completely
 // unexercised. The builders below assemble valid .abs byte layouts in memory
 // instead, so the read path — page model, schema page, record layout, data

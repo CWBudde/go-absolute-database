@@ -38,7 +38,7 @@ import (
 // from testdata/Constraints.abs: CIdxDesc, CIdxNoCase and CIdxMulti differ from
 // CIdxOne in exactly one of them. Before that file existed, coveredColumnCount
 // was only ever seen as 1 and the two flag bytes read as a reserved field, so a
-// multi-column index -- which every indexed customer fixture has -- was refused.
+// multi-column index -- which every indexed private fixture has -- was refused.
 //
 // Only a single-covered-column, ascending, case-sensitive, int32-keyed index is
 // built by CREATE INDEX and kept in step on write: it is the only leaf entry
@@ -106,7 +106,7 @@ const (
 	// every record in the corpus; the second marks UNIQUE and the third
 	// PRIMARY, both as 0x00/0xFF booleans. Constraints.abs's CPk and CUnique
 	// isolate them: 00 00 FF for a primary key, 00 FF 00 for a unique index,
-	// both set at once for a customer fixture's "p", all zero for a plain one.
+	// both set at once for a private fixture's "p", all zero for a plain one.
 	indexRecordFlagsSize = 3
 
 	// indexColumnMaxIndexedSize is the int32 closing every covered-column

@@ -3,7 +3,7 @@
 # SCOPE — please read before trusting a green check:
 #
 #   testdata/ is gitignored on purpose. Almost every .abs fixture is real
-#   customer project data and is never committed. Every test that opens a
+#   private project data and is never committed. Every test that opens a
 #   fixture calls t.Skip() when the file is absent, so on a GitHub runner most
 #   of them are SKIPPED, not passed. What CI actually covers is the synthetic
 #   and unit tests: header/page parsing on hand-built buffers, schema and
@@ -11,7 +11,7 @@
 #   fuzz targets.
 #
 #   The exceptions are forty fixtures that are ours and are committed (see
-#   testdata/README.md: synthetic data, no customer content):
+#   testdata/README.md: synthetic data, no private data):
 #
 #     - the eight Employees-*.abs, one per encryption algorithm. CI therefore
 #       does exercise the full encrypted read path end to end -- page decryption
@@ -27,7 +27,7 @@
 #       and it does run on a runner.
 #     - the twelve MultiTable*.abs, the only fixtures holding more than one
 #       table. CI therefore also covers the table catalog, per-table page
-#       partitioning and the two allocation maps -- none of which any customer
+#       partitioning and the two allocation maps -- none of which any private
 #       fixture can exercise, since all 20 of them hold exactly one table. Ten
 #       of the twelve differ from a parent by one DROP TABLE, CREATE TABLE,
 #       CREATE INDEX or ALTER TABLE, or by one Compact Database, so
@@ -40,9 +40,9 @@
 #       pages, and it takes two geometries to show the step is not a constant.
 #     - Constraints.abs, twelve tables differing from a control by exactly one
 #       column constraint or index variation each. It is what makes the schema
-#       stream's tail decodable without a customer file.
+#       stream's tail decodable without a private fixture.
 #
-#   Everything else -- all 20 customer fixtures, and the byte-identical
+#   Everything else -- all 20 private fixtures, and the byte-identical
 #   comparison of decryption against a plaintext twin -- is validated only on a
 #   developer machine that has them. Run `just test` (or `just ci`) locally
 #   before merging anything that touches the parser. A green CI run means

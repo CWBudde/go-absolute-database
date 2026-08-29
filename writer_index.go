@@ -93,7 +93,7 @@ func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
 	// only matter if it has one. A tail that does not parse says nothing
 	// either way, so it is carried and only raised below, where an index makes
 	// it decisive -- refusing every unparsed tail here would newly refuse
-	// writes to the unindexed customer files that have always accepted them.
+	// writes to the unindexed private files that have always accepted them.
 	records, constraints, tailErr := w.tableSchemaTail()
 	if tailErr == nil {
 		err := refuseConstraints(constraints, w.r.table.Name())

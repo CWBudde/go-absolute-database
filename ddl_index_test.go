@@ -377,7 +377,7 @@ func TestIndexRefusals(t *testing.T) {
 
 	t.Run("CreateIndex on a table whose schema stream carries constraints", func(t *testing.T) {
 		// This used to be an ErrSchemaTailNotUnderstood refusal, and it covered
-		// every indexed customer fixture. Decoding the constraint array
+		// every indexed private fixture. Decoding the constraint array
 		// (ddl_constraint.go) retired it: RCFQ0011.abs carries six NOT NULL
 		// records and a PRIMARY KEY, and all of them now parse.
 		//
