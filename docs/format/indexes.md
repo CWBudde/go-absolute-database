@@ -65,7 +65,28 @@ whose leftmost leaf is empty, and the BLOB-page index, whose keys are BLOB pages
 owner nothing in the file records. Neither arises for a single-table file, where every index is
 returned because there is no other table it could belong to.
 
-## Capacity
+## Capacity and splitting
 
-A single-page leaf holds 367 entries at the measured key shape. No table in the corpus is close
-to a tree deep enough to have split.
+A single-page leaf has room for 367 entries at the measured key shape — `(4056 - 18) / 11` for
+the 5-byte key and 6-byte reference of an `Int32` user index. That is a computed ceiling, not an
+observed fill: **the engine splits well before a leaf is full.**
+
+Five indexes in the corpus are split trees, all of them depth 2:
+
+| File           | Root | Key size | Leaves | Entries | Fullest leaf |
+| -------------- | ---- | -------- | ------ | ------- | ------------ |
+| `RCFQ0011.abs` | 10   | 5        | 3      | 600     | 232          |
+| `RCON0011.abs` | 10   | 15       | 2      | 300     | 152          |
+| `RCON0011.abs` | 11   | 10       | 2      | 300     | 173          |
+| `RMPA0011.abs` | 10   | 5        | 3      | 600     | 232          |
+| `RMPA0011.abs` | 11   | 10       | 4      | 600     | 187          |
+
+`TestFindByPrimaryKeyRoundTrip` reads two of these, which is what exercises the internal-node
+entry stride and the descent. So **reading** a multi-level tree is covered by real files. What no
+file demonstrates is the engine **performing** a split — the before/after page pair that would
+show how it chooses a split point and rewrites the parent. Since the fullest observed leaf is 232
+of a possible 367, the split point is evidently not "leaf full", and nothing here reproduces the
+rule. That is why every write path refuses a multi-level tree.
+
+These five trees all live in customer fixtures, which are gitignored; a fresh clone and CI see
+none of them.

@@ -59,12 +59,12 @@ The ciphertext extent of an encrypted page is this same span.
 | 3     | `PageTypeFileHdr`   | Database header block (page 0); its payload is the Page Free Space map                                                        |
 | 4     | —                   | System file directory (page 2)                                                                                                |
 | 5     | —                   | Connection/lock table (page 3)                                                                                                |
-| 6     | —                   | Table catalog                                                                                                                 |
-| 7     | —                   | Per-table system page; role unidentified. Two occur in each table's page run, and the table's catalog entry names one of them |
+| 6     | `PageTypeTableList` | Table catalog                                                                                                                 |
+| 7     | `PageTypeSystem`    | Per-table system page; role unidentified. Two occur in each table's page run, and the table's catalog entry names one of them |
 | 8     | `PageTypeSchema`    | Column definitions (zlib-compressed internal file)                                                                            |
-| 9     | —                   | Table info — the per-table counters                                                                                           |
+| 9     | `PageTypeTableInfo` | Table info — the per-table counters                                                                                           |
 | 10    | `PageTypeData`      | Data page: occupancy bitmap plus fixed-size records                                                                           |
-| 11    | —                   | BLOB storage                                                                                                                  |
+| 11    | `PageTypeBlob`      | BLOB storage                                                                                                                  |
 | 12    | `PageTypeIndex`     | B-tree index page                                                                                                             |
 
 Only **data pages** record an owner in `ObjectID`. Schema, table info, index and BLOB pages

@@ -1,7 +1,7 @@
 # Phase 6: Encryption Support Implementation Plan
 
 > **Superseded — do not implement from this document.** Phase 6 was completed on
-> 2026-08-28; `PLAN.md` §"Encryption" is the current reference. This plan is kept for the
+> 2026-08-28; [`docs/format/encryption.md`](../format/encryption.md) is the current reference. This plan is kept for the
 > binary-format tables below, which are still accurate. Its _architecture_ paragraph is
 > not: the ABSP header is **not** encrypted, the IV is **0xFF** repeated rather than zero,
 > and DEC's `cmCTS` is an XOR-accumulated feedback mode that does not degenerate to CBC.

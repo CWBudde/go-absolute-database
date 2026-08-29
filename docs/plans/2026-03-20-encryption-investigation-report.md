@@ -4,8 +4,8 @@
 **Status:** Superseded — kept as the record of how the format was worked out.
 **Password used for all test files:** "Bla"
 
-> **Resolved.** Encryption was solved on 2026-08-28; `PLAN.md` §"Encryption" is the
-> current reference. This document is a snapshot of the investigation while it was still
+> **Resolved.** Encryption was solved on 2026-08-28;
+> [`docs/format/encryption.md`](../format/encryption.md) is the current reference. This document is a snapshot of the investigation while it was still
 > open, so its open questions and negative results are of historical interest only.
 >
 > Corrections to what is written below:
@@ -21,7 +21,9 @@
 >   page that was never encrypted.
 > - The recorded `ABSP.CRC32` mismatch was the 3676-byte value. `ABSP.CRC32` is
 >   `absCRC32` over the decrypted 4056-byte payload.
-> - Resolving go-dede's fixup symbols was never needed; see `PLAN.md` for what settled it.
+> - Resolving go-dede's fixup symbols was never needed; see
+>   [`docs/format/encryption.md`](../format/encryption.md) §"DEC's ciphers are not the published
+>   ciphers" for what settled it.
 
 ---
 

@@ -19,8 +19,11 @@ What the format still hides, and what this package therefore refuses rather than
 - **Multi-page BLOB chaining.** Every BLOB page in the corpus has `NextPageNo == -1`, so
   `readBlobChain` is guarded against cycles but has never run against real data.
 - **Several BLOBs on one page.** `ItemNo` is parsed and not used to select among them.
-- **A B-tree deep enough to have split.** No corpus table approaches the 367-entry single-page
-  leaf, so every write path refuses a multi-level tree.
+- **Splitting a B-tree leaf.** Multi-level trees themselves _are_ in the corpus and are read
+  correctly — five of them, all depth 2, see [`format/indexes.md`](format/indexes.md#capacity-and-splitting).
+  What no file shows is the engine performing the split: the fullest observed leaf holds 232 of a
+  possible 367, so the split point is not "leaf full", and the rule is unknown. Every write path
+  refuses a multi-level tree.
 - **A second PFS or EAM page.** The engine's `PfsPageNoForPageNo` says they recur; one PFS
   payload addresses 32 448 pages at 4096 bytes and the largest file in the corpus is 78.
 - **Page sizes other than 4096 and 2048.** The payload model is expressed in terms of
