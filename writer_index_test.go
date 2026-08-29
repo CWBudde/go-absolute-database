@@ -95,8 +95,8 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 		// The three refusals maintainableIndexColumn adds on top of the leaf
 		// shape, checked against hand-built records because no committed
 		// fixture reaches them: the private fixtures that carry these index
-		// shapes all declare constraints too, and refuseConstraints stops
-		// their writes first (see TestWriterRefusesAConstrainedTable).
+		// shapes all declare a key constraint too, and the constraint gate
+		// stops their writes first (see TestWriterRefusesAConstrainedTable).
 		for _, c := range []struct {
 			name string
 			rec  indexRecord
@@ -128,18 +128,22 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 }
 
 // TestWriterRefusesAConstrainedTable pins the gate that sits in front of index
-// maintenance: a table declaring any constraint refuses every write, because
-// nothing here checks a NOT NULL, a MINVALUE/MAXVALUE pair or a uniqueness
-// rule, and a write that ignores them leaves the file holding a row the engine
-// would have rejected.
+// maintenance: a table declaring a constraint this package does not check
+// refuses every write, because a write that ignores one leaves the file
+// holding a row the engine would have rejected.
+//
+// Which constraints those are has narrowed. NOT NULL and MINVALUE/MAXVALUE are
+// checked now (writer_constraint.go), so CNotNull and CMinMax accept writes
+// and are tested for what they reject in TestWriterChecksConstraints. A
+// PRIMARY KEY or UNIQUE clause still refuses, because its index is one
+// maintainableIndexColumn will not maintain and checking the constraint alone
+// would let a row through that the index no longer describes.
 //
 // Constraints.abs isolates one clause per table, so each case names exactly
 // which one stopped the write. CNone is the control: the same file, the same
-// writer, no constraint, and the write is not refused. Every constrained
-// private fixture lands here too -- which is most of them -- and that is the
-// intended outcome, not a side effect: before parseSchemaTail decoded the
-// constraint array these tables were refused only when they also carried an
-// index, and only because their tail did not parse.
+// writer, no constraint, and the write is not refused. CBoth is the case that
+// matters most -- it declares a NOT NULL and a UNIQUE -- because a checker
+// that recorded what it could and ignored the rest would let it through.
 func TestWriterRefusesAConstrainedTable(t *testing.T) {
 	for _, c := range []struct {
 		table string
@@ -147,10 +151,10 @@ func TestWriterRefusesAConstrainedTable(t *testing.T) {
 	}{
 		{"CNone", nil},
 		{"CDefault", nil},
-		{"CNotNull", ErrConstraintsNotEnforced},
+		{"CNotNull", nil},
+		{"CMinMax", nil},
 		{"CPk", ErrConstraintsNotEnforced},
 		{"CUnique", ErrConstraintsNotEnforced},
-		{"CMinMax", ErrConstraintsNotEnforced},
 		{"CBoth", ErrConstraintsNotEnforced},
 		{"CPkMulti", ErrConstraintsNotEnforced},
 	} {

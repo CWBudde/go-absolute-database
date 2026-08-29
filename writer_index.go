@@ -49,9 +49,10 @@ import (
 //     index enforcing a PRIMARY KEY or UNIQUE constraint, and a table whose
 //     schema tail does not parse at all (all ErrIndexNotMaintained). See
 //     maintainableIndexColumn for what each of those would get wrong;
-//   - a table declaring any constraint at all, indexed or not
-//     (ErrConstraintsNotEnforced), since no write here checks a NOT NULL, a
-//     MINVALUE/MAXVALUE pair or a uniqueness rule. See refuseConstraints.
+//   - a table declaring a PRIMARY KEY or UNIQUE constraint, indexed or not
+//     (ErrConstraintsNotEnforced). NOT NULL and MINVALUE/MAXVALUE are checked
+//     now (writer_constraint.go); a key is not, because checking it without
+//     being able to maintain the index that implements it would buy nothing.
 
 // maintainedIndex is one user index this writer keeps in step with the records:
 // which page its single leaf is, and which column it keys on.
@@ -96,10 +97,12 @@ func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
 	// writes to the unindexed private files that have always accepted them.
 	records, constraints, tailErr := w.tableSchemaTail()
 	if tailErr == nil {
-		err := refuseConstraints(constraints, w.r.table.Name())
+		checks, err := newConstraintChecks(constraints, w.r.Schema(), w.r.table.Name())
 		if err != nil {
 			return nil, err
 		}
+
+		w.checks = checks
 	}
 
 	ir, err := w.r.table.OpenIndex()
@@ -164,31 +167,6 @@ func (w *TableWriter) tableSchemaTail() ([]indexRecord, []constraintRecord, erro
 	return records, constraints, nil
 }
 
-// refuseConstraints refuses a write against a table that declares any
-// constraint, naming the first one so the caller learns which clause stopped it.
-//
-// Every kind in the array is refused, because none of them is checked anywhere
-// in this package: a PRIMARY KEY or UNIQUE clause needs a duplicate check, a
-// NOT NULL clause needs the record's null flags read, and a CHECK record needs
-// its MINVALUE/MAXVALUE pair compared against the encoded value. Until a write
-// does that work, a constrained table is one this package can only leave alone.
-//
-// Before parseSchemaTail decoded the constraint array, such a table was refused
-// by accident -- its tail did not parse, and tableSchemaTail turned that into
-// ErrIndexNotMaintained -- but only when the table also carried an index, since
-// nothing read the tail otherwise. Decoding the array turned that accident into
-// a hole; this is the stated rule that replaces it.
-func refuseConstraints(constraints []constraintRecord, table string) error {
-	if len(constraints) == 0 {
-		return nil
-	}
-
-	first := constraints[0]
-
-	return fmt.Errorf("%w: table %q declares %d, starting with the %s constraint %q",
-		ErrConstraintsNotEnforced, table, len(constraints), first.kind, first.name)
-}
-
 // maintainableIndexColumn returns the one column an index keys on, refusing
 // every index shape whose leaf this package cannot reproduce.
 //
@@ -200,10 +178,12 @@ func refuseConstraints(constraints []constraintRecord, table string) error {
 //   - a DESC column sorts the other way, and compareInt32Keys does not;
 //   - a NOCASE column compares case-folded, which no key this package builds
 //     does;
-//   - a UNIQUE or PRIMARY index rejects a duplicate key, and nothing here
-//     checks for one. Letting an insert through would leave the file holding a
-//     duplicate under a constraint that says it cannot, which reads back fine
-//     and is not what the engine would have written.
+//   - a UNIQUE or PRIMARY index rejects a duplicate key. A duplicate scan
+//     would be easy enough, but no fixture shows the engine inserting into
+//     such an index -- all four Writes-idx* files carry a plain one -- so the
+//     leaf splice would be the only write in this package with no byte
+//     identity behind it. The constraint and its index have to lift together;
+//     see writer_constraint.go.
 func maintainableIndexColumn(rec indexRecord) (indexColumn, error) {
 	if rec.unique || rec.primary {
 		return indexColumn{}, fmt.Errorf("%w: index %q enforces a PRIMARY KEY or UNIQUE constraint this package does not check",
@@ -537,6 +517,11 @@ func (w *TableWriter) storeRecordReindexing(id RecordID, buf *pageWriteBuf, star
 	}
 
 	indexes, err := w.maintainedIndexes()
+	if err != nil {
+		return err
+	}
+
+	err = w.checkConstraints(rec)
 	if err != nil {
 		return err
 	}

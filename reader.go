@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -599,13 +600,22 @@ func (rec Record) intValue(col int) int64 {
 		return 0
 	}
 
+	return decodeIntegerLE(raw, signed)
+}
+
+// decodeIntegerLE reads a little-endian integer of raw's own width, sign
+// extending it when signed. It is shared with the constraint checker, which
+// decodes a CHECK record's bounds out of bytes the engine stored exactly the
+// way it stores the column they bound.
+func decodeIntegerLE(raw []byte, signed bool) int64 {
 	var v uint64
-	for i := width - 1; i >= 0; i-- {
+
+	for i := range slices.Backward(raw) {
 		v = v<<8 | uint64(raw[i])
 	}
 
-	bits := uint(width) * 8
-	if signed && width < 8 && v&(1<<(bits-1)) != 0 {
+	bits := uint(len(raw)) * 8
+	if signed && len(raw) < 8 && v&(1<<(bits-1)) != 0 {
 		v |= ^uint64(0) << bits
 	}
 

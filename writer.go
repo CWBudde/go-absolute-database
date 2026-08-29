@@ -56,15 +56,17 @@ var (
 	// definitions cannot be read are all refused here.
 	ErrIndexNotMaintained = errors.New("absdb: table has an index this package cannot maintain")
 
-	// ErrConstraintsNotEnforced reports a write against a table whose schema
-	// declares constraints, none of which this package checks: nothing here
-	// rejects a NULL in a NOT NULL column, a value outside a MINVALUE/MAXVALUE
-	// pair, or a duplicate under a PRIMARY KEY or UNIQUE clause. Letting the
-	// write through would leave the file holding a row the engine would have
-	// refused, which reads back fine here and is not what the engine wrote --
-	// the same reason maintainableIndexColumn refuses an index it would order
-	// differently. Refusing is the only outcome that cannot corrupt the
-	// table's own rules.
+	// ErrConstraintsNotEnforced reports a write against a table declaring a
+	// constraint this package does not check. NOT NULL and MINVALUE/MAXVALUE
+	// are checked (writer_constraint.go, ErrNotNullViolated and
+	// ErrCheckViolated); a PRIMARY KEY or UNIQUE clause is not, and neither is
+	// a record whose covered column or bound type cannot be resolved.
+	//
+	// Letting such a write through would leave the file holding a row the
+	// engine would have refused, which reads back fine here and is not what
+	// the engine wrote -- the same reason maintainableIndexColumn refuses an
+	// index it would order differently. Refusing is the only outcome that
+	// cannot corrupt the table's own rules.
 	ErrConstraintsNotEnforced = errors.New("absdb: table carries constraints this package does not check")
 
 	// ErrBlobReferenceLost reports an update that would overwrite a column
@@ -239,6 +241,12 @@ type TableWriter struct {
 	indexes         []maintainedIndex
 	indexesResolved bool
 	indexesErr      error
+	// checks are the table's constraint records reduced to what every write
+	// has to test. resolveIndexes fills them in from the same schema tail it
+	// reads for the indexes, so they are resolved exactly when the indexes are
+	// -- a table whose tail does not parse gets the zero value, which checks
+	// nothing, and is the behaviour it had before the checks existed.
+	checks constraintChecks
 	// touched counts records modified in any way — inserted, updated or
 	// deleted. The engine's change counter advances by the number of records a
 	// statement affected, not by one per transaction: a two-row UPDATE moves it
@@ -347,8 +355,14 @@ func (w *TableWriter) Insert(values []any) (RecordID, error) {
 		return RecordID{}, err
 	}
 
-	// Both refusals happen before the record is written, so an insert that
-	// cannot be indexed leaves no row behind that no index describes.
+	// All three refusals happen before the record is written, so an insert
+	// that cannot be indexed leaves no row behind that no index describes, and
+	// one that breaks a constraint leaves none at all.
+	err = w.checkConstraints(rec)
+	if err != nil {
+		return RecordID{}, err
+	}
+
 	err = w.indexRoom(indexes)
 	if err != nil {
 		return RecordID{}, err

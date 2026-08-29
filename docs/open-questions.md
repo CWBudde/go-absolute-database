@@ -59,6 +59,18 @@ What the format still hides, and what this package therefore refuses rather than
   carrying a fraction was rejected by the parser.
 - **BZIP and PPM BLOB compression** are named by the format and unimplemented; no fixture uses
   either.
+- **What the engine does with a row a constraint forbids.** A rejected write leaves no file
+  behind, so no fixture can show it, and the two checks in `writer_constraint.go` are therefore
+  held to the narrower standard of never passing a row the constraint's own bytes forbid. Two
+  rules are assumed rather than observed, both of which can only make this package _accept_ a
+  row: a `NULL` passes a `CHECK` constraint (what SQL says, and what would otherwise make a
+  nullable `MINVALUE` column unwritable), and a bound is inclusive, so `MINVALUE 0` admits 0.
+  A parameterised insert against the Delphi engine would settle both.
+- **Whether the engine writes anything else when inserting into a `UNIQUE` or `PRIMARY` index.**
+  All four `Writes-idx*` fixtures carry a plain index, so the leaf splice for a key-enforcing one
+  has no byte identity behind it. This is why a `PRIMARY KEY` or `UNIQUE` constraint still
+  refuses every write (`ErrConstraintsNotEnforced`) even though the duplicate scan it would need
+  is straightforward: the constraint and the index that implements it have to lift together.
 
 ## Deliberate divergences
 
