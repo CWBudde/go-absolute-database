@@ -490,7 +490,7 @@ func TestCompactDatabaseRefusals(t *testing.T) {
 			want:    ErrUnsupportedColumnType,
 		},
 		{
-			name:    "a table carrying constraint records",
+			name:    "a table carrying a key constraint",
 			fixture: "Constraints.abs",
 			want:    ErrConstraintsNotRebuilt,
 		},
@@ -551,6 +551,12 @@ func TestCompactDatabaseRefusesAnExistingDestination(t *testing.T) {
 // a DEFAULT lives in the column definition, and serializeColumnDef writes the
 // absent marker unconditionally, so rebuilding that table would drop the
 // clause instead of failing on it.
+//
+// CNotNull and CMinMax are the two that stopped refusing once CreateTable
+// learnt to write the column-shaped records. CBoth still refuses, and it is the
+// case worth keeping an eye on: it declares a NOT NULL the rebuild can write
+// beside a UNIQUE it cannot, so a check that stopped at the first record it
+// understood would let it through half rebuilt.
 func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 	db := openTestFile(t, "Constraints.abs")
 
@@ -561,10 +567,10 @@ func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 		{"CNone", nil},
 		{"CIdxOne", nil},
 		{"CDefault", ErrColumnDefault},
-		{"CNotNull", ErrConstraintsNotRebuilt},
+		{"CNotNull", nil},
+		{"CMinMax", nil},
 		{"CPk", ErrConstraintsNotRebuilt},
 		{"CUnique", ErrConstraintsNotRebuilt},
-		{"CMinMax", ErrConstraintsNotRebuilt},
 		{"CBoth", ErrConstraintsNotRebuilt},
 		{"CPkMulti", ErrConstraintsNotRebuilt},
 		{"CIdxDesc", ErrIndexNotMaintained},

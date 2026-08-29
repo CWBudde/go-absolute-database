@@ -98,11 +98,13 @@ const (
 	// absent marker.
 	columnDefDefaultSize = 2
 
-	// schemaTrailerSize is the 16 bytes following the column definitions:
-	// int32 indexCount (0 for a fresh table), a still-unidentified int32
-	// (FINDING 2; 0 alongside indexCount 0), and the 8-byte pair
-	// systemIndexRoots reads.
-	schemaTrailerSize = 16
+	// schemaTrailerSize is the 8 bytes closing the schema stream: the
+	// root/blobroot pair systemIndexRoots reads. What FINDING 2 of the CREATE
+	// TABLE analysis recorded as a "still-unidentified int32" sitting between
+	// indexCount and that pair is the constraint array's own count, which
+	// parseSchemaTail decoded later; a fresh table has zero of both, which is
+	// why one zero int32 was indistinguishable from the other.
+	schemaTrailerSize = 8
 )
 
 // knownColumnTypes is the set of (BaseType, FieldType) combinations CREATE
@@ -112,10 +114,15 @@ var knownColumnTypes = map[BaseFieldType]FieldType{
 	BftVarchar: FieldString,
 }
 
-// CreateTable adds a new, empty table to the database: no rows, no index and
-// no BLOB column. Columns are given in name/type order; any ID or Position the
-// caller sets on them is ignored, because the engine assigns both itself (see
-// the file comment).
+// CreateTable adds a new, empty table to the database: no rows, no index, no
+// constraint and no BLOB column. Columns are given in name/type order; any ID
+// or Position the caller sets on them is ignored, because the engine assigns
+// both itself (see the file comment).
+//
+// Constraints are not part of the exported signature because a caller has no
+// way to describe one: Column's nullability is unexported, and a MINVALUE pair
+// has no home on it at all. What does carry them is the internal createTable,
+// which the compaction rebuild uses to hand a table's own records back to it.
 //
 // It fails with ErrReadOnly unless the file was opened with OpenForWrite, and
 // refuses rather than guess when the table already exists, when the catalog
@@ -124,6 +131,19 @@ var knownColumnTypes = map[BaseFieldType]FieldType{
 // enough free pages is no longer among those refusals: it grows by whole
 // extents to make room, the way the engine does (ddl_grow.go).
 func (db *File) CreateTable(name string, columns []Column) error {
+	return db.createTable(name, columns, nil)
+}
+
+// createTable is CreateTable with the constraint records a rebuild carries
+// over. They are written into the new table's schema stream rather than
+// spliced in afterwards, so the table declares them from the moment it exists
+// and the whole creation stays one transaction, the way the engine's own
+// CREATE TABLE ... NOT NULL is.
+//
+// Only the column-shaped kinds can be passed: a PRIMARY KEY or UNIQUE record
+// names an index this function does not create. assignConstraintIDs enforces
+// that, and planCompactTable refuses such a table long before it gets here.
+func (db *File) createTable(name string, columns []Column, constraints []constraintRecord) error {
 	if !db.writable {
 		return ErrReadOnly
 	}
@@ -137,11 +157,22 @@ func (db *File) CreateTable(name string, columns []Column) error {
 	}
 
 	// Object ids: the table takes the next one, then each column takes the
-	// next after that, in order.
+	// next after that, then each constraint record takes the next after those
+	// -- the order Constraints.abs's ids run in.
 	tableID := int(db.lastObjectID) + 1
 	assigned := assignColumnIDs(tableID, columns)
 
 	colDefs, err := serializeColumnDefs(assigned)
+	if err != nil {
+		return err
+	}
+
+	records, err := assignConstraintIDs(name, tableID+len(assigned)+1, assigned, constraints)
+	if err != nil {
+		return err
+	}
+
+	constraintArray, err := serializeConstraintArray(records)
 	if err != nil {
 		return err
 	}
@@ -158,7 +189,7 @@ func (db *File) CreateTable(name string, columns []Column) error {
 		return err
 	}
 
-	if err := db.writeTableInternalFiles(w, pages, colDefs, len(assigned)); err != nil {
+	if err := db.writeTableInternalFiles(w, pages, colDefs, constraintArray, len(assigned)); err != nil {
 		return err
 	}
 
@@ -178,7 +209,7 @@ func (db *File) CreateTable(name string, columns []Column) error {
 		return err
 	}
 
-	if err := db.setLastObjectID(int32(tableID + len(assigned))); err != nil { //nolint:gosec // small object ids
+	if err := db.setLastObjectID(int32(tableID + len(assigned) + len(records))); err != nil { //nolint:gosec // small object ids
 		return err
 	}
 
@@ -224,6 +255,71 @@ func assignColumnIDs(tableID int, columns []Column) []Column {
 	}
 
 	return assigned
+}
+
+// assignConstraintIDs stamps a rebuild's constraint records with the object ids
+// and owners they take in their new database: one id each starting at firstID,
+// which is the id after the last column's, and an ownerObjectID naming the
+// column the record covers.
+//
+// Everything else is carried over unchanged, the record's own name included.
+// Regenerating the name from a "$C_NotNull$<table>$<column>" template would
+// reproduce every name in the corpus and would still be a guess about a name
+// the engine chose; copying it cannot be wrong.
+//
+// A record this function cannot place is refused rather than dropped: a key
+// constraint (whose owner is an index CreateTable does not build), one naming
+// another table, one covering no column or several, and one naming a column
+// the new table does not have.
+func assignConstraintIDs(
+	table string, firstID int, columns []Column, constraints []constraintRecord,
+) ([]constraintRecord, error) {
+	records := make([]constraintRecord, 0, len(constraints))
+
+	for _, rec := range constraints {
+		if rec.kind != constraintNotNull && rec.kind != constraintCheck {
+			return nil, fmt.Errorf("%w: the %s constraint %q needs an index CREATE TABLE does not build",
+				ErrConstraintsNotRebuilt, rec.kind, rec.name)
+		}
+
+		if !strings.EqualFold(rec.table, table) {
+			return nil, fmt.Errorf("%w: the constraint %q names table %q, not %q",
+				ErrConstraintsNotRebuilt, rec.name, rec.table, table)
+		}
+
+		if len(rec.columns) != 1 {
+			return nil, fmt.Errorf("%w: the constraint %q covers %d columns",
+				ErrConstraintsNotRebuilt, rec.name, len(rec.columns))
+		}
+
+		owner, ok := columnByName(columns, rec.columns[0].name)
+		if !ok {
+			return nil, fmt.Errorf("%w: the constraint %q covers %q, which is not a column of %q",
+				ErrConstraintsNotRebuilt, rec.name, rec.columns[0].name, table)
+		}
+
+		rec.objectID = uint32(firstID + len(records)) //nolint:gosec // small object ids
+		rec.ownerID = owner.ID
+		rec.start, rec.end = 0, 0
+
+		records = append(records, rec)
+	}
+
+	return records, nil
+}
+
+// columnByName finds a column by name, case-insensitively like every other
+// name lookup here. It takes the slice rather than a TableSchema because the
+// columns it searches are the ones assignColumnIDs has just stamped, which no
+// schema holds yet.
+func columnByName(columns []Column, name string) (Column, bool) {
+	for _, c := range columns {
+		if strings.EqualFold(c.Name, name) {
+			return c, true
+		}
+	}
+
+	return Column{}, false
 }
 
 // openCatalogForAppend buffers the table catalog page and dry-runs the append
@@ -332,7 +428,9 @@ func (db *File) allocateTablePages(w *pageEdit) (newTablePages, error) {
 // writeTableInternalFiles writes the content of every one of CreateTable's new
 // pages: the all-zero system file, the empty B-tree index root, the
 // column-definition file, and the counters file.
-func (db *File) writeTableInternalFiles(w *pageEdit, pages newTablePages, colDefs []byte, columnCount int) error {
+func (db *File) writeTableInternalFiles(
+	w *pageEdit, pages newTablePages, colDefs, constraints []byte, columnCount int,
+) error {
 	if err := db.writeInternalFilePages(w, pages.system[0], buildSystemInternalFile()); err != nil {
 		return err
 	}
@@ -341,7 +439,7 @@ func (db *File) writeTableInternalFiles(w *pageEdit, pages newTablePages, colDef
 		return err
 	}
 
-	schemaFile, err := compressInternalFile(buildSchemaFile(colDefs, pages.index), 1)
+	schemaFile, err := compressInternalFile(buildSchemaFile(colDefs, constraints, pages.index), 1)
 	if err != nil {
 		return err
 	}
@@ -415,26 +513,27 @@ func buildTableInfoFile(columnCount int) []byte {
 }
 
 // buildSchemaFile assembles the column-definition internal file: columnCount,
-// the column definitions themselves, an empty index-definition array (a
-// freshly created table has none), and the trailer systemIndexRoots reads.
+// the column definitions themselves, an empty index-definition array (a freshly
+// created table has none), the constraint array, and the trailer
+// systemIndexRoots reads.
 //
-// FINDING 2 of the CREATE TABLE analysis: the stream continues past the
-// columns with int32 indexCount, indexCount index records, one further
-// unidentified int32, then the two trailing page numbers. Only indexCount=0
-// is understood well enough to write, which is what a fresh table needs.
-func buildSchemaFile(colDefs []byte, recordIndexRoot int) []byte {
+// A fresh table's index array is empty because CREATE TABLE never creates one:
+// the primary-key index a constrained table would need is the reason a key
+// constraint is still refused. The constraint array is not: constraints comes
+// in already serialized, so a table created with a NOT NULL or a
+// MINVALUE/MAXVALUE pair declares it from the moment it exists, rather than
+// having it spliced in afterwards as a second transaction the engine never
+// performs.
+func buildSchemaFile(colDefs, constraints []byte, recordIndexRoot int) []byte {
 	// colDefs already opens with its own columnCount int32, written by
 	// serializeColumnDefs, so it is copied in as-is.
-	out := make([]byte, len(colDefs)+schemaTrailerSize)
-	copy(out, colDefs)
+	out := make([]byte, 0, len(colDefs)+4+len(constraints)+schemaTrailerSize)
+	out = append(out, colDefs...)
+	out = binary.LittleEndian.AppendUint32(out, 0) // indexCount
+	out = append(out, constraints...)
+	out = binary.LittleEndian.AppendUint32(out, uint32(int32(recordIndexRoot))) //nolint:gosec // page number
 
-	tail := out[len(colDefs):]
-	// tail[0:4] indexCount = 0, tail[4:8] the unidentified field = 0: both
-	// already zero from make().
-	binary.LittleEndian.PutUint32(tail[8:12], uint32(int32(recordIndexRoot))) //nolint:gosec // page number
-	binary.LittleEndian.PutUint32(tail[12:16], noPageNo)                      // blobIndexRoot: no BLOB column supported yet
-
-	return out
+	return binary.LittleEndian.AppendUint32(out, noPageNo) // blobIndexRoot: no BLOB column supported yet
 }
 
 // serializeColumnDefs builds the columnCount-prefixed run of column

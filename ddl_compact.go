@@ -88,20 +88,22 @@ import (
 // the key material), a column type CREATE TABLE has no corpus evidence for
 // (ErrUnsupportedColumnType), a column carrying a DEFAULT clause, which the
 // serializer cannot write back (ErrColumnDefault), a schema tail that does not
-// parse (ErrSchemaTailNotUnderstood), constraint records, which a re-created
-// table would lose (ErrConstraintsNotRebuilt), and an index that is not the plain,
+// parse (ErrSchemaTailNotUnderstood), a PRIMARY KEY or UNIQUE constraint record,
+// whose index a re-created table would not have (ErrConstraintsNotRebuilt), and
+// an index that is not the plain,
 // ascending, case-sensitive, single-column Int32 index CreateIndex builds
 // (ErrIndexNotMaintained, ErrMultiColumnIndex or ErrUnsupportedIndexColumn).
 // Losing an index is not an acceptable outcome of a compaction, so a
 // string-keyed index -- which CreateIndex cannot build -- refuses the whole
 // operation.
 
-// ErrConstraintsNotRebuilt reports a compaction of a table carrying constraint
-// records. A table this package re-creates is built by CreateTable, whose
-// schema stream carries an empty constraint array, so compacting such a table
-// would quietly return a database that no longer enforces its NOT NULL, PRIMARY
-// KEY, UNIQUE or MINVALUE/MAXVALUE rules. Refusing is the only outcome that
-// cannot lose them.
+// ErrConstraintsNotRebuilt reports a compaction of a table carrying a
+// constraint record the rebuild cannot write back. CreateTable writes the
+// column-shaped kinds -- NOT NULL and MINVALUE/MAXVALUE -- into the new table's
+// schema stream, so those no longer refuse. A PRIMARY KEY or UNIQUE record
+// still does: its ownerObjectID names the index implementing it, and nothing
+// here builds a key-enforcing index. Compacting such a table would quietly
+// return a database that no longer enforces its own key.
 var ErrConstraintsNotRebuilt = errors.New("absdb: table carries constraint records a rebuild would lose")
 
 // compactIndex is one index CompactDatabase re-creates: its name and the single
@@ -113,10 +115,16 @@ type compactIndex struct {
 
 // compactTable is one table's whole definition, which is everything CreateTable
 // and CreateIndex need to rebuild it in an empty database.
+//
+// constraints are carried as parsed records rather than reduced to something
+// smaller, because a rebuild has to reproduce a record's name and its bounds as
+// well as which column it covers; only the object ids are reassigned, by
+// assignConstraintIDs.
 type compactTable struct {
-	name    string
-	columns []Column
-	indexes []compactIndex
+	name        string
+	columns     []Column
+	indexes     []compactIndex
+	constraints []constraintRecord
 }
 
 // CompactDatabase writes a compacted copy of the database at srcPath to
@@ -303,8 +311,8 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 		return compactTable{}, err
 	}
 
-	if len(constraints) > 0 {
-		return compactTable{}, fmt.Errorf("%w: %d of them", ErrConstraintsNotRebuilt, len(constraints))
+	if err := planCompactConstraints(schema, constraints); err != nil {
+		return compactTable{}, err
 	}
 
 	indexes, err := planCompactIndexes(schema, records)
@@ -312,7 +320,34 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 		return compactTable{}, err
 	}
 
-	return compactTable{name: t.Name(), columns: schema.Columns, indexes: indexes}, nil
+	return compactTable{
+		name: t.Name(), columns: schema.Columns, indexes: indexes, constraints: constraints,
+	}, nil
+}
+
+// planCompactConstraints checks every constraint record against what
+// CreateTable can write back. It is deliberately the same set of refusals
+// assignConstraintIDs makes, made here so that a table the rebuild would choke
+// on is refused before the destination file exists -- the property every other
+// check in this file has.
+func planCompactConstraints(schema *TableSchema, constraints []constraintRecord) error {
+	for _, rec := range constraints {
+		if rec.kind != constraintNotNull && rec.kind != constraintCheck {
+			return fmt.Errorf("%w: the %s constraint %q is backed by an index this package does not build",
+				ErrConstraintsNotRebuilt, rec.kind, rec.name)
+		}
+
+		if len(rec.columns) != 1 {
+			return fmt.Errorf("%w: the constraint %q covers %d columns",
+				ErrConstraintsNotRebuilt, rec.name, len(rec.columns))
+		}
+
+		if _, err := findColumnIndex(schema, rec.columns[0].name); err != nil {
+			return fmt.Errorf("%w: the constraint %q: %w", ErrConstraintsNotRebuilt, rec.name, err)
+		}
+	}
+
+	return nil
 }
 
 // schemaTailArrays is parseSchemaTail reduced to the two record arrays a
@@ -368,7 +403,7 @@ func planCompactIndexes(schema *TableSchema, records []indexRecord) ([]compactIn
 // comment.
 func rebuildInto(src, dst *File, plan []compactTable) error {
 	for _, tbl := range plan {
-		if err := dst.CreateTable(tbl.name, tbl.columns); err != nil {
+		if err := dst.createTable(tbl.name, tbl.columns, tbl.constraints); err != nil {
 			return err
 		}
 
