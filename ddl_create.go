@@ -384,16 +384,11 @@ func (db *File) writeIndexRoot(w *pageEdit, pageNo int) error {
 // mirroring it. decompressInternalFile does not read that field for
 // algorithm 0, so the engine evidently does not populate it here the way it
 // does for the catalog's own internal file.
+//
+// The database's own connection table (ddl_database.go) has exactly the same
+// shape, which is why buildZeroInternalFile is shared rather than duplicated.
 func buildSystemInternalFile() []byte {
-	payload := make([]byte, systemInternalFileSize)
-
-	out := make([]byte, internalFileHeaderSize+len(payload))
-	out[0] = internalFileHeaderSize
-	binary.LittleEndian.PutUint32(out[1:5], uint32(len(payload))) //nolint:gosec // bounded by systemInternalFileSize
-	// out[5:9] (decompressedSize) and out[9] (algorithm 0) are left at zero.
-	copy(out[internalFileHeaderSize:], payload)
-
-	return out
+	return buildZeroInternalFile(systemInternalFileSize)
 }
 
 // buildTableInfoFile builds the 28-byte counters file tableInfoOffsets

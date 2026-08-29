@@ -118,11 +118,11 @@ var (
 // two system internal files at types 4 and 5, which every fixture carries
 // exactly once and which no observed write modifies.
 var databasePageTypes = map[uint16]bool{
-	PageTypeFileHdr:   true,
-	PageTypeSystemDir: true,
-	4:                 true,
-	5:                 true,
-	PageTypeTableList: true,
+	PageTypeFileHdr:         true,
+	PageTypeSystemDir:       true,
+	pageTypeSystemFileDir:   true,
+	pageTypeConnectionTable: true,
+	PageTypeTableList:       true,
 }
 
 // DropTable removes a table and every page it owns from the database.
