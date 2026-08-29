@@ -30,16 +30,16 @@ All eight hold the identical database and differ only in the cipher:
 | Index    | `IdxId` on `Id`                                                                         |
 | Origin   | Created 2026-08-28 with the ComponentAce Absolute Database Manager                      |
 
-| File                         | `TABSCryptoAlgorithm` | Cipher                                        |
-| ---------------------------- | --------------------- | --------------------------------------------- |
-| `Employees-Rijndael_128.abs` | 0                     | AES-128 (DEC's schedule coincides with AES)   |
-| `Employees-Rijndael_256.abs` | 1                     | DEC's Rijndael — **not** AES-256, see PLAN.md |
-| `Employees-DES_Single.abs`   | 2                     | DES                                           |
-| `Employees-DES_Triple.abs`   | 3                     | DEC's `TCipher_3TDES`, 24-byte block          |
-| `Employees-Blowfish.abs`     | 4                     | Blowfish (`golang.org/x/crypto/blowfish`)     |
-| `Employees-Twofish_128.abs`  | 5                     | DEC's Twofish variant                         |
-| `Employees-Twofish_256.abs`  | 6                     | DEC's Twofish variant                         |
-| `Employees-Square.abs`       | 7                     | Square                                        |
+| File                         | `TABSCryptoAlgorithm` | Cipher                                                          |
+| ---------------------------- | --------------------- | --------------------------------------------------------------- |
+| `Employees-Rijndael_128.abs` | 0                     | AES-128 (DEC's schedule coincides with AES)                     |
+| `Employees-Rijndael_256.abs` | 1                     | DEC's Rijndael — **not** AES-256, see docs/format/encryption.md |
+| `Employees-DES_Single.abs`   | 2                     | DES                                                             |
+| `Employees-DES_Triple.abs`   | 3                     | DEC's `TCipher_3TDES`, 24-byte block                            |
+| `Employees-Blowfish.abs`     | 4                     | Blowfish (`golang.org/x/crypto/blowfish`)                       |
+| `Employees-Twofish_128.abs`  | 5                     | DEC's Twofish variant                                           |
+| `Employees-Twofish_256.abs`  | 6                     | DEC's Twofish variant                                           |
+| `Employees-Square.abs`       | 7                     | Square                                                          |
 
 They contain no customer data — the schema and all three rows are invented — and no
 vendor material. This was checked rather than assumed: scanning both the ciphertext and
@@ -159,8 +159,8 @@ DBManager they show that the engine implements `ALTER TABLE` as `CREATE TABLE <t
 copy rows + rename + `DROP TABLE`, not as an in-place edit — four transactions, three
 catalog writes, new object ids, six pages allocated and six freed. This package splices in
 place instead, because matching the engine needs six free pages and `MultiTable.abs` is the
-only file in the corpus that has them. See PLAN.md's "What `ALTER TABLE` does instead of
-what the engine does"; `TestAlterTableMatchesEngineSemantically` and
+only file in the corpus that has them. See docs/writing.md's
+"`ALTER TABLE` — a deliberate divergence"; `TestAlterTableMatchesEngineSemantically` and
 `TestEngineAlterTableRebuildsTheTable` are what these two fixtures pin.
 
 `MultiTable-create.abs` earns its place twice over. Besides being the base of the
@@ -199,7 +199,7 @@ returned **six rows for a two-row table** — four of them other tables' bytes d
 through Alpha's schema — with no error. They also exposed a bug in the _write_ path that
 the `Writes*` fixtures structurally could not: the table info counters were read at
 fixed offsets that are correct only for a four-column table, and every write fixture has
-four columns. See PLAN.md, Phase 7.
+four columns. See docs/writing.md.
 
 `MultiTable-drop.abs` is the same size as its parent and differs by 45 bytes; the other
 drops differ by 61, 34 and 29. They record that `DROP TABLE` tombstones the dropped
@@ -207,7 +207,7 @@ table's pages (`ABSP` `State` = `0x7FFFFFFF`) rather than erasing them, and that
 compacts the catalog while leaving the last entry duplicated at the end — so a parser that
 ignores the catalog's length field reports the surviving table twice. Between them they
 also pin the two allocation maps: the Page Free Space bitmap on page 0 and the Extent
-Allocation Map on page 1. See PLAN.md, Phase 8.
+Allocation Map on page 1. See docs/format/pages.md.
 
 They contain no customer data and no vendor material, checked the same way as the other
 committed fixtures: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the three

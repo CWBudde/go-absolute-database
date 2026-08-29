@@ -945,7 +945,8 @@ func TestCreateThenDropTableRestoresTheFile(t *testing.T) {
 	exclude(eamPageNo*pageSize+pageStateOffset, 4)
 
 	// The EAM payload byte covering extent 3 is the concrete effect of that
-	// same asymmetry: it goes from "free" to "partial" and, per PLAN.md, an
+	// same asymmetry: it goes from "free" to "partial" and, per
+	// docs/format/pages.md, an
 	// extent the map calls partial never downgrades again, so it stays
 	// partial rather than returning to free.
 	exclude(eamPageNo*pageSize+pageDataOffset, 1)

@@ -81,7 +81,7 @@ var (
 
 // The bookkeeping an insert or a delete has to keep in step, established by
 // diffing vendor-produced files that differ by exactly one SQL statement (see
-// PLAN.md, Phase 7). Besides the record and its occupancy bit, the engine
+// docs/writing.md). Besides the record and its occupancy bit, the engine
 // updates, on every write:
 //
 //   - the record count of the affected data page, held in its entry of the

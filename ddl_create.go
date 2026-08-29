@@ -15,7 +15,7 @@ import (
 // internal/zlib1.Compress.
 //
 // What CREATE TABLE Delta (X, Y) writes, measured against MultiTable.abs (see
-// PLAN.md Phase 8 and the analysis this file was built from):
+// docs/writing.md and the analysis this file was built from):
 //
 //   - allocates five pages and no data page -- a data page arrives with the
 //     first insert: two chained type-7 pages for a 6000-byte all-zero
@@ -34,12 +34,12 @@ import (
 //   - moves LastUsedPageNo, LastObjectID and the State counters the pages and
 //     the header carry.
 //
-// Object ids are handed out one per table and one per column: PLAN.md records
+// Object ids are handed out one per table and one per column: docs/format/pages.md records
 // Delta's X and Y taking 13 and 14 after Delta itself took 12, which is what
 // moves LastObjectID from 11 to 14 -- one more than the column count, because
 // the table itself takes one too.
 //
-// Pages are allocated lowest free page number first: PLAN.md records a table
+// Pages are allocated lowest free page number first: docs/format/pages.md records a table
 // created after a drop taking the freed pages before any higher one.
 //
 // A newly allocated page's ABSP State is seeded by the engine with an
