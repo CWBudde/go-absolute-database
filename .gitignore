@@ -95,6 +95,13 @@ testdata/*
 !testdata/Keys-uniqnull.abs
 !testdata/Auto.abs
 !testdata/Auto-ins.abs
+!testdata/Auto-insexp.abs
+!testdata/Auto-insnext.abs
+!testdata/Auto-inslow.abs
+!testdata/Auto-del.abs
+!testdata/Auto-delins.abs
+!testdata/Auto-upd.abs
+!testdata/Auto-updcompact.abs
 !testdata/README.md
 # Safety net only, not a location. The ComponentAce SDK is not redistributable
 # and lives OUTSIDE this repository -- by convention ../absolute-database-sdk/.

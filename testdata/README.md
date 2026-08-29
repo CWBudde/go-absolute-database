@@ -10,14 +10,14 @@ project files — run `just test` locally for that.
 
 ## The committed fixtures
 
-Eight sets are committed, fifty-three files in all: the eight `Employees-*.abs` files, one per
+Eight sets are committed, sixty files in all: the eight `Employees-*.abs` files, one per
 encryption algorithm, the fourteen `Writes*.abs` files that pin the write path, the twelve
 `MultiTable*.abs` files that pin the table catalog and the schema operations over it, the five
 `Empty*.abs` files that pin what the engine writes for a brand-new database,
 `Constraints.abs`, which isolates one column constraint or index variation per table, the
 two `Types*.abs` files, which between them hold every field type the format supports, the nine
-`Keys*.abs` files that pin a key-enforcing index, and the two `Auto*.abs` files that say what an
-`AUTOINC` key does not write.
+`Keys*.abs` files that pin a key-enforcing index, and the nine `Auto*.abs` files that locate an
+`AUTOINC` column's counter and pin what moves it.
 
 ### `Employees-*.abs` — one per encryption algorithm
 
@@ -432,19 +432,53 @@ refuses the second as a duplicate — the engine compares NULL keys by value rat
 them as distinct the way SQL does. The rule is therefore uniform: a key index refuses any key
 already in its leaf, NULL included, and a `PRIMARY` one refuses a NULL outright.
 
-### `Auto*.abs` — what an `AUTOINC` key does not write
+### `Auto*.abs` — where an `AUTOINC` column's next value lives
 
 Fifteen of the corpus's twenty-five key constraints are backed by an index over an `AUTOINC`
 column, so an `AUTOINC` key is the shape the private fixtures actually have. `Auto` is
-`Id` AUTOINC **PRIMARY KEY**, `Name` VARCHAR(20), with three rows; `Auto-ins.abs` adds a fourth
-with `INSERT INTO Auto (Name) VALUES ('Alan')`.
+`Id` AUTOINC **PRIMARY KEY**, `Name` VARCHAR(20), with three rows.
 
-Its purpose is a negative. An `AUTOINC` column's next value has to come from somewhere, and a
-counter kept on some page of its own would be a reason to keep refusing such an index even once
-key indexes are maintained. The insert touches the **same page types** an `INTEGER`-keyed insert
-touches, so there is no such counter — the next value is derived, not stored. The index record
-and the leaf are the `Int32` shape exactly, which leaves the column's field type as the only
-thing standing between this package and those fifteen tables.
+| File                  | From              | Statement                                        |
+| --------------------- | ----------------- | ------------------------------------------------ |
+| `Auto.abs`            | `Empty.abs`       | `CREATE TABLE` + three `INSERT ... (Name)`       |
+| `Auto-ins.abs`        | `Auto.abs`        | `INSERT INTO Auto (Name) VALUES ('Alan')`        |
+| `Auto-insexp.abs`     | `Auto.abs`        | `INSERT INTO Auto (Id, Name) VALUES (10, 'Zoe')` |
+| `Auto-insnext.abs`    | `Auto-insexp.abs` | `INSERT INTO Auto (Name) VALUES ('Next')`        |
+| `Auto-inslow.abs`     | `Auto-insexp.abs` | `INSERT INTO Auto (Id, Name) VALUES (5, 'Low')`  |
+| `Auto-del.abs`        | `Auto.abs`        | `DELETE FROM Auto WHERE Id = 3`                  |
+| `Auto-delins.abs`     | `Auto-del.abs`    | `INSERT INTO Auto (Name) VALUES ('After')`       |
+| `Auto-upd.abs`        | `Auto.abs`        | `UPDATE Auto SET Id = 20 WHERE Id = 1`           |
+| `Auto-updcompact.abs` | `Auto-upd.abs`    | the same, then `Database -> Compact Database`    |
+
+The first two were generated to answer a narrower question — whether the engine keeps the next
+value on a page of its own — and the answer they gave was **wrong**, which is worth recording
+because the mistake is an easy one. An `AUTOINC` insert touches the same page _types_ an
+`INTEGER`-keyed insert touches, so it looked as though nothing stored a counter. The counter is
+on one of those pages: it is in the **table info file**, whose `columnCount` × 8-byte array was
+read as zero padding because in a table with no `AUTOINC` column every slot is in fact zero.
+`Auto.abs` holds 3 there and `Auto-ins.abs` holds 4. Page _types_ could not see it because an
+ordinary insert rewrites that page anyway, for the record count.
+
+The other seven pin the rule, and each one is a case the others do not cover:
+
+- **An explicit value above the counter raises it** (`insexp`: slot 3 → 10), and the next
+  automatic value comes from the counter rather than from the data (`insnext`: 11, not 4).
+- **An explicit value below it does not lower it** (`inslow`: slot stays 10). So the counter is
+  a running maximum over inserted values, not the last one written.
+- **A delete never lowers it** (`del`: rows 1, 2 with the slot still 3) and the freed value is
+  not reissued (`delins`: the next row is 4).
+- **An update never raises it** — `upd` sets `Id` to 20 and leaves the slot at 3, so the counter
+  tracks what the engine has _assigned_, not the column's maximum. Nothing about SQL predicts
+  that, and it is the one case where a writer copying the column's maximum would be wrong.
+- **Compaction rebuilds it from the rows** (`updcompact`: slot 3 → 20, `changes` back to 3).
+  That is not a ninth rule but the insert rule applied by a replay, which is what
+  `InternalCopyDatabase` is; it is the same evidence for compaction being a rebuild that
+  `MultiTable-dropcompact.abs` gives from the object ids.
+
+`Types.abs`'s `TAutoInc` corroborates the whole model from outside this family: `INITIALVALUE
+100 INCREMENT 5` gave rows 105 and 110 and a slot of **110 with two rows**, which no reading of
+the slot as a row count survives. Across the corpus all twenty `AUTOINC` columns carry their
+column's maximum, and no other column anywhere carries a non-zero slot.
 
 Neither set contains private data or vendor material, checked the same way as the others:
 scanning each finds only `ABS0LUTEDATABASE`, `ABSP`, the invented table and column names and the

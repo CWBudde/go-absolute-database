@@ -8,7 +8,7 @@ because git cannot re-include a path whose parent directory is excluded.
 
 Two populations:
 
-- **Committed** — 53 `.abs` files this project produced under the ComponentAce DB Manager, plus
+- **Committed** — 60 `.abs` files this project produced under the ComponentAce DB Manager, plus
   `testdata/zlib1` golden vectors and `testdata/fuzz` corpora. Eight `Employees-*` (one per
   encryption algorithm, all with rows), fourteen `Writes*` (the record write path's ground
   truth, five of them carrying a user index), twelve `MultiTable*` (the catalog and the schema
