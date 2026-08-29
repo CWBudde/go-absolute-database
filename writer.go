@@ -39,10 +39,14 @@ var (
 	// ErrSlotOccupied reports an insert into a slot that already holds a record.
 	ErrSlotOccupied = errors.New("absdb: record slot is occupied")
 
-	// ErrTableFull reports that no record slot could be found or made: every
-	// slot of every existing data page is occupied and no free page is left in
-	// the file to grow the table with. Growing a table within the file's free
-	// pages is implemented (see growTable); extending the file itself is not.
+	// ErrTableFull reports that no record slot could be found or made. It is a
+	// page-splitting ceiling, not a space one: running out of free pages no
+	// longer stops an insert, because growTable's allocation extends the file
+	// by whole extents when it has to (ddl_grow.go). What is left is the
+	// table's single-page record-page index root, which holds a fixed number of
+	// entries and would have to split to hold more (appendRecordPageEntry), and
+	// a row too wide for any record to fit a data page at all. Neither is
+	// something growth can lift.
 	ErrTableFull = errors.New("absdb: no free record slot in any data page")
 
 	// ErrIndexNotMaintained reports a write against an index this package will
@@ -719,7 +723,9 @@ func (w *TableWriter) freeSlot() (RecordID, error) {
 // rebalancing the way an index insert would. It shares db.allocatePages with
 // ddl.go's schema operations via the pageLoader interface, so the Page Free
 // Space and Extent Allocation Map stay in the same state a schema operation
-// would leave them in.
+// would leave them in -- and so an insert into a file with no free page left
+// grows the file by an extent rather than failing, through the same allocator
+// (ddl_grow.go).
 func (w *TableWriter) growTable() (int, error) {
 	if !w.db.writable {
 		return 0, ErrReadOnly
