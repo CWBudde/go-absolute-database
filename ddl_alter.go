@@ -833,15 +833,10 @@ func decodeRowValues(cols []Column, rec Record) ([]any, error) {
 // encodeField's own switch exactly -- BLOB/CLOB/WideCLOB columns never reach
 // here because AddColumn and DropColumn both refuse a table with BLOB pages
 // before rewriteDataPages runs; anything else unlisted (Extended, VarBytes)
-// is exactly what writer.go's ErrColumnNotWritable already names.
+// is exactly what writer.go's ErrColumnNotWritable already names. A TimeStamp
+// needs no special case: the engine stores one only to the hour, so what
+// Record.Time reads back always re-encodes to the same eight bytes.
 func decodeColumnValue(c Column, rec Record, col int) (any, error) {
-	// A TimeStamp shares BftDateTime's base type but not its layout, so
-	// Record.Time deliberately returns the zero time for it, and re-encoding
-	// that would rewrite the column with a different value.
-	if c.FieldType == FieldTimeStamp {
-		return nil, fmt.Errorf("%w: column %q (%s)", ErrColumnNotWritable, c.Name, c.FieldType)
-	}
-
 	switch c.BaseType {
 	case BftCurrency:
 		// Currency stores a double, so it round-trips through Float rather

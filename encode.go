@@ -73,12 +73,11 @@ var (
 	// ErrColumnNotWritable is returned for a column whose storage this package
 	// can read but not write: Extended, whose 64-bit significand does not
 	// survive the round trip through the float64 Record.Float returns, so
-	// rewriting a row would quietly truncate a column nobody touched; and
-	// TimeStamp, which shares BftDateTime's base type but stores some
-	// other layout that no fixture has decoded -- writing it as a DateTime
-	// would silently record a different instant. A GUID column is writable:
-	// it stores Char, and its text goes through the string path like any
-	// other fixed string.
+	// rewriting a row would quietly truncate a column nobody touched. A GUID
+	// column is writable: it stores Char, and its text goes through the
+	// string path like any other fixed string. So is a TimeStamp, which the
+	// engine keeps only to the hour -- a value carrying minutes or seconds is
+	// refused with ErrValueRange rather than silently rounded.
 	ErrColumnNotWritable = errors.New("absdb: column type cannot be written yet")
 )
 
@@ -228,11 +227,10 @@ func setNullFlag(flags []byte, col int, null bool) {
 // encodeField writes a non-nil value into the column's field bytes. field is
 // exactly fieldStoreSize(c) bytes and is fully overwritten.
 func encodeField(c Column, field []byte, v any) error {
-	// A TimeStamp shares BftDateTime's base type and not its layout, so the
-	// BftDateTime arm below would write a value the engine reads as some
-	// other instant. Its own layout is undecoded; see docs/format/records.md.
+	// A TimeStamp shares BftDateTime's base type and not its layout, so it
+	// must not reach the BftDateTime arm below.
 	if c.FieldType == FieldTimeStamp {
-		return fmt.Errorf("%w: %s", ErrColumnNotWritable, c.FieldType)
+		return encodeTimeStamp(field, v)
 	}
 
 	switch c.BaseType {
@@ -422,6 +420,52 @@ func encodeUTF16(field []byte, v any) error {
 // A Date column refuses a value with a non-zero time of day and a Time column
 // refuses one whose date is not 0001-01-01, the date Record.Time reports for
 // them: dropping the other half silently would lose information.
+// encodeTimeStamp writes a TimeStamp field: year, month, day and hour as four
+// little-endian 16-bit values, which is all the engine stores of one. See
+// reader.go's timeStampToTime for why the rest is missing.
+//
+// A value carrying minutes, seconds or a fraction is refused. The engine
+// truncates one silently -- Types2.abs's TStamp is what proves that -- but a
+// library that dropped part of a caller's value without saying so would be
+// the same silent loss one layer up.
+func encodeTimeStamp(field []byte, v any) error {
+	t, ok := v.(time.Time)
+	if !ok {
+		return fmt.Errorf("%w: %T is not a time.Time", ErrValueType, v)
+	}
+
+	if len(field) < timeStampSize {
+		return fmt.Errorf("%w: %d-byte TimeStamp field", ErrBadLayout, len(field))
+	}
+
+	if t.IsZero() {
+		clear(field[:timeStampSize])
+
+		return nil
+	}
+
+	if t.Minute() != 0 || t.Second() != 0 || t.Nanosecond() != 0 {
+		return fmt.Errorf("%w: %v has minutes or seconds, which a TimeStamp column stores only to the hour", ErrValueRange, t)
+	}
+
+	if t.Year() < 1 || t.Year() > 9999 {
+		return fmt.Errorf("%w: %v is outside the years a TimeStamp column can store", ErrValueRange, t)
+	}
+
+	// The year is bounded just above; month, day and hour are bounded by
+	// time.Time itself. The check states that for the conversion rather than
+	// leaving it to be inferred.
+	for i, part := range [...]int{t.Year(), int(t.Month()), t.Day(), t.Hour()} {
+		if part < 0 || part > math.MaxUint16 {
+			return fmt.Errorf("%w: %v does not fit a TimeStamp field", ErrValueRange, t)
+		}
+
+		binary.LittleEndian.PutUint16(field[i*2:i*2+2], uint16(part))
+	}
+
+	return nil
+}
+
 func encodeTime(base BaseFieldType, field []byte, v any) error {
 	t, ok := v.(time.Time)
 	if !ok {

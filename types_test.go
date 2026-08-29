@@ -1,6 +1,7 @@
 package absdb
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -266,10 +267,12 @@ func TestTypesFixtureValues(t *testing.T) {
 			t.Errorf("DateTime = %v, want %v", got, want)
 		}
 
-		// A TimeStamp holds the same instant in an undecoded layout, so it
-		// deliberately reads as the zero time rather than as a wrong one.
-		if got := rec.Time(6); !got.IsZero() {
-			t.Errorf("TimeStamp = %v, want the zero time", got)
+		// A TimeStamp holds the same instant to the hour and no further: the
+		// engine writes the first four fields of a TSQLTimeStamp into the
+		// eight bytes a DateTime column gets and drops the minutes and
+		// seconds. Types2.abs is what proved that; see types2_test.go.
+		if got, want := rec.Time(6), time.Date(2019, 3, 7, 1, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Errorf("TimeStamp = %v, want %v", got, want)
 		}
 	})
 
@@ -398,8 +401,10 @@ func TestTypesFixtureAutoIncOptions(t *testing.T) {
 	}
 }
 
-// TestTypesFixtureRefusesUnwritableColumns pins the two refusals the fixture
-// forced, so that neither can be relaxed without a fixture that justifies it.
+// TestTypesFixtureRefusesUnwritableColumns pins the two refusals that survive
+// against this fixture, so neither can be relaxed without a fixture that
+// justifies it. The TimeStamp refusal that used to sit here did not survive:
+// Types2.abs decoded the layout, and the column is now writable.
 func TestTypesFixtureRefusesUnwritableColumns(t *testing.T) {
 	db := openFixture(t, "Types.abs")
 
@@ -417,24 +422,32 @@ func TestTypesFixtureRefusesUnwritableColumns(t *testing.T) {
 		t.Logf("refused with: %v", err)
 	})
 
-	t.Run("timestamp", func(t *testing.T) {
-		schema := schemaOfTable(t, db, "TTime")
-		reader := readerOfTable(t, db, "TTime")
+	// An Extended column is readable and not writable: Record.Float rounds
+	// its 64-bit significand to float64, so copying a row through
+	// decodeColumnValue would quietly truncate a column nobody touched.
+	t.Run("extended", func(t *testing.T) {
+		schema := schemaOfTable(t, db, "TReal")
+		reader := readerOfTable(t, db, "TReal")
 
 		if !reader.Next() {
 			t.Fatalf("no rows: %v", reader.Err())
 		}
 
-		var ts int
+		ext := -1
 
 		for i, c := range schema.Columns {
-			if c.FieldType == FieldTimeStamp {
-				ts = i
+			if c.FieldType == FieldExtended {
+				ext = i
 			}
 		}
 
-		if _, err := decodeColumnValue(schema.Columns[ts], reader.Record(), ts); err == nil {
-			t.Error("decodeColumnValue accepted a TimeStamp column")
+		if ext < 0 {
+			t.Fatal("TReal has no Extended column")
+		}
+
+		_, err := decodeColumnValue(schema.Columns[ext], reader.Record(), ext)
+		if !errors.Is(err, ErrColumnNotWritable) {
+			t.Errorf("decodeColumnValue on an Extended column: err = %v, want ErrColumnNotWritable", err)
 		}
 	})
 }

@@ -363,17 +363,61 @@ func (rec Record) Bool(col int) bool {
 	return binary.LittleEndian.Uint16(raw) != 0
 }
 
-// Time returns the time.Time value of a Date, Time, or DateTime column.
-// Any other column, and any truncated field, yields the zero time.
+// timeStampSize is what a TimeStamp column occupies: the same eight bytes as
+// the DateTime it shares a base type with.
+const timeStampSize = 8
+
+// timeStampToTime decodes a TimeStamp field, which is four little-endian
+// 16-bit fields -- year, month, day, hour -- and nothing else.
 //
-// A TimeStamp column reads as the zero time even though it shares
-// BftDateTime's base type: Types.abs shows it stores some other layout --
-// "2019-03-07 01:02:03" is e3 07 03 00 07 00 01 00, which reads as the
-// numbers 2019, 3, 7, 1 rather than as a day count and a millisecond count --
-// and returning a confidently wrong instant is worse than returning none.
+// That is the first four fields of dbExpress's TSQLTimeStamp record, whose
+// remaining Minute, Second and Fractions fields do not fit: the engine sizes
+// the column from its BftDateTime base type, which is eight bytes, and writes
+// only what fits. The minutes and seconds of the value inserted are lost.
+// Types2.abs's TStamp proves it rather than infers it -- its rows 1, 2 and 3
+// hold 01:02:03, 01:02:04 and 01:03:03 and are byte-identical, while the
+// DateTime column beside them differs in every row, and row 9's 23:59:58
+// stores the hour and drops the rest.
+//
+// A field whose parts are not a real date reads as the zero time rather than
+// as whatever time.Date would normalise it to. That covers the NULL case,
+// which is all zeros, and any malformed input.
+func timeStampToTime(raw []byte) time.Time {
+	year := int(binary.LittleEndian.Uint16(raw[0:2]))
+	month := int(binary.LittleEndian.Uint16(raw[2:4]))
+	day := int(binary.LittleEndian.Uint16(raw[4:6]))
+	hour := int(binary.LittleEndian.Uint16(raw[6:8]))
+
+	if year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 {
+		return time.Time{}
+	}
+
+	t := time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.UTC)
+	if t.Day() != day {
+		// A day past the end of its month, which time.Date would roll into
+		// the next one.
+		return time.Time{}
+	}
+
+	return t
+}
+
+// Time returns the time.Time value of a Date, Time, DateTime or TimeStamp
+// column. Any other column, and any truncated field, yields the zero time.
+//
+// A TimeStamp is only accurate to the hour, because that is all the engine
+// keeps: see timeStampToTime.
 func (rec Record) Time(col int) time.Time {
 	c, ok := rec.column(col)
-	if !ok || c.FieldType == FieldTimeStamp {
+	if !ok {
+		return time.Time{}
+	}
+
+	if c.FieldType == FieldTimeStamp {
+		if raw := rec.fieldPrefix(col, timeStampSize); raw != nil {
+			return timeStampToTime(raw)
+		}
+
 		return time.Time{}
 	}
 

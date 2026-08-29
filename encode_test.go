@@ -670,25 +670,54 @@ func TestEncodeDelphiDateInverse(t *testing.T) {
 	}
 }
 
-// TestEncodeRefusesTimeStamp pins the one refusal Types.abs forced. A
-// TimeStamp column shares BftDateTime's base type but stores some other
-// layout, so writing it as a DateTime would record a different instant.
-func TestEncodeRefusesTimeStamp(t *testing.T) {
+// TestEncodeTimeStampRoundTrip covers the TimeStamp encoder, which writes the
+// four 16-bit fields the engine keeps. A value carrying minutes or seconds is
+// refused rather than truncated: the engine drops them silently, and doing the
+// same one layer up would lose part of a caller's value without saying so.
+func TestEncodeTimeStampRoundTrip(t *testing.T) {
 	stamp := col("ts", BftDateTime, FieldTimeStamp, 0)
 	r := newTestReader(stamp, col("n", BftInt32, FieldInteger, 0))
 
-	err := r.encodeInto(make([]byte, r.recordSize), 0, time.Unix(0, 0).UTC())
-	if !errors.Is(err, ErrColumnNotWritable) {
-		t.Errorf("encodeInto on a TimeStamp column: err = %v, want ErrColumnNotWritable", err)
+	want := time.Date(2019, 3, 7, 1, 0, 0, 0, time.UTC)
+
+	buf := make([]byte, r.recordSize)
+	if err := r.encodeInto(buf, 0, want); err != nil {
+		t.Fatalf("encodeInto on a TimeStamp column: %v", err)
 	}
 
-	rec := recordOver(r, make([]byte, r.recordSize))
-	if _, err := decodeColumnValue(stamp, rec, 0); !errors.Is(err, ErrColumnNotWritable) {
-		t.Errorf("decodeColumnValue on a TimeStamp column: err = %v, want ErrColumnNotWritable", err)
+	if got := recordOver(r, buf).Time(0); !got.Equal(want) {
+		t.Errorf("Time() = %v, want %v", got, want)
 	}
 
-	// A DateTime column of the same base type is still writable, which is what
-	// says the refusal keys on FieldType and not on the storage.
+	// The same value goes back out of decodeColumnValue unchanged, which is
+	// what lets ALTER TABLE copy a row holding one.
+	got, err := decodeColumnValue(stamp, recordOver(r, buf), 0)
+	if err != nil {
+		t.Fatalf("decodeColumnValue on a TimeStamp column: %v", err)
+	}
+
+	if got != any(want) {
+		t.Errorf("decodeColumnValue = %v, want %v", got, want)
+	}
+
+	for _, tt := range []struct {
+		name string
+		v    time.Time
+	}{
+		{"minutes", time.Date(2019, 3, 7, 1, 2, 0, 0, time.UTC)},
+		{"seconds", time.Date(2019, 3, 7, 1, 0, 3, 0, time.UTC)},
+		{"fraction", time.Date(2019, 3, 7, 1, 0, 0, int(time.Millisecond), time.UTC)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := r.encodeInto(make([]byte, r.recordSize), 0, tt.v)
+			if !errors.Is(err, ErrValueRange) {
+				t.Errorf("encodeInto(%v): err = %v, want ErrValueRange", tt.v, err)
+			}
+		})
+	}
+
+	// A DateTime column of the same base type keeps its own encoder, which is
+	// what says the dispatch keys on FieldType and not on the storage.
 	dt := newTestReader(col("dt", BftDateTime, FieldDateTime, 0))
 	if err := dt.encodeInto(make([]byte, dt.recordSize), 0, time.Unix(0, 0).UTC()); err != nil {
 		t.Errorf("encodeInto on a DateTime column: %v", err)
