@@ -635,3 +635,128 @@ func TestKeyIndexRefusesADuplicate(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateTableWithAPrimaryKeyMatchesEngineByteForByte is the whole-file
+// oracle for building a key constraint's index. It replays into a copy of
+// Empty.abs the four statements Keys.abs was made with -- the CREATE TABLE and
+// its three INSERTs, each its own transaction the way the script ran them --
+// and requires the result to be the engine's file.
+//
+// Only the page State words are excluded, and only because they are seeded
+// randomly for a page CREATE TABLE allocates. Everything else has to line up:
+// six allocated pages rather than five, the index record spliced into the
+// schema stream ahead of the constraint array, the object ids the index and the
+// constraint take between the columns and the next table, the empty leaf's
+// 5-byte key size, and the three entries the inserts splice into it.
+//
+// The constraint records come out of Keys.abs itself, because Column carries no
+// way to declare a key. The comparison is not circular for that: what is
+// checked is the file, against the file the engine wrote.
+func TestCreateTableWithAPrimaryKeyMatchesEngineByteForByte(t *testing.T) {
+	want, err := os.ReadFile(requireFixture(t, keysFixture))
+	if err != nil {
+		t.Fatalf("reading %s: %v", keysFixture, err)
+	}
+
+	fixture := openFixture(t, keysFixture)
+	constraints := constraintsOf(t, fixture, "Keys")
+	fixture.Close()
+
+	path := writableCopy(t, "Empty.abs")
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	columns := []Column{
+		{Name: "Id", BaseType: BftInt32, FieldType: FieldInteger},
+		{Name: "Alt", BaseType: BftInt32, FieldType: FieldInteger},
+		{Name: "Name", BaseType: BftVarchar, FieldType: FieldString, Size: 20},
+	}
+
+	if err := db.createTable("Keys", columns, constraints); err != nil {
+		t.Fatalf("createTable: %v", err)
+	}
+
+	for _, row := range [][]any{
+		{int32(1), int32(10), "Ada"},
+		{int32(2), int32(20), "Grace"},
+		{int32(3), int32(30), "Edsger"},
+	} {
+		insertOneRow(t, db, "Keys", row)
+	}
+
+	pageSize, pageCount := db.PageSize(), db.PageCount()
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading result: %v", err)
+	}
+
+	excluded := make(map[int]bool, pageCount*4)
+
+	for no := range pageCount {
+		for i := range 4 {
+			excluded[no*pageSize+pageStateOffset+i] = true
+		}
+	}
+
+	reportByteDifferencesExcept(t, got, want,
+		"CREATE TABLE Keys (Id INTEGER PRIMARY KEY, Alt INTEGER, Name VARCHAR(20)) + three INSERTs", excluded)
+}
+
+// TestCompactKeysFixture compacts an engine-written database whose table has a
+// PRIMARY KEY, which is what the rebuild refused before it could build the
+// backing index. The source is a real file rather than one assembled here, so
+// it exercises the plan against the engine's own page layout and rows.
+func TestCompactKeysFixture(t *testing.T) {
+	dst := newDatabasePath(t, "keys-compacted.abs")
+
+	if err := CompactDatabase(requireFixture(t, keysUniqueIdxFixure), dst); err != nil {
+		t.Fatalf("CompactDatabase: %v", err)
+	}
+
+	db, err := OpenForWrite(dst)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	defer db.Close()
+
+	// Both indexes come back, the primary key's and the standalone unique one,
+	// and both still refuse the key their leaf already holds.
+	_, _, records, constraints := tailOf(t, db, "Keys")
+	if len(records) != 2 || len(constraints) != 2 {
+		t.Fatalf("compacted Keys carries %d index and %d constraint records, want 2 and 2",
+			len(records), len(constraints))
+	}
+
+	tbl, err := db.Table("Keys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	w, err := tbl.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+
+	defer w.Close()
+
+	if _, err := w.Insert([]any{int32(2), int32(99), "Dup"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("insert of a duplicate primary key = %v, want ErrDuplicateKey", err)
+	}
+
+	if _, err := w.Insert([]any{int32(9), int32(10), "Dup2"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("insert of a duplicate unique key = %v, want ErrDuplicateKey", err)
+	}
+
+	if _, err := w.Insert([]any{int32(9), int32(90), "New"}); err != nil {
+		t.Errorf("insert of a fresh row = %v, want it to be allowed", err)
+	}
+}

@@ -490,9 +490,12 @@ func TestCompactDatabaseRefusals(t *testing.T) {
 			want:    ErrUnsupportedColumnType,
 		},
 		{
-			name:    "a table carrying a key constraint",
+			// Constraints.abs stops at its third table now rather than its
+			// second: CPk and CUnique are rebuildable, and CDefault is the
+			// first thing in the file that is not.
+			name:    "a column carrying a DEFAULT",
 			fixture: "Constraints.abs",
-			want:    ErrConstraintsNotRebuilt,
+			want:    ErrColumnDefault,
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -552,11 +555,12 @@ func TestCompactDatabaseRefusesAnExistingDestination(t *testing.T) {
 // absent marker unconditionally, so rebuilding that table would drop the
 // clause instead of failing on it.
 //
-// CNotNull and CMinMax are the two that stopped refusing once CreateTable
-// learnt to write the column-shaped records. CBoth still refuses, and it is the
-// case worth keeping an eye on: it declares a NOT NULL the rebuild can write
-// beside a UNIQUE it cannot, so a check that stopped at the first record it
-// understood would let it through half rebuilt.
+// The list has shortened twice. CNotNull and CMinMax stopped refusing when
+// CreateTable learnt to write the column-shaped records, and CPk and CUnique
+// stopped when it learnt to build a key's backing index. CBoth is the case
+// worth keeping an eye on: it declares a NOT NULL the rebuild can write beside
+// a UNIQUE over a VARCHAR column it cannot, so a check that stopped at the
+// first record it understood would let it through half rebuilt.
 func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 	db := openTestFile(t, "Constraints.abs")
 
@@ -569,8 +573,8 @@ func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 		{"CDefault", ErrColumnDefault},
 		{"CNotNull", nil},
 		{"CMinMax", nil},
-		{"CPk", ErrConstraintsNotRebuilt},
-		{"CUnique", ErrConstraintsNotRebuilt},
+		{"CPk", nil},
+		{"CUnique", nil},
 		{"CBoth", ErrConstraintsNotRebuilt},
 		{"CPkMulti", ErrConstraintsNotRebuilt},
 		{"CIdxDesc", ErrIndexNotMaintained},
@@ -611,7 +615,7 @@ func TestPlanCompactIndexesRefusesAStringKey(t *testing.T) {
 		columns: []indexColumn{{name: "S", maxIndexedSize: indexColumnMaxIndexedSize}},
 	}}
 
-	_, err := planCompactIndexes(schema, records)
+	_, err := planCompactIndexes(schema, records, nil)
 	if !errors.Is(err, ErrUnsupportedIndexColumn) {
 		t.Errorf("planCompactIndexes over a string column = %v, want %v", err, ErrUnsupportedIndexColumn)
 	}

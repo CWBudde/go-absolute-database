@@ -293,7 +293,12 @@ func (db *File) CreateIndex(table, index, column string) error {
 
 	objectID := int(db.lastObjectID) + 1
 
-	record, err := serializeIndexRecord(index, uint32(objectID), int32(rootPageNo), column) //nolint:gosec // small object/page ids
+	record, err := serializeIndexRecord(indexRecord{
+		name:       index,
+		objectID:   uint32(objectID),  //nolint:gosec // small object ids
+		rootPageNo: int32(rootPageNo), //nolint:gosec // small page numbers
+		columns:    []indexColumn{{name: column, maxIndexedSize: indexColumnMaxIndexedSize}},
+	})
 	if err != nil {
 		return err
 	}
@@ -754,24 +759,53 @@ func readUint32(data []byte, pos int, field string) (uint32, int, error) {
 	return binary.LittleEndian.Uint32(data[pos : pos+4]), pos + 4, nil
 }
 
+// serializeIndexArray builds the schema stream's index-definition array: the
+// int32 count and that many records. It is the index-side mirror of
+// serializeConstraintArray, and CreateTable uses it for a table whose PRIMARY
+// KEY or UNIQUE constraint brings an index with it.
+func serializeIndexArray(records []indexRecord) ([]byte, error) {
+	out := binary.LittleEndian.AppendUint32(nil, uint32(len(records))) //nolint:gosec // bounded by maxSchemaColumns upstream
+
+	for _, rec := range records {
+		raw, err := serializeIndexRecord(rec)
+		if err != nil {
+			return nil, fmt.Errorf("index %q: %w", rec.name, err)
+		}
+
+		out = append(out, raw...)
+	}
+
+	return out, nil
+}
+
 // serializeIndexRecord builds one index record, the mirror of parseIndexRecord
-// for the one shape CreateIndex builds: a Pascal name, the object id, three
-// zero flag bytes (not unique, not primary), coveredColumnCount=1, the index's
-// own root page, and a single covered column -- a Pascal name, a zero DESC
-// flag, a zero NOCASE flag and the constant maximum indexed size.
+// for the one shape this package builds: a Pascal name, the object id, the
+// reserved/UNIQUE/PRIMARY flag bytes, coveredColumnCount=1, the index's own
+// root page, and a single covered column -- a Pascal name, a zero DESC flag, a
+// zero NOCASE flag and the constant maximum indexed size.
 //
-// These are the same bytes this function wrote before covered-column entries
-// were decoded, which is what keeps TestCreateIndexMatchesEngineByteForByte
-// passing unchanged: what used to be "2 reserved bytes plus a 0x14 terminator"
-// is the ASC/CASE/20 entry the engine writes for an ascending, case-sensitive
-// index.
-func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column string) ([]byte, error) {
-	rawName, err := encodePascalName(name)
+// The bytes for a plain index are the same ones this function wrote before
+// covered-column entries were decoded, which is what keeps
+// TestCreateIndexMatchesEngineByteForByte passing unchanged: what used to be
+// "2 reserved bytes plus a 0x14 terminator" is the ASC/CASE/20 entry the
+// engine writes for an ascending, case-sensitive index.
+func serializeIndexRecord(rec indexRecord) ([]byte, error) {
+	rawName, err := encodePascalName(rec.name)
 	if err != nil {
 		return nil, err
 	}
 
-	rawColumn, err := encodePascalName(column)
+	col, ok := rec.singleColumn()
+	if !ok {
+		return nil, fmt.Errorf("%w: index %q covers %d columns", ErrMultiColumnIndex, rec.name, len(rec.columns))
+	}
+
+	if col.descending || col.caseInsensitive {
+		return nil, fmt.Errorf("%w: index %q is descending=%t case-insensitive=%t",
+			ErrUnsupportedIndexColumn, rec.name, col.descending, col.caseInsensitive)
+	}
+
+	rawColumn, err := encodePascalName(col.name)
 	if err != nil {
 		return nil, err
 	}
@@ -783,15 +817,15 @@ func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column
 
 	var buf4 [4]byte
 
-	binary.LittleEndian.PutUint32(buf4[:], objectID)
+	binary.LittleEndian.PutUint32(buf4[:], rec.objectID)
 	out = append(out, buf4[:]...)
 
-	out = append(out, make([]byte, indexRecordFlagsSize)...)
+	out = append(out, 0, indexFlagByte(rec.unique), indexFlagByte(rec.primary))
 
 	binary.LittleEndian.PutUint32(buf4[:], 1) // coveredColumnCount
 	out = append(out, buf4[:]...)
 
-	binary.LittleEndian.PutUint32(buf4[:], uint32(rootPageNo))
+	binary.LittleEndian.PutUint32(buf4[:], uint32(rec.rootPageNo))
 	out = append(out, buf4[:]...)
 
 	out = append(out, byte(len(rawColumn))) //nolint:gosec // checked in encodePascalName
@@ -803,6 +837,16 @@ func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column
 	out = append(out, buf4[:]...)
 
 	return out, nil
+}
+
+// indexFlagByte spells a ByteBool the way an index record does: 0xFF when set
+// and 0x00 when not, the encoding DESC, NOCASE, UNIQUE and PRIMARY all share.
+func indexFlagByte(set bool) byte {
+	if set {
+		return indexFlagTrue
+	}
+
+	return 0
 }
 
 // encodePascalName Windows-1252 encodes a name for a Pascal string field, the

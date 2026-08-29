@@ -311,11 +311,11 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 		return compactTable{}, err
 	}
 
-	if err := planCompactConstraints(schema, constraints); err != nil {
+	if err := planCompactConstraints(t.Name(), schema, constraints); err != nil {
 		return compactTable{}, err
 	}
 
-	indexes, err := planCompactIndexes(schema, records)
+	indexes, err := planCompactIndexes(schema, records, keyBackingIndexes(constraints))
 	if err != nil {
 		return compactTable{}, err
 	}
@@ -326,28 +326,34 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 }
 
 // planCompactConstraints checks every constraint record against what
-// CreateTable can write back. It is deliberately the same set of refusals
-// assignConstraintIDs makes, made here so that a table the rebuild would choke
-// on is refused before the destination file exists -- the property every other
-// check in this file has.
-func planCompactConstraints(schema *TableSchema, constraints []constraintRecord) error {
+// CreateTable can write back, by running the very planner CreateTable runs and
+// throwing the result away. Sharing the code rather than the intent is what
+// keeps the two sets of refusals from drifting: a table the rebuild would
+// choke on is refused before the destination file exists, which is the
+// property every other check in this file has.
+//
+// The object ids handed out here are discarded, so the first one is arbitrary.
+func planCompactConstraints(table string, schema *TableSchema, constraints []constraintRecord) error {
+	_, _, err := planTableConstraints(table, 1, schema.Columns, constraints)
+
+	return err
+}
+
+// keyBackingIndexes is the set of index object ids a PRIMARY KEY or UNIQUE
+// record is built on. Such an index is created by CreateTable along with its
+// constraint, so the rebuild must not also create it with CreateIndex -- which
+// would give the table two indexes over the same column, one of them named
+// twice.
+func keyBackingIndexes(constraints []constraintRecord) map[uint32]bool {
+	keyed := map[uint32]bool{}
+
 	for _, rec := range constraints {
-		if rec.kind != constraintNotNull && rec.kind != constraintCheck {
-			return fmt.Errorf("%w: the %s constraint %q is backed by an index this package does not build",
-				ErrConstraintsNotRebuilt, rec.kind, rec.name)
-		}
-
-		if len(rec.columns) != 1 {
-			return fmt.Errorf("%w: the constraint %q covers %d columns",
-				ErrConstraintsNotRebuilt, rec.name, len(rec.columns))
-		}
-
-		if _, err := findColumnIndex(schema, rec.columns[0].name); err != nil {
-			return fmt.Errorf("%w: the constraint %q: %w", ErrConstraintsNotRebuilt, rec.name, err)
+		if rec.kind == constraintPrimaryKey || rec.kind == constraintUnique {
+			keyed[rec.ownerID] = true
 		}
 	}
 
-	return nil
+	return keyed
 }
 
 // schemaTailArrays is parseSchemaTail reduced to the two record arrays a
@@ -370,10 +376,16 @@ func schemaTailArrays(raw []byte) ([]indexRecord, []constraintRecord, error) {
 // maintainableIndexColumn is the same gate the record writer puts in front of
 // index maintenance, which is not a coincidence -- the rows are copied through
 // that writer, so an index it would not maintain could not be filled anyway.
-func planCompactIndexes(schema *TableSchema, records []indexRecord) ([]compactIndex, error) {
+func planCompactIndexes(
+	schema *TableSchema, records []indexRecord, keyed map[uint32]bool,
+) ([]compactIndex, error) {
 	indexes := make([]compactIndex, 0, len(records))
 
 	for _, rec := range records {
+		if keyed[rec.objectID] {
+			continue
+		}
+
 		col, err := maintainableIndexColumn(rec)
 		if err != nil {
 			return nil, err

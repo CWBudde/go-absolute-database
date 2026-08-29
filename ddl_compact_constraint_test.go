@@ -1,7 +1,7 @@
 package absdb
 
 import (
-	"bytes"
+	"encoding/binary"
 	"testing"
 )
 
@@ -56,8 +56,8 @@ func TestCreateTableWritesTheEngineSchemaStream(t *testing.T) {
 	}{
 		{table: "CNone", columns: constraintTestColumns, check: true},
 		{table: "CNotNull", columns: constraintTestColumns, check: true},
-		{table: "FillerForCPk", columns: fillerColumns(4)},
-		{table: "FillerForCUnique", columns: fillerColumns(4)},
+		{table: "CPk", columns: constraintTestColumns, check: true},
+		{table: "CUnique", columns: constraintTestColumns, check: true},
 		{table: "FillerForCDefault", columns: fillerColumns(2)},
 		{table: "CMinMax", columns: constraintTestColumns, check: true},
 	} {
@@ -85,25 +85,97 @@ func TestCreateTableWritesTheEngineSchemaStream(t *testing.T) {
 			}
 
 			end := len(want) - systemIndexRootsSize
-			if !bytes.Equal(got[:end], want[:end]) {
-				t.Errorf("%s schema stream:\n got % x\nwant % x", step.table, got[:end], want[:end])
-			}
+			requireStreamsEqual(t, step.table, got[:end], want[:end], indexRootOffsets(t, db, step.table))
 		})
 	}
 }
 
-// TestCompactDatabaseRebuildsColumnConstraints runs the whole operation:
-// a database carrying a NOT NULL and a MINVALUE/MAXVALUE pair used to refuse
-// compaction outright with ErrConstraintsNotRebuilt, and now compacts with the
-// records intact.
+// indexRootOffsets is the byte range of every index record's rootPageNo in a
+// table's schema stream, and the one thing the replay cannot reproduce: the
+// page an index lands on depends on where in the file its table was created,
+// not on what the table declares. The offset is computed from the record's own
+// parsed span rather than searched for, so a record whose layout moved would
+// exclude the wrong bytes and fail loudly instead of hiding a difference.
+//
+// It doubles as a check that the number written is the page actually
+// allocated, which is what the exclusion would otherwise stop anyone noticing.
+func indexRootOffsets(t *testing.T, db *File, table string) map[int]bool {
+	t.Helper()
+
+	raw, _, records, _ := tailOf(t, db, table)
+	excluded := map[int]bool{}
+
+	for _, rec := range records {
+		name, err := encodePascalName(rec.name)
+		if err != nil {
+			t.Fatalf("%s: index %q: %v", table, rec.name, err)
+		}
+
+		// name byte + name + objectID + three flag bytes + coveredColumnCount.
+		start := rec.start + 1 + len(name) + 4 + indexRecordFlagsSize + 4
+
+		if got := int32(binary.LittleEndian.Uint32(raw[start : start+4])); got != rec.rootPageNo {
+			t.Fatalf("%s: index %q root page reads %d at offset %d, parsed as %d",
+				table, rec.name, got, start, rec.rootPageNo)
+		}
+
+		page, err := db.ReadPage(int(rec.rootPageNo))
+		if err != nil || page.Header == nil || int(page.Header.PageType) != PageTypeIndex {
+			t.Errorf("%s: index %q is rooted at page %d, which is not an index page (%v)",
+				table, rec.name, rec.rootPageNo, err)
+		}
+
+		for i := range 4 {
+			excluded[start+i] = true
+		}
+	}
+
+	return excluded
+}
+
+// maxReportedStreamDifferences caps how many differing bytes are named before
+// the count alone is reported, the same courtesy reportByteDifferences does
+// for a whole file.
+const maxReportedStreamDifferences = 8
+
+// requireStreamsEqual compares two schema streams byte for byte, skipping the
+// offsets a replay cannot reproduce and naming the first few that differ.
+func requireStreamsEqual(t *testing.T, table string, got, want []byte, excluded map[int]bool) {
+	t.Helper()
+
+	differing := 0
+
+	for i := range want {
+		if excluded[i] || got[i] == want[i] {
+			continue
+		}
+
+		differing++
+
+		if differing <= maxReportedStreamDifferences {
+			t.Errorf("%s schema stream: byte %d: wrote %#02x, the engine wrote %#02x",
+				table, i, got[i], want[i])
+		}
+	}
+
+	if differing > maxReportedStreamDifferences {
+		t.Errorf("%s schema stream: %d bytes differ in all", table, differing)
+	}
+}
+
+// TestCompactDatabaseRebuildsConstraints runs the whole operation: a database
+// carrying a NOT NULL, a MINVALUE/MAXVALUE pair, a PRIMARY KEY and a UNIQUE
+// used to refuse compaction outright with ErrConstraintsNotRebuilt, and now
+// compacts with every record intact -- the key ones together with the index
+// each is built on, which the rebuild creates rather than copies.
 //
 // The source is built here rather than taken from Constraints.abs because
 // whole-file compaction stops at the first table it cannot rebuild, and that
-// file's third table is CPk. What the source is does not weaken the test: the
+// file's fifth table is CDefault. What the source is does not weaken the test: the
 // records it carries are the engine's, read out of Constraints.abs and written
 // through the path TestCreateTableWritesTheEngineSchemaStream holds to the
 // engine's bytes.
-func TestCompactDatabaseRebuildsColumnConstraints(t *testing.T) {
+func TestCompactDatabaseRebuildsConstraints(t *testing.T) {
 	src := constrainedSourceDatabase(t)
 	dst := newDatabasePath(t, "compacted.abs")
 
@@ -114,7 +186,7 @@ func TestCompactDatabaseRebuildsColumnConstraints(t *testing.T) {
 	before := openTestFileAt(t, src)
 	after := openTestFileAt(t, dst)
 
-	for _, table := range []string{"CNotNull", "CMinMax"} {
+	for _, table := range []string{"CNotNull", "CMinMax", "CPk", "CUnique"} {
 		t.Run(table, func(t *testing.T) {
 			want := constraintsOf(t, before, table)
 			got := constraintsOf(t, after, table)
@@ -175,6 +247,14 @@ func TestCompactedConstraintsAreEnforced(t *testing.T) {
 		{"NOT NULL still admits a value", "CNotNull", []any{int32(1), "x"}, nil},
 		{"MAXVALUE still rejects one above", "CMinMax", []any{int32(100), "x"}, ErrCheckViolated},
 		{"MAXVALUE still admits the bound", "CMinMax", []any{int32(99), "x"}, nil},
+		// The key constraints are the ones a rebuild used to refuse outright.
+		// Their index has to come back enforcing, not merely present: the
+		// source row has A = 5 in every table.
+		{"PRIMARY KEY still rejects a duplicate", "CPk", []any{int32(5), "x"}, ErrDuplicateKey},
+		{"PRIMARY KEY still rejects a NULL", "CPk", []any{nil, "x"}, ErrNotNullViolated},
+		{"PRIMARY KEY still admits a new key", "CPk", []any{int32(6), "x"}, nil},
+		{"UNIQUE still rejects a duplicate", "CUnique", []any{int32(5), "x"}, ErrDuplicateKey},
+		{"UNIQUE still admits a NULL", "CUnique", []any{nil, "x"}, nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			tbl, err := db.Table(c.table)
@@ -209,7 +289,7 @@ func constrainedSourceDatabase(t *testing.T) string {
 		t.Fatalf("CreateDatabase: %v", err)
 	}
 
-	for _, table := range []string{"CNotNull", "CMinMax"} {
+	for _, table := range []string{"CNotNull", "CMinMax", "CPk", "CUnique"} {
 		if err := db.createTable(table, constraintTestColumns, constraintsOf(t, fixture, table)); err != nil {
 			t.Fatalf("createTable(%q): %v", table, err)
 		}

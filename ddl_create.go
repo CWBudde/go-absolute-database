@@ -140,9 +140,11 @@ func (db *File) CreateTable(name string, columns []Column) error {
 // and the whole creation stays one transaction, the way the engine's own
 // CREATE TABLE ... NOT NULL is.
 //
-// Only the column-shaped kinds can be passed: a PRIMARY KEY or UNIQUE record
-// names an index this function does not create. assignConstraintIDs enforces
-// that, and planCompactTable refuses such a table long before it gets here.
+// A PRIMARY KEY or UNIQUE record brings an index with it, and that index is
+// built here: one more page, one more object id and one more record in the
+// schema stream's index array. What is still refused is a key covering more
+// than one column, or one whose column is not the Int32 shape an index leaf is
+// built for -- planTableConstraints is where each refusal is made.
 func (db *File) createTable(name string, columns []Column, constraints []constraintRecord) error {
 	if !db.writable {
 		return ErrReadOnly
@@ -156,23 +158,9 @@ func (db *File) createTable(name string, columns []Column, constraints []constra
 		return fmt.Errorf("%w: no columns", ErrBadSchema)
 	}
 
-	// Object ids: the table takes the next one, then each column takes the
-	// next after that, then each constraint record takes the next after those
-	// -- the order Constraints.abs's ids run in.
 	tableID := int(db.lastObjectID) + 1
-	assigned := assignColumnIDs(tableID, columns)
 
-	colDefs, err := serializeColumnDefs(assigned)
-	if err != nil {
-		return err
-	}
-
-	records, err := assignConstraintIDs(name, tableID+len(assigned)+1, assigned, constraints)
-	if err != nil {
-		return err
-	}
-
-	constraintArray, err := serializeConstraintArray(records)
+	plan, err := planNewTable(name, tableID, columns, constraints)
 	if err != nil {
 		return err
 	}
@@ -184,12 +172,17 @@ func (db *File) createTable(name string, columns []Column, constraints []constra
 		return err
 	}
 
-	pages, err := db.allocateTablePages(w)
+	pages, err := db.allocateTablePages(w, len(plan.indexes))
 	if err != nil {
 		return err
 	}
 
-	if err := db.writeTableInternalFiles(w, pages, colDefs, constraintArray, len(assigned)); err != nil {
+	files, err := plan.internalFiles(pages)
+	if err != nil {
+		return err
+	}
+
+	if err := db.writeTableInternalFiles(w, pages, files); err != nil {
 		return err
 	}
 
@@ -209,7 +202,7 @@ func (db *File) createTable(name string, columns []Column, constraints []constra
 		return err
 	}
 
-	if err := db.setLastObjectID(int32(tableID + len(assigned) + len(records))); err != nil { //nolint:gosec // small object ids
+	if err := db.setLastObjectID(int32(plan.lastObjectID)); err != nil { //nolint:gosec // small object ids
 		return err
 	}
 
@@ -222,6 +215,72 @@ func (db *File) createTable(name string, columns []Column, constraints []constra
 	}
 
 	return nil
+}
+
+// newTablePlan is everything CreateTable works out before it touches the file:
+// the columns with their object ids, the index records a key constraint brings
+// with it, the constraint records themselves, and the serialized column array.
+// Only the index array is left, because it embeds root pages that are not
+// allocated yet.
+type newTablePlan struct {
+	columns      []Column
+	indexes      []indexRecord
+	constraints  []constraintRecord
+	colDefs      []byte
+	lastObjectID int
+}
+
+// planNewTable hands out the table's object ids and serializes what does not
+// depend on a page number.
+//
+// The ids run table, columns, indexes, constraints -- the order
+// Constraints.abs's run in (CPk is table 8, columns 9 and 10, index 11,
+// constraint 12, and the next table is 13). Reproducing that order is what
+// makes the replay in TestCreateTableWritesTheEngineSchemaStream land on the
+// engine's own ids.
+func planNewTable(
+	name string, tableID int, columns []Column, constraints []constraintRecord,
+) (newTablePlan, error) {
+	assigned := assignColumnIDs(tableID, columns)
+
+	colDefs, err := serializeColumnDefs(assigned)
+	if err != nil {
+		return newTablePlan{}, err
+	}
+
+	indexes, records, err := planTableConstraints(name, tableID+len(assigned)+1, assigned, constraints)
+	if err != nil {
+		return newTablePlan{}, err
+	}
+
+	return newTablePlan{
+		columns:      assigned,
+		indexes:      indexes,
+		constraints:  records,
+		colDefs:      colDefs,
+		lastObjectID: tableID + len(assigned) + len(indexes) + len(records),
+	}, nil
+}
+
+// internalFiles completes the plan once the pages are allocated, which is when
+// each index's root page number is finally known.
+func (p newTablePlan) internalFiles(pages newTablePages) (tableInternalFiles, error) {
+	indexArray, err := serializeIndexArray(rootIndexRecords(p.indexes, pages.keys))
+	if err != nil {
+		return tableInternalFiles{}, err
+	}
+
+	constraintArray, err := serializeConstraintArray(p.constraints)
+	if err != nil {
+		return tableInternalFiles{}, err
+	}
+
+	return tableInternalFiles{
+		colDefs:     p.colDefs,
+		indexes:     indexArray,
+		constraints: constraintArray,
+		columnCount: len(p.columns),
+	}, nil
 }
 
 // checkTableNameFree refuses a CREATE TABLE whose name is already in the
@@ -257,55 +316,144 @@ func assignColumnIDs(tableID int, columns []Column) []Column {
 	return assigned
 }
 
-// assignConstraintIDs stamps a rebuild's constraint records with the object ids
-// and owners they take in their new database: one id each starting at firstID,
-// which is the id after the last column's, and an ownerObjectID naming the
-// column the record covers.
+// planTableConstraints stamps a rebuild's constraint records with the object
+// ids and owners they take in their new database, and returns the indexes the
+// key ones need built alongside them.
 //
-// Everything else is carried over unchanged, the record's own name included.
-// Regenerating the name from a "$C_NotNull$<table>$<column>" template would
-// reproduce every name in the corpus and would still be a guess about a name
-// the engine chose; copying it cannot be wrong.
+// The ids run table, columns, indexes, constraints, so firstID -- the id after
+// the last column's -- goes to the first index if there is one and to the first
+// constraint otherwise. A key record's ownerObjectID names its index; a NOT
+// NULL or CHECK record's names the column it covers.
 //
-// A record this function cannot place is refused rather than dropped: a key
-// constraint (whose owner is an index CreateTable does not build), one naming
-// another table, one covering no column or several, and one naming a column
-// the new table does not have.
-func assignConstraintIDs(
+// Everything else is carried over unchanged, each record's own name and the
+// index name it quotes included. Regenerating a name from a
+// "$C_NotNull$<table>$<column>" template would reproduce every name in the
+// corpus and would still be a guess about a name the engine chose; copying it
+// cannot be wrong.
+//
+// A record this function cannot place is refused rather than dropped: one
+// naming another table, one covering no column or several, one naming a column
+// the new table does not have, and a key whose column is not the Int32 shape
+// an index leaf is built for.
+func planTableConstraints(
 	table string, firstID int, columns []Column, constraints []constraintRecord,
-) ([]constraintRecord, error) {
-	records := make([]constraintRecord, 0, len(constraints))
+) ([]indexRecord, []constraintRecord, error) {
+	owners := make([]Column, 0, len(constraints))
 
 	for _, rec := range constraints {
-		if rec.kind != constraintNotNull && rec.kind != constraintCheck {
-			return nil, fmt.Errorf("%w: the %s constraint %q needs an index CREATE TABLE does not build",
-				ErrConstraintsNotRebuilt, rec.kind, rec.name)
+		owner, err := constraintOwnerColumn(table, rec, columns)
+		if err != nil {
+			return nil, nil, err
 		}
 
-		if !strings.EqualFold(rec.table, table) {
-			return nil, fmt.Errorf("%w: the constraint %q names table %q, not %q",
-				ErrConstraintsNotRebuilt, rec.name, rec.table, table)
+		owners = append(owners, owner)
+	}
+
+	indexes := make([]indexRecord, 0, len(constraints))
+
+	for i, rec := range constraints {
+		if rec.kind != constraintPrimaryKey && rec.kind != constraintUnique {
+			continue
 		}
 
-		if len(rec.columns) != 1 {
-			return nil, fmt.Errorf("%w: the constraint %q covers %d columns",
-				ErrConstraintsNotRebuilt, rec.name, len(rec.columns))
+		idx, err := keyConstraintIndex(rec, owners[i], firstID+len(indexes))
+		if err != nil {
+			return nil, nil, err
 		}
 
-		owner, ok := columnByName(columns, rec.columns[0].name)
-		if !ok {
-			return nil, fmt.Errorf("%w: the constraint %q covers %q, which is not a column of %q",
-				ErrConstraintsNotRebuilt, rec.name, rec.columns[0].name, table)
-		}
+		indexes = append(indexes, idx)
+	}
 
-		rec.objectID = uint32(firstID + len(records)) //nolint:gosec // small object ids
-		rec.ownerID = owner.ID
+	records := make([]constraintRecord, 0, len(constraints))
+	nextIndex := 0
+
+	for i, rec := range constraints {
+		rec.objectID = uint32(firstID + len(indexes) + len(records)) //nolint:gosec // small object ids
+		rec.ownerID = owners[i].ID
 		rec.start, rec.end = 0, 0
+
+		if rec.kind == constraintPrimaryKey || rec.kind == constraintUnique {
+			rec.ownerID = indexes[nextIndex].objectID
+			nextIndex++
+		}
 
 		records = append(records, rec)
 	}
 
-	return records, nil
+	return indexes, records, nil
+}
+
+// constraintOwnerColumn resolves the single column a constraint record covers,
+// refusing every record this package will not place.
+//
+// An empty table name passes: a UNIQUE record CREATE UNIQUE INDEX wrote carries
+// none (testdata/Keys-uniqidx.abs), and refusing it would make such a table
+// uncompactable for a field the engine itself left blank.
+func constraintOwnerColumn(table string, rec constraintRecord, columns []Column) (Column, error) {
+	if rec.table != "" && !strings.EqualFold(rec.table, table) {
+		return Column{}, fmt.Errorf("%w: the constraint %q names table %q, not %q",
+			ErrConstraintsNotRebuilt, rec.name, rec.table, table)
+	}
+
+	if len(rec.columns) != 1 {
+		return Column{}, fmt.Errorf("%w: the constraint %q covers %d columns",
+			ErrConstraintsNotRebuilt, rec.name, len(rec.columns))
+	}
+
+	owner, ok := columnByName(columns, rec.columns[0].name)
+	if !ok {
+		return Column{}, fmt.Errorf("%w: the constraint %q covers %q, which is not a column of %q",
+			ErrConstraintsNotRebuilt, rec.name, rec.columns[0].name, table)
+	}
+
+	return owner, nil
+}
+
+// keyConstraintIndex builds the index record a PRIMARY KEY or UNIQUE record is
+// implemented by, without its root page: that is allocated later and filled in
+// by rootIndexRecords, because the stream embeds the page number and the page
+// cannot be reserved before the request is known to be buildable.
+//
+// The UNIQUE and PRIMARY flags follow the kind, which is what Constraints.abs
+// shows DBManager writing: CPk's index is primary and not unique, CUnique's is
+// unique and not primary. (A private fixture's own "p" index sets both; nothing
+// this package writes produces that.)
+func keyConstraintIndex(rec constraintRecord, owner Column, objectID int) (indexRecord, error) {
+	if rec.index == "" {
+		return indexRecord{}, fmt.Errorf("%w: the %s constraint %q names no index",
+			ErrConstraintsNotRebuilt, rec.kind, rec.name)
+	}
+
+	if owner.BaseType != BftInt32 || owner.FieldType != FieldInteger {
+		return indexRecord{}, fmt.Errorf(
+			"%w: the %s constraint %q is on %q, which is base type %d / field type %s",
+			ErrConstraintsNotRebuilt, rec.kind, rec.name, owner.Name, owner.BaseType, owner.FieldType,
+		)
+	}
+
+	return indexRecord{
+		name:     rec.index,
+		objectID: uint32(objectID), //nolint:gosec // small object ids
+		unique:   rec.kind == constraintUnique,
+		primary:  rec.kind == constraintPrimaryKey,
+		columns: []indexColumn{{
+			name:           owner.Name,
+			maxIndexedSize: indexColumnMaxIndexedSize,
+		}},
+	}, nil
+}
+
+// rootIndexRecords fills in each planned index's root page from the pages just
+// allocated for them, in the same order.
+func rootIndexRecords(indexes []indexRecord, pages []int) []indexRecord {
+	out := make([]indexRecord, len(indexes))
+
+	for i, rec := range indexes {
+		rec.rootPageNo = int32(pages[i]) //nolint:gosec // small page numbers
+		out[i] = rec
+	}
+
+	return out
 }
 
 // columnByName finds a column by name, case-insensitively like every other
@@ -356,6 +504,12 @@ type newTablePages struct {
 	schema int
 	info   int
 	index  int
+
+	// keys is one page per key constraint's backing index, allocated after
+	// the record-page index and in the order the constraints appear.
+	// Constraints.abs shows the engine allocating them there: CPk's five
+	// pages are 15 to 19 and its PRIMARY KEY index is page 20.
+	keys []int
 }
 
 // systemFilePageCount is how many pages the fresh table's system internal file
@@ -384,8 +538,9 @@ func (db *File) systemFilePageCount() int {
 
 // allocateTablePages reserves and chains CreateTable's pages, in the order the
 // engine itself allocates them (see the file comment): the system internal
-// file's chain first, then schema, then info, then index.
-func (db *File) allocateTablePages(w *pageEdit) (newTablePages, error) {
+// file's chain first, then schema, then info, then the record-page index, then
+// one page per key constraint's own index.
+func (db *File) allocateTablePages(w *pageEdit, keys int) (newTablePages, error) {
 	var pages newTablePages
 
 	systemPages, err := db.allocatePages(w, db.systemFilePageCount(), PageTypeSystem, -1)
@@ -415,21 +570,33 @@ func (db *File) allocateTablePages(w *pageEdit) (newTablePages, error) {
 
 	pages.info = infoPages[0]
 
-	indexPages, err := db.allocatePages(w, 1, PageTypeIndex, -1)
+	indexPages, err := db.allocatePages(w, 1+keys, PageTypeIndex, -1)
 	if err != nil {
 		return pages, err
 	}
 
 	pages.index = indexPages[0]
+	pages.keys = indexPages[1:]
 
 	return pages, nil
 }
 
+// tableInternalFiles is the serialized content CreateTable has ready before it
+// allocates anything: the column definitions, the index array and the
+// constraint array of the schema stream, plus the column count the counters
+// file opens with.
+type tableInternalFiles struct {
+	colDefs     []byte
+	indexes     []byte
+	constraints []byte
+	columnCount int
+}
+
 // writeTableInternalFiles writes the content of every one of CreateTable's new
-// pages: the all-zero system file, the empty B-tree index root, the
+// pages: the all-zero system file, the empty B-tree index roots, the
 // column-definition file, and the counters file.
 func (db *File) writeTableInternalFiles(
-	w *pageEdit, pages newTablePages, colDefs, constraints []byte, columnCount int,
+	w *pageEdit, pages newTablePages, files tableInternalFiles,
 ) error {
 	if err := db.writeInternalFilePages(w, pages.system[0], buildSystemInternalFile()); err != nil {
 		return err
@@ -439,7 +606,19 @@ func (db *File) writeTableInternalFiles(
 		return err
 	}
 
-	schemaFile, err := compressInternalFile(buildSchemaFile(colDefs, constraints, pages.index), 1)
+	// A key constraint's index starts empty, and an empty one is the
+	// record-page index's page with a 5-byte key instead of a 4-byte one:
+	// pages 20 and 26 of Constraints.abs are byte-identical to page 19 but
+	// for that field.
+	for _, pageNo := range pages.keys {
+		if err := db.writeIndexLeaf(w, pageNo, nil); err != nil {
+			return err
+		}
+	}
+
+	schemaFile, err := compressInternalFile(
+		buildSchemaFile(files.colDefs, files.indexes, files.constraints, pages.index), 1,
+	)
 	if err != nil {
 		return err
 	}
@@ -448,7 +627,7 @@ func (db *File) writeTableInternalFiles(
 		return err
 	}
 
-	infoFile, err := compressInternalFile(buildTableInfoFile(columnCount), 0)
+	infoFile, err := compressInternalFile(buildTableInfoFile(files.columnCount), 0)
 	if err != nil {
 		return err
 	}
@@ -513,23 +692,20 @@ func buildTableInfoFile(columnCount int) []byte {
 }
 
 // buildSchemaFile assembles the column-definition internal file: columnCount,
-// the column definitions themselves, an empty index-definition array (a freshly
-// created table has none), the constraint array, and the trailer
-// systemIndexRoots reads.
+// the column definitions themselves, the index-definition array, the
+// constraint array, and the trailer systemIndexRoots reads.
 //
-// A fresh table's index array is empty because CREATE TABLE never creates one:
-// the primary-key index a constrained table would need is the reason a key
-// constraint is still refused. The constraint array is not: constraints comes
-// in already serialized, so a table created with a NOT NULL or a
-// MINVALUE/MAXVALUE pair declares it from the moment it exists, rather than
-// having it spliced in afterwards as a second transaction the engine never
-// performs.
-func buildSchemaFile(colDefs, constraints []byte, recordIndexRoot int) []byte {
+// Both arrays come in already serialized, so a table created with a NOT NULL,
+// a MINVALUE/MAXVALUE pair or a PRIMARY KEY declares it from the moment it
+// exists, rather than having it spliced in afterwards as a second transaction
+// the engine never performs. A table with no key constraint gets the empty
+// index array a fresh CREATE TABLE writes.
+func buildSchemaFile(colDefs, indexes, constraints []byte, recordIndexRoot int) []byte {
 	// colDefs already opens with its own columnCount int32, written by
 	// serializeColumnDefs, so it is copied in as-is.
-	out := make([]byte, 0, len(colDefs)+4+len(constraints)+schemaTrailerSize)
+	out := make([]byte, 0, len(colDefs)+len(indexes)+len(constraints)+schemaTrailerSize)
 	out = append(out, colDefs...)
-	out = binary.LittleEndian.AppendUint32(out, 0) // indexCount
+	out = append(out, indexes...)
 	out = append(out, constraints...)
 	out = binary.LittleEndian.AppendUint32(out, uint32(int32(recordIndexRoot))) //nolint:gosec // page number
 
