@@ -3,15 +3,17 @@
 Almost everything in this directory is **deliberately not committed**. The `.abs`
 fixtures the parser is developed against are real customer project data, and
 `.gitignore` excludes `testdata/*` for that reason. A fresh clone therefore has only the
-`Employees-*`, `Writes*` and `MultiTable*` fixtures below, and every test that needs one of
-the others skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
+`Employees-*`, `Writes*`, `MultiTable*`, `Empty*` and `Constraints` fixtures below, and every
+test that needs one of the others skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
 validated against real customer files — run `just test` locally for that.
 
 ## The committed fixtures
 
-Three sets are committed: the eight `Employees-*.abs` files, one per encryption algorithm,
-the fourteen `Writes*.abs` files that pin the write path, and the eight `MultiTable*.abs` files
-that pin the table catalog and the schema operations over it.
+Five sets are committed, forty files in all: the eight `Employees-*.abs` files, one per
+encryption algorithm, the fourteen `Writes*.abs` files that pin the write path, the twelve
+`MultiTable*.abs` files that pin the table catalog and the schema operations over it, the five
+`Empty*.abs` files that pin what the engine writes for a brand-new database, and
+`Constraints.abs`, which isolates one column constraint or index variation per table.
 
 ### `Employees-*.abs` — one per encryption algorithm
 
@@ -125,20 +127,24 @@ name and the invented row values.
 
 ### `MultiTable*.abs` — the table catalog and the schema operations over it
 
-Eight unencrypted files, the only ones in the corpus holding more than one table. Every
+Twelve unencrypted files, the only ones in the corpus holding more than one table. Every
 other fixture, customer files included, has exactly one, which is why the multi-table bug
 they close survived unnoticed for so long.
 
-| File                        | Made from               | Contents                                           |
-| --------------------------- | ----------------------- | -------------------------------------------------- |
-| `MultiTable.abs`            | created fresh           | `Alpha`, `Beta`, `Gamma` + `CREATE INDEX` on Alpha |
-| `MultiTable-drop.abs`       | `MultiTable.abs`        | the same, then `DROP TABLE Beta`                   |
-| `MultiTable-dropfirst.abs`  | `MultiTable.abs`        | the same, then `DROP TABLE Alpha`                  |
-| `MultiTable-droplast.abs`   | `MultiTable.abs`        | the same, then `DROP TABLE Gamma`                  |
-| `MultiTable-create.abs`     | `MultiTable.abs`        | the same, then `CREATE TABLE Delta (X, Y)`         |
-| `MultiTable-createdrop.abs` | `MultiTable-create.abs` | the same, then `DROP TABLE Delta`                  |
-| `MultiTable-alteradd.abs`   | `MultiTable.abs`        | the same, then `ALTER TABLE Gamma ADD (W INTEGER)` |
-| `MultiTable-alterdrop.abs`  | `MultiTable.abs`        | the same, then `ALTER TABLE Gamma DROP (V)`        |
+| File                           | Made from                  | Contents                                             |
+| ------------------------------ | -------------------------- | ---------------------------------------------------- |
+| `MultiTable.abs`               | created fresh              | `Alpha`, `Beta`, `Gamma` + `CREATE INDEX` on Alpha   |
+| `MultiTable-drop.abs`          | `MultiTable.abs`           | the same, then `DROP TABLE Beta`                     |
+| `MultiTable-dropfirst.abs`     | `MultiTable.abs`           | the same, then `DROP TABLE Alpha`                    |
+| `MultiTable-droplast.abs`      | `MultiTable.abs`           | the same, then `DROP TABLE Gamma`                    |
+| `MultiTable-create.abs`        | `MultiTable.abs`           | the same, then `CREATE TABLE Delta (X, Y)`           |
+| `MultiTable-createdrop.abs`    | `MultiTable-create.abs`    | the same, then `DROP TABLE Delta`                    |
+| `MultiTable-alteradd.abs`      | `MultiTable.abs`           | the same, then `ALTER TABLE Gamma ADD (W INTEGER)`   |
+| `MultiTable-alterdrop.abs`     | `MultiTable.abs`           | the same, then `ALTER TABLE Gamma DROP (V)`          |
+| `MultiTable-createidx.abs`     | `MultiTable-create.abs`    | the same, then `CREATE INDEX IdxDeltaX ON Delta (X)` |
+| `MultiTable-createidxgrow.abs` | `MultiTable-createidx.abs` | the same, then `CREATE INDEX IdxDeltaY ON Delta (Y)` |
+| `MultiTable-createidxtab.abs`  | `MultiTable-createidx.abs` | the same, then `CREATE TABLE Epsilon (X, Y)`         |
+| `MultiTable-dropcompact.abs`   | `MultiTable-drop.abs`      | the same, then `Database -> Compact Database`        |
 
 The `drop*` files are what `TestDropTableMatchesEngineByteForByte` holds the drop to, and each
 covers something the original pair could not. Dropping `Alpha` rewrites every catalog entry
@@ -162,6 +168,19 @@ what the engine does"; `TestAlterTableMatchesEngineSemantically` and
 (two for the table's system internal file, one each for the column definitions, the
 counters and the record page index) and **no data page** — that arrives with the first
 insert.
+
+The four newest files are the growth and compaction set. `MultiTable-createidx.abs` matters
+for what it _lacks_: `CREATE INDEX` costs exactly one page, and `MultiTable-create.abs` had
+exactly one free, so the result is the only file in the corpus with **zero free pages** — the
+base from which a grow event can be observed on its own, with no page reuse mixed into the
+diff. The two files derived from it then pin the rule: a one-page request and a five-page
+request both extend the file by a single eight-page extent, and `Empty-p2048-e4-grow.abs`
+below extends by two four-page ones, which is what shows the step is `PageCountInExtent`
+rather than a constant. `MultiTable-dropcompact.abs` is what `Database -> Compact Database`
+wrote for a file with twelve free pages: eighteen pages where thirty were, no free page left,
+the file `State` reset from 12 to 6 and `LastObjectID` from 11 to 7. Object ids being
+reallocated is the proof that compaction is a rebuild into a new file rather than a
+defragment in place — the engine's `CompactDatabase` calls `InternalCopyDatabase`.
 
 The three tables are deliberately different shapes, so that anything reading one through
 another's schema is obvious rather than subtle:
@@ -194,6 +213,88 @@ They contain no customer data and no vendor material, checked the same way as th
 committed fixtures: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the three
 invented table names and the invented row values, and no UTF-16 strings at all.
 
+### `Empty*.abs` — what the engine writes for a brand-new database
+
+Five files, each produced by DBManager's File -> Create Database with one setting changed
+from the defaults, so that every field can be attributed to the setting that moved it.
+
+| File                      | Setting changed from the defaults                               | Bytes |
+| ------------------------- | --------------------------------------------------------------- | ----- |
+| `Empty.abs`               | none — 4096 / extent 8 / 500 conn                               | 24956 |
+| `Empty-p2048-e4.abs`      | `PageSize` 2048, extent 4                                       | 12668 |
+| `Empty-encrypted.abs`     | encrypted, Rijndael_128, `Bla`                                  | 24956 |
+| `Empty-mc100.abs`         | `Max Connections` 100                                           | 24956 |
+| `Empty-p2048-e4-grow.abs` | `Empty-p2048-e4.abs` + `CREATE TABLE T1 (X INTEGER, Y INTEGER)` | 29052 |
+
+A fresh database is exactly **six pages** — five allocated, one free — with `LastUsedPageNo`
+4, `State` 1 and `LastObjectID` 0. That is the same shape the engine truncates down to when
+the last table is dropped, which is what `ErrLastTable` was refusing to guess at.
+
+What the one-variable-at-a-time diffs settle:
+
+- **Geometry.** `Empty.abs` against `Empty-p2048-e4.abs` differs in the 380-byte header by
+  **exactly two bytes** — `PageSize` at offset 26 and `PageCountInExtent` at 28. Nothing else
+  in the header depends on the page size.
+- **Encryption.** `Empty-encrypted.abs` sets offset 43 to **`0xFF`**, not 1, and fills offsets
+  **80..339** with 260 bytes of key material that are all zero in an unencrypted file.
+- **Max Connections is not a header field at all.** `Empty-mc100.abs` differs from `Empty.abs`
+  only in the random `State` words of pages 2, 3 and 4 and in **page 3's internal-file Size**,
+  `0x1F4` (500) -> `0x64` (100). Page 3 holds a zero-filled connection table of that many
+  bytes. Without this file the 500 would have looked like a header constant.
+
+The system pages are otherwise fixed. An internal file begins with a ten-byte header —
+`0x0A` version, `int32 Size`, `int32 DecompressedSize`, `byte CompressionAlgorithm` — and
+**page 2 is byte-identical in every database examined**, a twenty-byte directory naming page
+3 and page 4. Page 4 is the table catalog, empty here.
+
+Three of them are now byte targets: `TestCreateDatabaseMatchesEngineByteForByte` reproduces
+`Empty.abs`, `Empty-p2048-e4.abs` and `Empty-mc100.abs` with twelve bytes excluded, the
+`State` words of pages 2, 3 and 4. Pages 0 and 1 are reproduced exactly, which is how their
+`State`s were identified as counters rather than random seeds — and the 2048/extent-4 file's
+Extent Allocation Map count of **3** is what says the engine allocates a fresh database's
+five pages one at a time rather than in a batch. `Empty-encrypted.abs` is the one this
+package cannot write: the 260 bytes at 80..339 are located but undecoded, so
+`CreateDatabase` refuses `Encrypted: true` rather than guessing.
+
+### `Constraints.abs` — one variation per table
+
+Twelve two-column tables in one database, each differing from the control in exactly one
+clause, so that subtracting the control's schema stream isolates a single record. It is to
+the schema tail's constraint records what `Writes.abs`/`Writes-idx.abs` were to its index
+record, and it exists because those records are what made `parseSchemaTail` refuse most real
+customer tables.
+
+| Table        | Declaration                                       | Isolates                               |
+| ------------ | ------------------------------------------------- | -------------------------------------- |
+| `CNone`      | `(A INTEGER, B VARCHAR(10))`                      | the control — no constraint, no index  |
+| `CNotNull`   | `A INTEGER NOT NULL`                              | the required flag                      |
+| `CPk`        | `A INTEGER PRIMARY KEY`                           | primary key, and its implicit index    |
+| `CUnique`    | `A INTEGER UNIQUE`                                | unique                                 |
+| `CDefault`   | `A INTEGER DEFAULT 7`                             | a constraint carrying a typed value    |
+| `CMinMax`    | `A INTEGER MINVALUE 0 MAXVALUE 99`                | two value-carrying records, one column |
+| `CBoth`      | `A INTEGER NOT NULL, B VARCHAR(10) UNIQUE`        | two records on two columns             |
+| `CPkMulti`   | `PRIMARY KEY (A, B)`                              | a multi-column key                     |
+| `CIdxOne`    | `CREATE INDEX IdxOne ON CIdxOne (A)`              | the single-column index record         |
+| `CIdxDesc`   | `CREATE INDEX IdxDesc ON CIdxDesc (A DESC)`       | the descending flag                    |
+| `CIdxMulti`  | `CREATE INDEX IdxMulti ON CIdxMulti (A, B)`       | a multi-column index record            |
+| `CIdxNoCase` | `CREATE INDEX IdxNoCase ON CIdxNoCase (B NOCASE)` | the case-insensitive flag              |
+
+It paid for itself twice over. Besides settling the constraint record's layout — the `int32` the
+old parser read as a reserved zero is the **constraint count**, and there are two arrays in the
+tail rather than one — it turned up a **read** bug. `DEFAULT` is not stored as a constraint record
+at all; it lives in the column definition as a typed value, which moves the column terminator.
+`findColumnTerminator` did not know that, so `CDefault` could not be opened at all. Across the
+whole corpus that is the only table whose parse changed: 20 customer tables went from refused to
+parsed, and `CDefault` from unreadable to readable, with every other column list and row digest
+identical before and after.
+
+Two sources in `legacy/` corroborate the vocabulary rather than leaving it to inference: the
+manual's `CREATE TABLE` grammar (`7z x -so legacy/Help/AbsDbManual.chm createtablestatement.htm`)
+and DBManager's own Table Properties dialog, which lists the per-field columns as Name, Type,
+Size, Required, Default, MinValue, MaxValue, BLOBCompressionAlgorithm, BLOBCompressionMode,
+BLOBBlockSize, and the per-index-column ones as ColumnName, CaseInsensitive, Asc,
+MaxIndexedSize.
+
 ## Regenerating them
 
 They can be recreated on Linux by driving `DBManager.exe` from the SDK under Wine with a
@@ -207,19 +308,32 @@ virtual desktop. Three things make it much easier than it first appears:
   with `xdotool type` and clicking the button is markedly more robust than driving
   `SQL → Execute SQL Script` through a file dialog: no file to write, no dialog
   coordinates to get right, and the result is legible in one screenshot.
-- `SQL → Execute SQL Script` runs a whole semicolon-separated `.sql` file in one pass, so
-  the `CREATE TABLE` / `INSERT` / `CREATE INDEX` statements above need no per-statement
-  typing.
+- `SQL → Execute SQL Script` runs a whole semicolon-separated `.sql` file in one pass, and
+  is the right tool the moment a fixture needs more than one statement — `Constraints.abs`
+  is sixteen of them and took one file dialog. Its parser skips `--` and `/* */` comments
+  and quoted text, so the script can be commented. The dialog opens in the last-used
+  directory, so write the `.sql` next to the working copies and it is one double-click.
+- `File → Create Database` makes a fixture from nothing. Its Database Properties dialog
+  **remembers the previous run's settings, the Encrypted tick and password included**, so
+  reset every field explicitly — otherwise a file meant to vary one thing varies three.
 - Clearing `HKCU\Software\ComponentAce\Absolute Database\DatabaseManager\History\File1..5`
   before launch stops DBManager reopening the last database and prompting for its
-  password.
+  password. If it does reopen one, the window title is `AbsDb Manager {path}` and a search
+  for `Absolute Database Manager` finds nothing.
+- DBManager's own Delphi source is in `legacy/Utils/Source/DBManager/`. Read it rather than
+  guessing at the GUI: the script runner's parser, the file dialog's behaviour and
+  `aCompactDatabaseExecute` (which does nothing but call `db.CompactDatabase`) all came from
+  there. `ABSDiskEngine.hpp` beside it names the free-space manager's entire API, and
+  `AbsDbManual.chm` (`7z x -so`) documents the SQL grammar.
 
 Verify the result by reading the file rather than by screenshot: byte 43 is the
 `Encrypted` flag and byte 78 is the algorithm, which must match the table above.
 
-The `Writes*` and `MultiTable*` files use the same route with the encryption checkbox left
-off, opening a copy of the parent through `argv[1]` and typing the one statement into the
-SQL tab.
+The `Writes*`, `MultiTable*`, `Empty*` and `Constraints` files use the same route with the
+encryption checkbox left off, opening a copy of the parent through `argv[1]` and typing the
+one statement into the SQL tab.
+**Always work on copies in a scratch directory.** The file dialogs open wherever they were
+last used, and that is often this directory, which is full of irreplaceable customer files.
 Verify those by bytes too: a derived file must actually differ from its parent
 (`cmp -l parent child | wc -l`), because a script that silently failed to run produces a
 file that is byte-identical to its parent and looks like a valid fixture.

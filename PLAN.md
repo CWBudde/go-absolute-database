@@ -838,7 +838,8 @@ UncompressedSize`), so the decompression path had never executed.
 - [x] Test: look up train type by name in TS03.abs ("EC / IC" → page 13, item 2)
 - [x] Test: primary key lookup across TS03 (1–18) and RPDG0011
 - [x] Test: full index scan returns 18 sorted entries for both primary and secondary indexes
-- [ ] Decode index definition records from schema metadata — deferred (complex serialization)
+- [x] Decode index definition records from schema metadata — done, and the constraint records
+      beside them; see "The schema tail's second array" in Phase 8
 - [ ] Benchmark: index lookup vs full scan — deferred
 
 ---
@@ -1539,9 +1540,15 @@ Phase 8.
 
 ---
 
-## Phase 8 — Write support: schema operations
+## Phase 8 — Write support: schema operations — DONE
 
 **Goal:** Create tables, add/remove columns, manage indexes.
+
+Every box below is ticked, including the two that were added mid-phase — file growth and
+`CreateDatabase` — neither of which was in the original plan. What the phase does _not_ do is
+as important as what it does, and each refusal is named and evidenced rather than pending:
+no encrypted writes, no constraint records written back, no index shape beyond a single-page
+single-column ascending `Int32` key, and no `ALTER TABLE` that rebuilds the way the engine does.
 
 ### Steps
 
@@ -1554,11 +1561,24 @@ Phase 8.
 - [x] Implement `ALTER TABLE DROP COLUMN` — update schema, re-encode existing records
 - [x] Implement `CREATE INDEX` — build B-tree from existing data
 - [x] Implement `DROP INDEX` — remove index pages, update schema
-- [ ] Implement database growth — extend a file by an extent when no free pages remain. Not
-      previously listed: it surfaced as the reason an engine-faithful `ALTER TABLE` is out of
-      reach, since every file in the corpus but `MultiTable.abs` has too few free pages for one.
-      No fixture captures a grow event, so it needs one before it can be written.
-- [ ] Implement database compaction (defragment free space)
+- [x] Implement database growth — extend a file by whole extents when no free page remains.
+      Not previously listed: it surfaced as the reason an engine-faithful `ALTER TABLE` is out
+      of reach, since every file in the corpus but `MultiTable.abs` has too few free pages for
+      one. Four fixtures now capture grow events across two geometries — see "How the file
+      grows" below.
+- [x] Implement `CreateDatabase` — write an `.abs` from nothing (`ddl_database.go`). Not
+      previously listed; it is the prerequisite for the box below. It reproduces `Empty.abs`,
+      `Empty-p2048-e4.abs` and `Empty-mc100.abs` byte for byte with twelve bytes excluded —
+      the `State` words of the three pages the engine seeds randomly — see "What a fresh
+      database contains" below.
+- [x] Implement database compaction (`ddl_compact.go`). **The box used to read "defragment free
+      space", which is not what the engine does.** `TABSDatabase.CompactDatabase` routes to
+      `InternalCopyDatabase`, the SDK help calls the result "a new compact copy of a database",
+      and DBManager's handler (`legacy/Utils/Source/DBManager/main.pas:1420`) closes the
+      database, calls the no-argument overload and reopens it. It is a full rebuild into a new
+      file, so it needed `CreateDatabase` first — see "What compaction actually is" below,
+      including why the byte identity this box was written off as unable to reach turned out to
+      be reachable after all.
 
 ### What blocked the other five, and how it was unblocked
 
@@ -1693,16 +1713,21 @@ Every counter in the file agrees, and nothing else explains all of them at once:
 This package splices the schema stream and rewrites the records in place instead: three
 pages touched, thirty bytes, object ids preserved.
 
-**Reproducing the engine's sequence was considered and deliberately rejected.** It needs six
-free pages, and nothing in this package can grow a database. `MultiTable.abs` is the only
-file in the entire corpus that has six — `Writes.abs` has three, every `Employees-*.abs` has
-two, and the customer fixtures have between none and five. An engine-faithful `ALTER TABLE`
-would be byte-perfect on one fixture and refuse on every other file this package exists to
-read. File growth would fix that, but no fixture in the corpus captures a grow event, so its
-accounting would be inferred rather than verified — the one thing the byte-identity tests
-exist to prevent.
+**Reproducing the engine's sequence was considered and deliberately rejected — and the reason
+has since expired.** It needed six free pages, and at the time nothing in this package could
+grow a database. `MultiTable.abs` is the only file in the entire corpus that has six —
+`Writes.abs` has three, every `Employees-*.abs` has two, and the customer fixtures have
+between none and five. An engine-faithful `ALTER TABLE` would have been byte-perfect on one
+fixture and refused on every other file this package exists to read.
 
-So byte identity is out of reach here, recorded as a measured divergence rather than an open
+`ddl_grow.go` has since removed that constraint: the file extends by whole extents on demand,
+and four fixtures measure the rule. **So the rebuild is no longer blocked — it is merely not
+done.** What it would still have to reproduce is the entire four-transaction sequence above,
+three catalog writes and a fresh set of object ids included, which is a good deal more work
+than allocating six pages. It is recorded here as an open question rather than a closed one,
+so that the reasoning does not outlive the constraint that produced it.
+
+So byte identity is out of reach here today, recorded as a measured divergence rather than an open
 question. What the fixtures do pin:
 
 - `TestAlterTableMatchesEngineSemantically` — run the statement through this package and
@@ -1813,6 +1838,187 @@ rows are the fixtures this phase still wants — see above. The recipe in
 | `ALTER TABLE Gamma DROP (V)`              | 234   | as above                                                                                                                                                                                                                                                                      |
 | `CREATE INDEX IdxBetaCode ON Beta (Code)` | 93    | allocates one index page, rewrites `Beta`'s column definitions, moves `LastObjectID` by 1                                                                                                                                                                                     |
 | `DROP INDEX Alpha.IdxAlphaId`             | 25    | frees the index page, rewrites `Alpha`'s column definitions                                                                                                                                                                                                                   |
+
+### The schema tail's second array — constraint records, decoded
+
+`parseSchemaTail` used to accept a tail only when exactly the eight-byte trailer followed the
+index-record array, and refused everything else with `ErrSchemaTailNotUnderstood`. That covered
+**20 customer tables** — nearly every real one, since almost all of them carry a `NOT NULL` or a
+key — and it took `CREATE INDEX`, `DROP INDEX`, `DROP COLUMN` and index maintenance down with it.
+
+The layout is now decoded, and the first finding is that the region was mis-described. What the
+old code called a reserved `int32` that happened to be zero is a **count**:
+
+```
+int32 indexCount | index records | int32 constraintCount | constraint records | int32 recordIndexRoot | int32 blobIndexRoot
+```
+
+Every constraint record opens the same way — `byte kind` (0 `PRIMARY KEY`, 2 `UNIQUE`, 3
+`NOT NULL`, 4 `CHECK` for `MINVALUE`/`MAXVALUE`; 1 is unobserved and refused), a Pascal name,
+an `int32` object id from the same database-wide sequence tables and columns draw from, eight
+reserved bytes that are zero in all 66 records in the corpus, and an `int32` naming what the
+constraint hangs off: the covered column for kinds 3 and 4, the backing index for 0 and 2.
+
+The body then splits, and the split is the one real surprise: **key-shaped records size their
+strings and counts with `int32` fields, column-shaped ones size the same fields with single
+bytes.** A typed value is `byte baseType, byte flag`, `0xFF` absent and `0x00` present followed
+by an `int32` size and its payload.
+
+The index record gained detail from the same fixture. Its "three reserved bytes" are
+`[0, UNIQUE, PRIMARY]` ByteBools, its covered-column count really can exceed one, and its "two
+reserved bytes plus a `0x14` terminator" is a per-covered-column `[DESC, NOCASE]` pair followed
+by an `int32 MaxIndexedSize`. `serializeIndexRecord` emits the same bytes it always did, which
+is why the byte-identity tests pass unchanged.
+
+**`DEFAULT` is not a constraint record at all** — it lives in the column definition, as the same
+`baseType`/flag/value triple. That is not a curiosity: it means a `DEFAULT` clause moves the
+column terminator, `findColumnTerminator` did not know it, and `Constraints.abs`'s `CDefault`
+table **could not be opened at all** before this. A read bug, found by a write-path fixture.
+
+The whole corpus now parses: **20 refusing customer tables became 0**, and a before-and-after
+diff of every fixture's column list and row digest shows exactly one change anywhere — `CDefault`
+going from unreadable to readable.
+
+What is still refused, and deliberately: an unobserved constraint kind, a non-zero reserved
+field, a body count other than 1, a size disagreeing with its string, an index flag byte that is
+neither `0x00` nor `0xFF`, a `MaxIndexedSize` other than `0x14`, and any leftover bytes. New with
+this work, `ErrIndexBacksConstraint` refuses `DROP INDEX` on the index a `PRIMARY KEY` or `UNIQUE`
+is built on — DBManager drops the constraint, not the index — and `DropColumn` now refuses only a
+column a record actually covers, where the old text scan flagged any column whose name appeared
+anywhere in the tail.
+
+Index maintenance still refuses every indexed customer fixture, and the reason has changed in a
+way worth recording: it used to be that the tail could not be read, and it is now the index shapes
+themselves — multi-column, `DESC`, `NOCASE`, or backing a uniqueness constraint this package does
+not check. Same outcome, stated reason.
+
+### How the file grows
+
+`ABSDiskEngine.hpp` names the machinery rather than leaving it to inference:
+`TABSDatabaseFreeSpaceManager` exports `GetPage(DesiredStartPageNo)`, `FindAndReusePage`,
+**`AddNewPageAndExtentFile`**, `AddPagesStep`/`DelPagesStep`, `TruncateFile` and
+`FindLastUsedPageNo`, over `TABSDiskPageManager.ExtendFile(PageCount)`. It also exports
+`PfsPageNoForPageNo`, `EamPageNoForPageNo` and `IsPagePfsOrEam`, so for a large enough file the
+PFS and EAM are **not** just pages 0 and 1 — they recur. Nothing in this corpus is close: the
+PFS payload addresses 32 448 pages at a 4096-byte page size, and the largest file anywhere in
+the corpus is 78.
+
+**The rule is `ceil(shortfall / PageCountInExtent)` whole extents.** Four measurements over two
+geometries, because one geometry cannot tell the extent size from the constant 8:
+
+| base                       | geometry | free | needed | shortfall | grew by              |
+| -------------------------- | -------- | ---- | ------ | --------- | -------------------- |
+| `MultiTable-createidx.abs` | 4096 / 8 | 0    | 1      | 1         | +8 — one extent      |
+| `MultiTable-createidx.abs` | 4096 / 8 | 0    | 5      | 5         | +8 — one extent      |
+| `Empty-p2048-e4.abs`       | 2048 / 4 | 1    | 6      | 5         | +8 — **two** extents |
+| (measured, not committed)  | 2048 / 4 | 3    | 6      | 3         | +4 — one extent      |
+
+A multi-page request causes **one** extension sized to cover it, never a loop of one-page ones.
+`MultiTable-createidx.abs` earns its keep by being the only file in the corpus with **zero**
+free pages, so a grow event can be observed with no page reuse mixed into the diff.
+
+The whole of that diff, for the one-page case:
+
+```
+hdr+30  TotalPageCount   30 -> 38
+hdr+34  LastUsedPageNo   29 -> 30
+hdr+38  State            13 -> 14
+hdr+376 LastObjectID     15 -> 16
+p0 +4   State            30 -> 31      (page 0 advances once per PFS bit set)
+p0 +43  PFS payload[3]   0x3F -> 0x7F  (the single bit for page 30)
+```
+
+Three consequences, each of which an implementation would otherwise have guessed wrong:
+
+- The appended pages are **pure zeros**. No `ABSP` header is stamped until something allocates
+  them — verified directly: pages 31–37 hold not one non-zero byte.
+- **Page 1, the EAM, is not written at all**, and its `State` does not move. A new extent is
+  already zero in the existing payload, so there is nothing to write.
+- `TotalPageCount` at header offset 30 was read at `absdb.go:414` and written **nowhere**. It
+  is the fourth header setter, beside `LastUsedPageNo`, `LastObjectID` and `State`.
+
+### What a fresh database contains
+
+`Empty*.abs` are five brand-new databases from `File → Create Database`, each with one setting
+changed, so every byte can be attributed to the setting that moved it.
+
+A fresh database is exactly **six pages** — five allocated, one free — with `LastUsedPageNo` 4,
+`State` 1 and `LastObjectID` 0, and page types 3, 2, 4, 5, 6. That is precisely the shape
+recorded above for a `MultiTable.abs` with all three tables dropped ("6 pages where 30 were,
+`LastUsedPageNo` at 4"), so the truncation floor `ErrLastTable` refused to guess at is now
+evidenced.
+
+The 380-byte header turns out to be nearly constant:
+
+- `Empty.abs` against `Empty-p2048-e4.abs` differs by **exactly two header bytes** — `PageSize`
+  at 26 and `PageCountInExtent` at 28.
+- `Empty-encrypted.abs` sets offset 43 to **`0xFF`**, not 1, and fills offsets **80–339** with
+  260 bytes of key material that are all zero in an unencrypted file.
+- **`Max Connections` is not a header field.** `Empty-mc100.abs` differs from `Empty.abs` only
+  in the `State` words of pages 2, 3 and 4 and in **page 3's internal-file `Size`**, `0x1F4`
+  (500) → `0x64` (100). Page 3 is a zero-filled connection table of that many bytes. Without
+  that one file the 500 would have read as a header constant.
+
+An internal file starts with a ten-byte header — `0x0A` version, `int32 Size`,
+`int32 DecompressedSize`, `byte CompressionAlgorithm`. **Page 2 is byte-identical in every
+database examined**: a twenty-byte directory whose two entries name page 3 and page 4. Page 4
+is the table catalog, zero-length in a fresh file. The connection table is the one internal
+file that sets `Size` and leaves `DecompressedSize` at **zero**; `buildZeroInternalFile` in
+`ddl_database.go` reproduces that asymmetry rather than tidying it.
+
+Writing the file back is what pinned down the two allocation maps' `State` words, which are
+**counters, not seeds** — the only page `State`s in the corpus that are. Page 0's counts one
+bump per bit set in the Page Free Space map. Page 1's counts one bump per Extent Allocation
+Map entry that _changed value_, and it is the sharpest measurement in the whole set: at
+4096/8 a fresh database reads 1, at 2048/4 it reads **3**. A writer that allocated its five
+pages in one batch would record 2. The 3 says the engine allocates them **one at a time**,
+re-deriving the extent state after each, and `CreateDatabase` does the same for no other
+reason than that this byte says so.
+
+### What compaction actually is
+
+Not a defragment. `TABSDatabase.CompactDatabase` has two overloads and both go to
+`InternalCopyDatabase(NewDatabaseFileName, …)`; the SDK help says "If NewDatabaseFileName
+specified then a new compact copy of a database is created"; and DBManager's menu handler
+closes the database, calls the no-argument form, and reopens whatever it left behind.
+
+`MultiTable-dropcompact.abs` — `Database → Compact Database` on `MultiTable-drop.abs`, which had
+twelve free pages — settles it:
+
+|                  | before          | after                                  |
+| ---------------- | --------------- | -------------------------------------- |
+| pages            | 30, twelve free | **18, none free**                      |
+| `LastUsedPageNo` | 23              | 17                                     |
+| file `State`     | 12              | **6**                                  |
+| `LastObjectID`   | 11              | **7** — `Gamma` goes from id 8 to id 5 |
+
+A file whose transaction counter has been **reset** and whose object ids have been **reallocated**
+is not the input file with its holes squeezed out; it is a new file. The output is exactly
+`CreateDatabase` + `CREATE TABLE` + copy rows + `CREATE INDEX` per table in catalog order,
+which is also how it should be implemented.
+
+This section used to end by concluding that byte identity was therefore out of reach here for a
+stronger reason than with `ALTER TABLE`: not only is every page's `State` reseeded, every object
+id is different too. **That conclusion was wrong**, and `TestCompactDatabaseMatchesEngineByteForByte`
+is the refutation — `CompactDatabase` reproduces this fixture with sixteen page `State` words
+excluded and nothing else. The error was reading "the ids are different" as "the ids are
+unpredictable". They differ from the _input_ file, but they are fully determined in the _output_
+by the order in which objects are created, and replaying that order hands out the same ones.
+Pages 0 and 1 are not excluded either: their `State`s are the two allocation counters, and
+reproducing 18 and 5 exactly is most of what the test proves. The semantic test is kept beside
+it, in the register of `TestAlterTableMatchesEngineSemantically`, so a future divergence names
+the property that broke rather than the offset; `TestEngineCompactionRebuildsTheDatabase` pins
+the engine's strategy so the reasoning above cannot go stale.
+
+Two things the implementation had to learn from the fixture rather than from the SDK:
+
+- The per-table order is **`CREATE TABLE` → `CREATE INDEX` → copy rows**, not rows before
+  indexes: a table's index page lands _ahead_ of its data page in the engine's output.
+- Rebuilding by whole extents overshoots — 22 pages where the engine wrote 18 — so compaction
+  ends by **shortening the file** to `LastUsedPageNo + 1` (`shrinkToLastUsedPage`). This is the
+  corpus's only evidence of the engine making a file smaller, and its floor is the six pages of
+  a fresh database: a database with no tables uses five, but `CreateDatabase` writes six, so
+  compacting `Empty.abs` reproduces `Empty.abs`.
 
 ---
 
@@ -1967,32 +2173,50 @@ an independent decoder for every fixture.
    requires it with no `replace`. Re-tag from `main` and bump Aconiq. This is the only
    item left in this list, and it is not something to do from here: it changes what
    `../Aconiq` resolves to.
-5. ~~**Phase 8 — schema operations.**~~ Done except database compaction. `internal/zlib1`
-   reproduces the engine's C-zlib-level-1 streams, which unblocked the five operations that
-   rewrite one, and `CREATE TABLE`, `CREATE INDEX`, `DROP INDEX` and both `ALTER TABLE`
-   forms are implemented alongside the existing `DROP TABLE`. `CREATE TABLE` and
-   `CREATE INDEX` are checked against the engine's own bytes; `ALTER TABLE` is not, because
-   no fixture for it exists — see Phase 8 for exactly what that leaves unproven.
+5. ~~**Phase 8 — schema operations.**~~ Done except writing a database from nothing.
+   `internal/zlib1` reproduces the engine's C-zlib-level-1 streams, which unblocked the five
+   operations that rewrite one, and `CREATE TABLE`, `CREATE INDEX`, `DROP INDEX` and both
+   `ALTER TABLE` forms are implemented alongside the existing `DROP TABLE`, with database
+   growth in `ddl_grow.go` underneath them all. `CREATE TABLE`, `CREATE INDEX` and growth are
+   checked against the engine's own bytes; `ALTER TABLE` is held to semantic identity instead,
+   by a decision whose original reason has now expired — see Phase 8.
 
-**After that**, three pieces of work are ready to start, in rough order of what unblocks
-the most:
+~~**After that**, three pieces of work are ready to start~~ — all three have since been
+done, and each is worth recording for what it cost rather than for the tick:
 
-- **Appending a data page when every existing one is full** (Phase 7, `ErrTableFull`).
-  This is now much closer than it was: the page allocator exists and is exercised by
-  `CREATE TABLE` and `CREATE INDEX`, and `MultiTable-create.abs` shows the engine taking
-  freed pages lowest-first.
-- **Maintaining user indexes**, so insert and delete are not refused on an indexed table.
-  Still blocked on fixtures that do not exist yet: an index insert whose key sorts into
-  the middle, and one that splits a full leaf. Producing those two files under DBManager
-  is the first step, not an afterthought. `CREATE INDEX` now builds a whole B-tree from
-  existing rows, so the leaf format is written as well as read — but only the append case
-  is evidenced.
-- **Decoding the constraint records** in the schema stream's tail. Their presence is
-  confirmed and their `$C_NotNull$`/`$C_PK$`/`$C_Unique$` markers are readable as text, but
-  the surrounding binary fields are not decoded, and that is what currently forces
-  `CREATE INDEX`, `DROP INDEX` and `DROP COLUMN` to refuse on most real tables. A clean
-  single-statement diff of adding one constraint to an otherwise clean table is what would
-  settle it, the way `Writes.abs`/`Writes-idx.abs` settled the index record.
+- ~~**Appending a data page when every existing one is full**~~ (Phase 7, `ErrTableFull`).
+  Done twice over: `growTable` takes a free page, and `ddl_grow.go` extends the file when
+  there is none. `ErrTableFull` now means only that the single-page record-page index root
+  is out of entries — a page-splitting ceiling, not a space one.
+- ~~**Maintaining user indexes**~~, so insert and delete are not refused on an indexed
+  table. The two fixtures this entry said did not exist were produced under DBManager, and
+  they changed the design rather than confirming it: a removal **leaves the slot it vacates
+  untouched**, and a key-moving update is a removal followed by a sorted insertion rather
+  than an in-place patch. A leaf split is still unevidenced and still refused.
+- ~~**Decoding the constraint records**~~ in the schema stream's tail. What this entry asked
+  for was "a clean single-statement diff of adding one constraint to an otherwise clean
+  table". `Constraints.abs` is better than that: twelve tables in one database, each
+  differing from a control by exactly one clause, so every constraint kind and both index
+  flags are isolated at once instead of one per fixture. DBManager's `Execute SQL Script` is
+  what made the wider instrument as cheap as the narrow one.
+
+- ~~**`CreateDatabase`**~~ and ~~**compaction**~~ both landed with this round; Phase 8 has no
+  open boxes left. Compaction came in stronger than this document predicted — see "What
+  compaction actually is" for the prediction and its refutation.
+
+**Next**, in rough order of what unblocks the most:
+
+- **Widening what compaction accepts.** It refuses a table carrying constraint records
+  (`ErrConstraintsNotRebuilt`), because `CREATE TABLE` cannot write them back and a silent
+  drop of a `NOT NULL` or a `PRIMARY KEY` is worse than a refusal. Writing constraint records
+  is the missing half of the constraint work: `ddl_constraint.go` reads them, nothing writes
+  them. That one gap is what keeps compaction off most real tables.
+- **Revisiting the `ALTER TABLE` rebuild**, now that file growth exists and the reason for
+  splicing in place has expired. Compaction has since shown the object-id replay works, which
+  was the other half of the objection.
+- **Encrypted writes.** Every write path refuses an encrypted database, and `CreateDatabase`
+  refuses `Encrypted: true`, because the 260-byte control block at header offset 80 is located
+  but undecoded. A guess produces a file the engine will not open.
 
 **The two largest validation gaps** are not phases, and neither can be closed from here:
 

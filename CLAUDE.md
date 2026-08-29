@@ -40,14 +40,16 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 
 - **One table is a special case, not the shape of the API**: a database can hold several tables, and only data pages record which one they belong to. Reads and writes are scoped through `File.Table(name)`; the no-argument `Schema`, `OpenTable` and `OpenTableWriter` are shorthand for `Table("")` and report `ErrAmbiguousTable` rather than mixing tables. Before this existed, `OpenTable` on a three-table file returned six rows for a two-row table with no error. When adding anything that scans pages by type, ask what happens with three tables in the file — the answer is usually "it silently reads someone else's".
 
-- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete, growing a table by a free page when every existing one is full, and keeping the table's user indexes in step (`writer_index.go`); Phase 8 adds the schema operations — `DROP TABLE` and the allocation model in `ddl.go`, `CREATE TABLE` in `ddl_create.go`, `CREATE INDEX`/`DROP INDEX` in `ddl_index.go`, and `ALTER TABLE ADD`/`DROP COLUMN` in `ddl_alter.go`. Database compaction is the one Phase 8 step still open.
+- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete, growing a table by a free page when every existing one is full, and keeping the table's user indexes in step (`writer_index.go`); Phase 8 adds the schema operations — `DROP TABLE` and the allocation model in `ddl.go`, `CREATE TABLE` in `ddl_create.go`, `CREATE INDEX`/`DROP INDEX` in `ddl_index.go`, and `ALTER TABLE ADD`/`DROP COLUMN` in `ddl_alter.go`. Database growth — extending the file by whole extents when no free page remains — is part of the allocation model in `ddl.go`. `ddl_database.go` writes an `.abs` from nothing (`CreateDatabase`), and `ddl_compact.go` rebuilds one into a new file on top of it (`CompactDatabase`), which closes Phase 8.
 
 - **The engine's zlib is the C library at level 1, and `internal/zlib1` reproduces it**: every compressed internal file in the corpus — schema (type 8), table info (9), catalog (6) — is byte-identical to `zlib.compress(data, 1)`, all 48 of them, and to no other level. Go's `compress/zlib` matches none of them at any level, because its level 1 is its own fast encoder rather than zlib's `deflate_fast`. This blocked every schema operation except `DROP TABLE` until `internal/zlib1` ported zlib's level-1 path; `TestZlib1ReproducesEveryCorpusStream` re-compresses all 48 and requires each to reproduce the engine's bytes, and `testdata/zlib1` holds 37 golden vectors that pin it without any fixture. **Never write a stream the engine will read with `compress/zlib`** — it is for reading only. A writer using it produces a file that reads back correctly and is not what the engine wrote, which is exactly the failure the byte-identity tests exist to catch.
 
 - **Writes are judged byte-for-byte**: `TestWriterMatchesEngineByteForByte`,
-  `TestDropTableMatchesEngineByteForByte`, `TestCreateTableMatchesEngineByteForByte` and
-  `TestCreateIndexMatchesEngineByteForByte` require each operation to reproduce the file DBManager
-  itself produced for the same SQL statement. That includes index maintenance: four of the
+  `TestDropTableMatchesEngineByteForByte`, `TestCreateTableMatchesEngineByteForByte`,
+  `TestCreateIndexMatchesEngineByteForByte`, `TestGrowthMatchesEngineByteForByte`,
+  `TestCreateDatabaseMatchesEngineByteForByte` and `TestCompactDatabaseMatchesEngineByteForByte`
+  require each operation to reproduce the file DBManager itself produced for the same SQL statement
+  or menu action. That includes index maintenance: four of the
   `Writes-idx*` pairs pin the B-tree leaf splices an insert, a delete and a key-moving update
   perform, with **no `State` exclusion**, because maintenance allocates no page. Reading a write back correctly is not sufficient
   evidence — the engine keeps counters a naive writer would miss, and this package's own reader would
@@ -57,22 +59,50 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   and `DROP COLUMN` **diverge from the engine by design**, and the fixtures that prove it are
   committed: `MultiTable-alteradd.abs`/`-alterdrop.abs` show the engine implements `ALTER TABLE` as
   `CREATE TABLE <temp>` + copy rows + rename + `DROP TABLE` — four transactions, new object ids, six
-  pages allocated and six freed. Matching that needs six free pages, and nothing here can grow a
-  database; `MultiTable.abs` is the only file in the corpus that has six, so a faithful `ALTER` would
-  refuse on every other file. This package splices in place instead and is held to _semantic_
+  pages allocated and six freed. This package splices in place instead and is held to _semantic_
   identity against those same fixtures (`TestAlterTableMatchesEngineSemantically`), with
   `TestEngineAlterTableRebuildsTheTable` pinning the engine's strategy so the reasoning cannot go
-  stale. **Do not "fix" this into a rebuild without solving file growth first.** And every byte
-  comparison excludes page `State` words, because of the next point.
+  stale. **The reason for that choice has expired and the choice has not been revisited.** It was
+  that matching the engine needs six free pages and nothing here could grow a database, so a faithful
+  `ALTER` would have been byte-perfect on `MultiTable.abs` and refused on every other file. `ddl_grow.go`
+  removed that constraint: the file now extends by whole extents on demand. So an engine-faithful
+  rebuild is newly _possible_ — it is no longer blocked, merely not done, and it would still have to
+  reproduce four transactions, three catalog writes and a fresh set of object ids to be worth doing.
+  `CompactDatabase` since showed that last part is tractable: replaying object creation in the
+  engine's order hands out the engine's ids. Treat it as an open question, not as a settled
+  impossibility. And every byte comparison excludes
+  page `State` words, because of the next point.
+
+- **Compaction is a rebuild into a new file, not a defragment in place**: `TABSDatabase.CompactDatabase`
+  routes to `InternalCopyDatabase`, the SDK help calls the result "a new compact copy of a database",
+  and DBManager's menu handler closes the file, copies it and reopens. `MultiTable-dropcompact.abs`
+  proves it from the bytes: 30 pages become 18 with none free, the file `State` is **reset** from 12
+  to 6 and `LastObjectID` from 11 to 7, so `Gamma` comes back with a different object id. A file whose
+  transaction counter has been reset and whose ids have been reallocated is a new file, not a squeezed
+  one. That is why compaction needed `CreateDatabase` (`ddl_database.go`) first, and why it must never
+  be implemented as an in-place free-space sweep — that would read back correctly through this package
+  and would not be what the engine wrote.
+
+  This entry used to add that byte identity was therefore unreachable "by construction", every object
+  id being different. **That was wrong, and `TestCompactDatabaseMatchesEngineByteForByte` is the
+  refutation**: `CompactDatabase` reproduces `MultiTable-dropcompact.abs` with only sixteen page
+  `State` words excluded. The ids differ from the _source_ file but are deterministic in the _output_,
+  because a replay that creates objects in the engine's order hands out the same ids. The lesson is
+  narrower than the old claim: reallocation defeats byte identity only when the allocation order is
+  not reproduced. `ALTER TABLE`'s fallback to semantic identity is a choice about effort, not a
+  consequence of reallocation.
 
 - **Index maintenance is deliberately narrow, and its narrowness is load-bearing**: insert, delete
   and a key-moving update keep a **single-page index over an `Int32` column** in step, which is
   exactly the shape `CREATE INDEX` builds. Everything else is refused with `ErrIndexNotMaintained`
-  rather than guessed at: a tree deep enough to have split, a key of another shape, and a table
-  whose schema tail `parseSchemaTail` declines to read. That last one covers **every indexed
-  customer fixture** — they all carry constraint records or multi-column indexes — so writes to
-  those tables are refused, where `Update` previously went through and silently left the index
-  describing a key the row no longer had. Two behaviours come from fixtures and must not be
+  rather than guessed at: a tree deep enough to have split, a key of another shape, and an index
+  whose ordering this package does not reproduce — multi-column, `DESC`, `NOCASE`, or backing a
+  `UNIQUE`/`PRIMARY KEY` constraint, since nothing here checks for duplicates. **Every indexed
+  customer fixture still refuses writes**, and it is worth knowing why the reason changed: it used
+  to be that `parseSchemaTail` could not read their schema tail at all, and since `ddl_constraint.go`
+  it is the index shapes themselves. The outcome is the same and the refusal is now a stated fact
+  rather than an unread one. What it replaced is worse than a refusal: `Update` went through and
+  silently left the index describing a key the row no longer had. Two behaviours come from fixtures and must not be
   "tidied": a removal **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), and a
   key-moving update is a **removal followed by a sorted insertion**, not an in-place patch
   (`Writes-idx-upd.abs`). Clearing that tail reads back correctly through this package and is not
@@ -89,7 +119,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   never widen an exclusion to make a test pass.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.
-- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the fourteen `testdata/Writes*.abs` fixtures (the write path's ground truth, four of them carrying a user index) and the eight `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
+- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the fourteen `testdata/Writes*.abs` fixtures (the write path's ground truth, four of them carrying a user index) and the twelve `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), the five `testdata/Empty*.abs` fixtures (what the engine writes for a brand-new database, and how it grows one) and `testdata/Constraints.abs` (twelve tables differing from a control by one column constraint or index variation each), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
 - **Windows-1252 aware**: String fields use Windows-1252 encoding by default. Always decode to UTF-8.
 
 ## Formatting and Linting
