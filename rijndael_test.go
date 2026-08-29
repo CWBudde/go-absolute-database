@@ -13,7 +13,7 @@ import (
 // TestDECRijndaelSelfTest is the anchor for the whole Rijndael implementation:
 // it reproduces the self-test vector compiled into DEC's own
 // TCipher_Rijndael, recovered from VMT slot 10 of that class in
-// legacy/Utils/Bin/DBImportExport.exe and corroborated by
+// <sdk>/Utils/Bin/DBImportExport.exe and corroborated by
 // TCipher_Rijndael.TestVector in DEC's Cipher1.pas.
 //
 // DEC's SelfTest keys the cipher with the class name, "TCipher_Rijndael",

@@ -51,7 +51,7 @@ readers are bounded by [source-specific expansion ceilings](format/internal-file
 
 ## Generating fixtures
 
-`testdata/README.md` carries the recipe: drive `legacy/Utils/Bin/DBManager.exe` under Wine on
+`testdata/README.md` carries the recipe: drive `<sdk>/Utils/Bin/DBManager.exe` under Wine on
 `Xvfb`, with a virtual desktop set in the prefix registry. Use **`SQL → Execute SQL Script`**
 for anything longer than one statement — it turns a fixture needing a dozen statements into a
 single file dialog, which is what makes a _matrix_ fixture like `Constraints.abs` as cheap as a

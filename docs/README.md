@@ -40,10 +40,15 @@ what is documented here.
 - [Maximum Capacity Specifications](https://www.componentace.com/help/absdb_manual/maximumcapacityspecification.htm)
 - [CREATE TABLE syntax](https://www.componentace.com/help/absdb_manual/createtablestatement.htm)
 
-The SDK's own C++Builder headers under `legacy/` — `ABSTypes.hpp`, `ABSBTree.hpp`,
-`ABSCipher.hpp`, `ABSDiskEngine.hpp` — are the source for every structure declaration quoted in
-these documents, and DBManager's Delphi source under `legacy/Utils/Source/DBManager/` is the
-source for the engine's behaviour. Neither is redistributable; both are gitignored.
+The SDK's own C++Builder headers — `ABSTypes.hpp`, `ABSBTree.hpp`, `ABSCipher.hpp`,
+`ABSDiskEngine.hpp` — are the source for every structure declaration quoted in these documents,
+and DBManager's Delphi source under `<sdk>/Utils/Source/DBManager/` is the source for the
+engine's behaviour.
+
+`<sdk>` throughout these documents means an extracted copy of the ComponentAce SDK, which lives
+**outside this repository** — by convention a sibling directory, `../absolute-database-sdk/`. It
+is not redistributable, it is not part of this repository and never has been, and reproducing the
+work below needs your own licensed copy. See [provenance.md](provenance.md).
 
 ## Source layout
 
@@ -78,7 +83,9 @@ ddl_compact.go        CompactDatabase
 internal/zlib1/       A deflate encoder bit-compatible with C zlib level 1
 cmd/absdb/            The CLI
 testdata/             Fixtures (gitignored bar an allowlist)
-legacy/               ComponentAce SDK, reference only (gitignored, never commit)
 ```
+
+The ComponentAce SDK is deliberately not in this list: it lives outside the repository as
+`<sdk>`, never inside it.
 
 See [provenance.md](provenance.md) for what may and may not be committed, and why.

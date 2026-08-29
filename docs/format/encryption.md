@@ -133,7 +133,7 @@ TCipher_Square    439CA6C467E82E472295668506396AC9182120F74436F1617D1490B1A96856
 **These are not in `ABSCipher.dcu`.** ComponentAce replaced every DEC `TestVector` asm stub
 with one that raises `"TCipher_Square.TestVector not implemented 27"`, so byte-scanning the
 Rio-era `.dcu`, `.bpl` or `DBManager.exe` returns nothing. The vectors survive in DEC 3.0's own
-`Cipher.pas`/`Cipher1.pas`, and in the 2011-vintage `legacy/Utils/Bin/DBImportExport.exe`,
+`Cipher.pas`/`Cipher1.pas`, and in the 2011-vintage `<sdk>/Utils/Bin/DBImportExport.exe`,
 where VMT slot 10 of each cipher class still points at the original constant (Square at file
 offset `0xD78B6`, Twofish at `0xD687A`). The two sources agree byte for byte, and the Blowfish
 vector reproduces with stdlib Blowfish, which is what proves the harness rather than the

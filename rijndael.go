@@ -7,6 +7,12 @@ import (
 
 // Rijndael as ComponentAce's ABSCipher.pas implements it.
 //
+// DEC 3.0 Part I is Copyright (c) Hagen Reddmann, on the terms "freeware, but
+// this Copyright must be included". No DEC code is used here: what follows is
+// an independent Go implementation. What is owed to DEC is the knowledge of
+// where it deviates and the self-test vector that pins the deviation, and the
+// notice is carried for those. See NOTICE.
+//
 // ABSCipher is a fork of Delphi Encryption Compendium (DEC) 3.0, and this is
 // DEC's TCipher_Rijndael: a 128-bit-block Rijndael with 10, 12 or 14 rounds for
 // 128-, 192- and 256-bit keys. The round function — SubBytes, ShiftRows,

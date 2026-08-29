@@ -288,8 +288,8 @@ whole corpus that is the only table whose parse changed: 20 customer tables went
 parsed, and `CDefault` from unreadable to readable, with every other column list and row digest
 identical before and after.
 
-Two sources in `legacy/` corroborate the vocabulary rather than leaving it to inference: the
-manual's `CREATE TABLE` grammar (`7z x -so legacy/Help/AbsDbManual.chm createtablestatement.htm`)
+Two sources in `<sdk>` corroborate the vocabulary rather than leaving it to inference: the
+manual's `CREATE TABLE` grammar (`7z x -so <sdk>/Help/AbsDbManual.chm createtablestatement.htm`)
 and DBManager's own Table Properties dialog, which lists the per-field columns as Name, Type,
 Size, Required, Default, MinValue, MaxValue, BLOBCompressionAlgorithm, BLOBCompressionMode,
 BLOBBlockSize, and the per-index-column ones as ColumnName, CaseInsensitive, Asc,
@@ -320,7 +320,7 @@ virtual desktop. Three things make it much easier than it first appears:
   before launch stops DBManager reopening the last database and prompting for its
   password. If it does reopen one, the window title is `AbsDb Manager {path}` and a search
   for `Absolute Database Manager` finds nothing.
-- DBManager's own Delphi source is in `legacy/Utils/Source/DBManager/`. Read it rather than
+- DBManager's own Delphi source is in `<sdk>/Utils/Source/DBManager/`. Read it rather than
   guessing at the GUI: the script runner's parser, the file dialog's behaviour and
   `aCompactDatabaseExecute` (which does nothing but call `db.CompactDatabase`) all came from
   there. `ABSDiskEngine.hpp` beside it names the free-space manager's entire API, and

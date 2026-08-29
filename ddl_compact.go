@@ -12,7 +12,7 @@ import (
 // Three independent sources agree on what the engine's Database -> Compact
 // Database does. TABSDatabase.CompactDatabase routes to InternalCopyDatabase;
 // the SDK help calls the result "a new compact copy of a database"; and
-// DBManager's own handler (legacy/Utils/Source/DBManager/main.pas:1420) closes
+// DBManager's own handler (<sdk>/Utils/Source/DBManager/main.pas:1420) closes
 // the file, calls the no-argument overload and reopens it. The bytes settle it
 // beyond doubt. testdata/MultiTable-dropcompact.abs is Compact Database run on
 // MultiTable-drop.abs, which had twelve free pages:

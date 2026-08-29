@@ -18,7 +18,7 @@ import (
 //
 // The expected ciphertext was recovered twice independently: from
 // TCipher_Square.TestVector in DEC 3.0's Cipher.pas, and from VMT slot 10 of
-// TCipher_Square in legacy/Utils/Bin/DBImportExport.exe at file offset
+// TCipher_Square in <sdk>/Utils/Bin/DBImportExport.exe at file offset
 // 0xD78B6. It is not in the shipped ABSCipher.dcu because the Rio-era ABSCipher
 // replaced DEC's TestVector stubs with ones that raise "not implemented".
 func TestDECSquareSelfTest(t *testing.T) {

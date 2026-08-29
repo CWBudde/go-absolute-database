@@ -39,7 +39,8 @@ excludes = [
     "coverage.out",
     "coverage.html",
 
-    # Legacy files
+    # Safety net only. The ComponentAce SDK lives outside the repository (see
+    # docs/provenance.md); this keeps it excluded if anyone extracts one here.
     "legacy/**",
 ]
 

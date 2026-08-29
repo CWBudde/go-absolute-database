@@ -1,0 +1,100 @@
+go-absolute-database
+Copyright (c) 2026 Christian Budde
+
+This product is licensed under the MIT License; see the LICENSE file.
+
+The sections below are attributions required by, or offered in good faith to,
+the authors of work this project builds on. No third-party source code is
+included in this repository: every file here was written for this project.
+
+
+================================================================================
+1. zlib — internal/zlib1
+================================================================================
+
+The package internal/zlib1 is an ALTERED Go port of the C zlib library's
+compression level 1, specifically the deflate_fast path of deflate.c and the
+Huffman coding of trees.c from zlib 1.2.13. It exists because the Absolute
+Database engine writes its compressed internal files with C zlib at level 1,
+and Go's compress/flate reproduces those bytes at no level.
+
+It is a derivative work of zlib and is plainly marked as altered, as zlib's
+licence requires. It is NOT zlib, has been rewritten in Go, implements only
+level 1, and provides compression only. Any defect in it is this project's, not
+zlib's. Report bugs here, never to the zlib authors.
+
+  zlib.h -- interface of the 'zlib' general purpose compression library
+  version 1.2.13, October 13th, 2022
+
+  Copyright (C) 1995-2022 Jean-loup Gailly and Mark Adler
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Jean-loup Gailly        Mark Adler
+  jloup@gzip.org          madler@alumni.caltech.edu
+
+
+================================================================================
+2. DEC — Delphi Encryption Compendium 3.0
+================================================================================
+
+Absolute Database's ABSCipher unit is a fork of DEC 3.0 Part I. Three of its
+ciphers deviate from the published algorithms, and files written with them
+cannot be read by a correct implementation, so rijndael.go, twofish.go,
+tdes.go and square.go reproduce DEC's behaviour rather than the specifications.
+
+Those four files are independent Go implementations written from the published
+algorithm descriptions (Rijndael/AES, Twofish, DES, and the 1997
+Daemen/Knudsen/Rijmen Square cipher). What is owed to DEC is factual rather
+than expressive: the knowledge of where DEC deviates, and the self-test vectors
+its ciphers carry, which this project's tests use to pin those deviations. DEC
+3.0's terms ask only that the copyright be carried, and it is carried here.
+
+  Copyright:      Hagen Reddmann  mailto:HaReddmann@AOL.COM
+  Author:         Hagen Reddmann
+  Remarks:        freeware, but this Copyright must be included
+  Version:        3.0,  Part I from Delphi Encryption Compendium  ( DEC Part I)
+
+Later releases of DEC are maintained by others — Frederik A. Winkelsdorf,
+Norman Gallery and Markus Humm — and DEC 6.x is licensed under Apache 2.0.
+Nothing from those releases is used here; ABSCipher forked 3.0.
+
+
+================================================================================
+3. ComponentAce Absolute Database — trademarks, and what this project is not
+================================================================================
+
+This project is an independent, clean-room implementation of a file format. It
+is NOT affiliated with, authorised by, endorsed by, or sponsored by
+ComponentAce, and it contains no ComponentAce code, headers, binaries or
+documentation.
+
+"Absolute Database" and "ComponentAce" are trademarks of ComponentAce. They are
+used here only to identify the file format this library reads and writes, which
+is nominative use: there is no other way to say what the software does.
+
+The ComponentAce SDK is not redistributable and is not part of this repository.
+It has never been committed to this repository's history. Anyone reproducing
+this project's fixture-generation or verification work needs their own licensed
+copy; see docs/testing.md.
+
+The .abs format itself is not the subject of anyone's copyright. In the EU this
+follows from Case C-406/10, SAS Institute v World Programming, in which the
+Court of Justice held that neither the functionality of a computer program nor
+the format of the data files it uses constitutes a form of expression protected
+by copyright. See docs/provenance.md for the full basis on which this work was
+done and published.

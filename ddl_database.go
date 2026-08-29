@@ -98,7 +98,7 @@ const (
 	// defaultPageSize, defaultPageCountInExtent and defaultMaxConnections are
 	// the DBManager's own Create Database defaults, which is what Empty.abs
 	// measures. They are also the values its dialog opens with
-	// (legacy/Utils/Source/DBManager/uDatabase.dfm).
+	// (<sdk>/Utils/Source/DBManager/uDatabase.dfm).
 	defaultPageSize          = 4096
 	defaultPageCountInExtent = 8
 	defaultMaxConnections    = 500

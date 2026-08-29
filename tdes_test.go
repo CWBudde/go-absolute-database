@@ -21,7 +21,7 @@ const (
 
 // decSelfTestVector3TDES is the self-test vector compiled into DEC's
 // TCipher_3TDES. It was read out of VMT slot 10 in
-// legacy/Utils/Bin/DBImportExport.exe at file offset 0xD6596 and corroborated
+// <sdk>/Utils/Bin/DBImportExport.exe at file offset 0xD6596 and corroborated
 // by TCipher_3TDES.TestVector in DEC's Cipher1.pas.
 const decSelfTestVector3TDES = "0b12e48bd9cd08bfcaae3e5ff6fe13cd" +
 	"3f706ecd53563f5a800f1b1efb9a5796"

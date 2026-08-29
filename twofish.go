@@ -7,6 +7,12 @@ import (
 
 // Twofish as ComponentAce's ABSCipher.pas implements it.
 //
+// DEC 3.0 Part I is Copyright (c) Hagen Reddmann, on the terms "freeware, but
+// this Copyright must be included". No DEC code is used here: what follows is
+// an independent Go implementation. What is owed to DEC is the knowledge of
+// where it deviates and the self-test vector that pins the deviation, and the
+// notice is carried for those. See NOTICE.
+//
 // ABSCipher is a fork of Delphi Encryption Compendium (DEC) 3.0, and its
 // TCipher_Twofish is *not* interchangeable with reference Twofish. Everything
 // but one line agrees with the specification — the q permutations and the MDS

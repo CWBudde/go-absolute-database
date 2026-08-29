@@ -26,7 +26,7 @@ check-formatted:
     # treefmt has no read-only mode: every formatter in treefmt.toml runs in
     # write mode, so `treefmt --fail-on-change` would reformat the very files it
     # claims to be checking. Instead, copy every git-visible file (tracked plus
-    # untracked-but-not-ignored, so testdata/ and legacy/ are skipped) into a
+    # untracked-but-not-ignored, so testdata/ is skipped) into a
     # scratch directory and format the copy. Only the exit status is used; the
     # working tree is never written to. Needs GNU coreutils for `cp --parents`.
     set -euo pipefail

@@ -26,6 +26,10 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   **Format findings belong there**, not in `PLAN.md` and not only in a code comment.
 - `PLAN.md` — what is built and what comes next. No format knowledge.
 - `testdata/README.md` — the fixtures and how to generate more under Wine.
+- `NOTICE` — third-party attributions (zlib, DEC) and the ComponentAce trademark disclaimer.
+  `docs/provenance.md` says what each one is for; keep both current when adding a dependency or
+  a ported algorithm. The ComponentAce SDK lives **outside** this repository, referred to as
+  `<sdk>` (by convention `../absolute-database-sdk/`), and must never be committed.
 
 ## Architecture
 

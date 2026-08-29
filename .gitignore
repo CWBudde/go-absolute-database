@@ -15,7 +15,7 @@ absdb
 .DS_Store
 Thumbs.db
 
-# legacy / testdata
+# testdata
 #
 # testdata/ holds real customer project files and is never committed. The one
 # exception is the Go fuzzing corpus: `go test -fuzz` writes a reproducer to
@@ -83,5 +83,9 @@ testdata/*
 !testdata/Empty-p2048-e4-grow.abs
 !testdata/Empty-mc100.abs
 !testdata/README.md
-
+# Safety net only, not a location. The ComponentAce SDK is not redistributable
+# and lives OUTSIDE this repository -- by convention ../absolute-database-sdk/.
+# It has never been committed here and must never be. This rule stays so that
+# extracting an SDK into the tree by accident cannot stage it; nothing else is
+# allowed to depend on it. See docs/provenance.md.
 legacy/
