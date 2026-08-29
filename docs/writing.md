@@ -139,8 +139,24 @@ column of one is never mistaken for an ordinary integer and left with a stale co
 Everything else is refused with `ErrIndexNotMaintained` rather than guessed at: a tree deep
 enough to have split, a key of another shape, a multi-column index (`ErrMultiColumnIndex`), a
 `DESC` or `NOCASE` index, which orders its leaf differently than this package compares, and a
-column that is not `Int32`. A multi-column index is what now covers most of what is left: eight
-of the sixteen tables the writer still refuses are refused for that.
+column that is not `Int32`.
+
+Sixteen of the corpus's 111 tables are refused, and counting every reason each one carries rather
+than only the first one reported, the shapes rank like this:
+
+| Shape                  | Sole reason a table is refused | Named among a table's reasons |
+| ---------------------- | ------------------------------ | ----------------------------- |
+| a multi-column key     | 5                              | 9                             |
+| a `VARCHAR` key column | 2                              | 7                             |
+| a split leaf           | 1                              | 3                             |
+| `NOCASE`               | 0                              | 3                             |
+| `DESC`                 | 1                              | 1                             |
+
+The first column is the one to plan by, and it is not the one a first-reason count gives. A
+multi-column index is reported against eight tables but is the _only_ thing wrong with five of
+them: two of the other three also key a `VARCHAR` column and one also has a split leaf. `NOCASE`
+is the sharper case — it is the sole reason for nothing at all, because every table that has a
+`NOCASE` index keys a string column with it.
 
 Indexes are resolved from the table's own schema records, with the pages kept as a cross-check
 in the other direction: an index the pages show that the schema does not name stops the write.

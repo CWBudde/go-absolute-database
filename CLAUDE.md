@@ -123,9 +123,13 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   writer will not maintain produces a table nothing can insert into. Everything else is refused
   with `ErrIndexNotMaintained` rather than guessed at: a tree deep enough to have split, a key of
   another shape, and an index whose ordering this package does not reproduce (multi-column,
-  `DESC`, `NOCASE`). **A multi-column index is now the largest single blocker** — eight of the
-  sixteen tables the writer still refuses are refused for one, more than every other reason
-  together. Three behaviours come from fixtures and must not be "tidied": a removal
+  `DESC`, `NOCASE`). **A multi-column index is the largest single blocker, but count what a
+  shape unblocks rather than what it is reported against**: sixteen tables are refused, a
+  multi-column key is named among nine of them and is the _only_ reason for five, and `NOCASE`
+  is the sole reason for none at all because every `NOCASE` index in the corpus keys a string
+  column. `PLAN.md` carries the full table, and it is measured, not asserted — the first-reason
+  count that stood here overstated the multi-column item by three tables.
+  Three behaviours come from fixtures and must not be "tidied": a removal
   **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), a key-moving update is a
   **removal followed by a sorted insertion** rather than an in-place patch (`Writes-idx-upd.abs`),
   and a `NULL` key **sorts before every value** (`Keys-uniqnull.abs`, which is the only file

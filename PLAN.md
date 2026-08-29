@@ -32,7 +32,121 @@ Every write path is held to byte identity against the engine's own output, with 
 exceptions; see [docs/writing.md](docs/writing.md).
 
 > **Checkbox legend:** `[x]` done and verified · `[~]` partially done or unvalidated ·
-> `[ ]` not started.
+> `[ ]` not started. An item with sub-steps is ticked only once every sub-step is. The sub-steps
+> are there so that a session's work lands somewhere visible rather than only in the git log:
+> most remaining items are several sessions of work each, and used to be one line.
+
+## What is left, and what each piece unblocks
+
+The write path takes **95 of the corpus's 111 tables**. Every one of the sixteen it refuses is
+refused for the shape of an index, and several are refused for more than one shape at once. The
+table below counts **every** reason a table is refused, not just the first one reported, which is
+what makes the ordering meaningful:
+
+| Capability             | Unblocks alone | Appears in | Cumulative, in this order |
+| ---------------------- | -------------- | ---------- | ------------------------- |
+| A multi-column key     | 5              | 9          | 5                         |
+| A `VARCHAR` key column | 2              | 7          | 9                         |
+| `NOCASE` ordering      | 0              | 3          | 12                        |
+| A split B-tree leaf    | 1              | 3          | 15                        |
+| `DESC` ordering        | 1              | 1          | 16                        |
+
+Two things follow from the middle column that did not follow from the first-reason count this
+file used to quote. A multi-column key is still the largest single item, but it unblocks **five**
+tables, not the nine it appears in: two of the other four also need a `VARCHAR` key and two also
+need a split leaf. (Eight of the nine name it as their first reported reason, which is the eight
+this file used to quote.) And `NOCASE` unblocks nothing at all on its own — every table with a
+`NOCASE` index keys a `VARCHAR` column with it, so it is only ever worth doing after that one.
+
+Everything else on this page is either read-path polish or a schema-write shape no corpus table
+needs (`DEFAULT`, `AUTOINC` options, encrypted creation).
+
+## How an item closes here
+
+The last two items to close — a key-enforcing index and an `AUTOINC` column — took the same eight
+steps, and the sub-steps below are written in that shape so each is separately tickable:
+
+1. **Survey.** Measure what the item unblocks before building it. Both of the last two turned out
+   to unblock less than this file claimed.
+2. **Fixture.** Drive DBManager under Wine to produce the engine's own before/after pair, per
+   [testdata/README.md](testdata/README.md). Nothing below step 2 is implemented on inference.
+3. **Read.** A test that reads the new fixtures and pins the shape; the finding goes to
+   `docs/format/`.
+4. **Maintain.** Insert, delete and a key-moving update, byte-identical to the fixture with no
+   page `State` exclusion, because maintenance allocates no page.
+5. **Check.** The constraint gate resolves the shape, or goes on refusing it explicitly.
+6. **Create.** `CREATE TABLE` and `CREATE INDEX` build it.
+7. **Compact.** The rebuild reproduces it.
+8. **Record.** `docs/`, `testdata/README.md`, this file, `CLAUDE.md` — and re-run the survey from
+   step 1, because the numbers above are what the next item is chosen by.
+
+## Index shapes the write path refuses (Phases 7 and 8)
+
+These five are the whole of the sixteen refusals. Each crosses index maintenance, the constraint
+gate, `CREATE TABLE`/`CREATE INDEX` and compaction, which is why each is a list rather than a
+line.
+
+### A multi-column key — 5 tables alone, 9 in total
+
+`Constraints.abs`'s `CPkMulti` and `CIdxMulti` and five private tables' `RecIdx`/`p`.
+
+- [ ] a. Confirm from the files already committed what a concatenated key looks like — the
+      corpus's key sizes of 10 and 15 bytes are consistent with two and three 5-byte keys, and
+      that is a hypothesis, not a reading. Needs no Wine run.
+- [ ] b. Fixtures: a two-column index with rows, plus an insert, a delete and a key-moving
+      update, in the shape of the `Writes-idx*` family.
+- [ ] c. Read the leaf: the key's layout, its `KeyPrefixSize`, and which column breaks a tie.
+      → `docs/format/indexes.md`.
+- [ ] d. Maintain it — a comparison over the concatenation, and the splice
+      (`ErrMultiColumnIndex` lifted only for the shape the fixtures pin).
+- [ ] e. Resolve a multi-column `PRIMARY KEY`/`UNIQUE` in the constraint gate.
+- [ ] f. `CREATE TABLE` builds it; `CREATE INDEX` writes a multi-column record.
+- [ ] g. Compaction rebuilds it (`planCompactIndexes`, `planCompactConstraints`).
+- [ ] h. Docs, and re-measure.
+
+### A `VARCHAR` key column — 2 tables alone, 7 in total
+
+`Constraints.abs`'s `CBoth`, `MultiTable-createidxgrow.abs`'s `Delta`, and it is a prerequisite
+for three of the `NOCASE` tables and two of the multi-column ones.
+
+- [ ] a. Read what a string key stores in the leaf: padded to the column width or to
+      `maxIndexedSize`, and how a shorter value is terminated. The corpus has such indexes to
+      read; only the ordering rule needs the engine.
+- [ ] b. Fixtures: insert, delete and a key-moving update against a `VARCHAR`-keyed index.
+- [ ] c. Ordering — whether the engine compares by Windows-1252 byte or by something else.
+- [ ] d. Maintain it (`indexableKeyColumn` widened, `indexKeySize` no longer a constant).
+- [ ] e. `CREATE INDEX`/`CREATE TABLE` build one, and compaction rebuilds it.
+- [ ] f. Docs, and re-measure.
+
+### `NOCASE` ordering — 0 alone, 3 in total
+
+`Addresses.abs`'s `NameSort`, `Constraints.abs`'s `CIdxNoCase`, `TS03.abs`'s `EN`. Do this after
+the `VARCHAR` key: all three key a string column, so neither is any use alone.
+
+- [ ] a. Which case-folding the engine uses, from the order of an existing `NOCASE` leaf.
+- [ ] b. Maintenance, `CREATE INDEX`, compaction, docs.
+
+### A split B-tree leaf — 1 alone, 3 in total
+
+`RCFQ0011.abs` and, with a multi-column key, `RCON0011.abs` and `RMPA0011.abs`. This is also the
+ceiling under `ErrIndexTooManyRows` and under the `ErrTableFull` that the record-page index root
+raises, so it is the only item here that closes a limit as well as a shape.
+
+- [ ] a. Fixture: drive the engine past a split. The corpus's fullest leaf holds 232 of a
+      possible 367, so the trigger is not "leaf full" and no existing file shows the moment.
+- [ ] b. The rule: what triggers a split and where the split point falls.
+      → `docs/format/indexes.md`.
+- [ ] c. Perform a split in index maintenance.
+- [ ] d. The same for the internal record-page index, which raises `ErrTableFull` for the same
+      reason.
+- [ ] e. Docs, and re-measure.
+
+### `DESC` ordering — 1 alone, 1 in total
+
+`Constraints.abs`'s `CIdxDesc`. The smallest of the five, and self-contained.
+
+- [ ] a. Reverse the comparison in maintenance, and let `CREATE INDEX` write the flag.
+- [ ] b. A fixture pair pinning an insert into a `DESC` index.
 
 ## Open items in completed phases
 
@@ -72,19 +186,17 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 
 - [ ] Carry the **index name and covered column** on `IndexInfo`. Both are decoded from the
       schema stream now, but `IndexInfo` does not expose them, so `FindByStringKey` still takes
-      `secondaries[0]` rather than the index that covers the column asked for.
+      `secondaries[0]` rather than the index that covers the column asked for. Small, and it is
+      the read-side half of what the multi-column item needs anyway.
 - [ ] Benchmark index lookup against a full scan.
 
 ### Phase 7 — record writes
 
-- [ ] Split a B-tree leaf. `ErrIndexTooManyRows` and `ErrTableFull` are both single-page
-      ceilings. Split trees themselves are in the corpus and read correctly (five of them, see
-      [`docs/format/indexes.md`](docs/format/indexes.md#capacity-and-splitting)); what no fixture
-      shows is the engine performing a split, and the fullest observed leaf holds 232 of a
-      possible 367, so the split point is not the ceiling either. The rule is unknown, so a
-      multi-level tree is refused.
 - [ ] Crash-atomic commit. Rollback is exact, but a crash inside `Commit` leaves some pages
       written; the engine's journalling is not reproduced.
+
+  The two single-page ceilings that used to sit here — `ErrIndexTooManyRows` and `ErrTableFull` —
+  are the split-leaf item above.
 
 ### Phase 8 — schema operations
 
@@ -102,25 +214,33 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
       compaction and index maintenance all take the column now, and this package assigns the
       next value the way the engine does. See
       [docs/format/internal-files.md](docs/format/internal-files.md#the-autoinc-counters).
-- [ ] **A multi-column or `VARCHAR` key.** The other two shapes still refused, by index
-      maintenance and by the rebuild alike: `Constraints.abs`'s `CPkMulti` and `CBoth`, and the
-      three private fixtures whose key covers two or three columns. This is now the largest
-      single blocker: eight of the sixteen tables the writer still refuses are refused for a
-      multi-column index.
-- [ ] **Write a `DEFAULT`.** The same problem one level down, refused the same way
-      (`ErrColumnDefault`): it lives in the column definition rather than the constraint array,
-      and `serializeColumnDef` writes the absent marker unconditionally.
-- [ ] **Write a column's `AUTOINC` options.** The same shape again (`ErrColumnAutoIncOptions`):
-      the five parameters are read, and `serializeColumnDef` writes the engine's defaults
+- [ ] **Write a `DEFAULT`.** Refused with `ErrColumnDefault`: it lives in the column definition
+      rather than the constraint array, and `serializeColumnDef` writes the absent marker
+      unconditionally. No corpus table has one, so nothing is unblocked by it — but it is a
+      small, self-contained pair with the next item.
+  - [ ] a. Serialize the clause the way the column definition stores it.
+  - [ ] b. A `CREATE TABLE` fixture carrying one, to compare against.
+- [ ] **Write a column's `AUTOINC` options.** The same shape (`ErrColumnAutoIncOptions`): the
+      five parameters are read, and `serializeColumnDef` writes the engine's defaults
       unconditionally, so a column carrying real ones is refused rather than silently reset.
-      `Types.abs`'s `TAutoInc` is the only table anywhere that has any.
+  - [ ] a. Serialize the five parameters. `Types.abs`'s `TAutoInc` is the only table anywhere
+        that has any, and is therefore also the oracle.
+  - [ ] b. Decide what happens at `MAXVALUE` — refuse or wrap — which needs a fixture, and is
+        why `ErrAutoIncExhausted` and the `CYCLED` refusal exist.
 - [ ] **Encrypted writes at the database level.** Existing encrypted files are read and written
       page by page, but `CreateDatabase` refuses `Encrypted: true` and compaction refuses an
-      encrypted database, because the 260-byte control block at header offset 80 is located and
-      undecoded.
-- [ ] Reconsider the **engine-faithful `ALTER TABLE` rebuild**. The original objection — it needs
+      encrypted database.
+  - [ ] a. Decode the 260-byte control block at header offset 80. This is analysis, not code: a
+        guess produces a file the engine will not open.
+  - [ ] b. `CreateDatabase` with `Encrypted: true`, byte-identical against `Empty-encrypted.abs`.
+  - [ ] c. Compaction of an encrypted database.
+- [ ] **Reconsider the engine-faithful `ALTER TABLE` rebuild.** The original objection — it needs
       six free pages and nothing could grow a file — has expired, and compaction has since shown
-      that replaying object ids works.
+      that replaying object ids works. What is left is the work itself.
+  - [ ] a. Reproduce the four transactions the engine performs.
+  - [ ] b. Reproduce the three catalog writes and the fresh object ids.
+  - [ ] c. Byte identity against `MultiTable-alteradd.abs` and `-alterdrop.abs`, replacing the
+        semantic comparison.
 
 ### Phase T — packaging
 
@@ -141,25 +261,13 @@ Deferred until there is a concrete use case.
 
 ## Next
 
-In rough order of what unblocks the most:
+The index-shape table above is the order: **a multi-column key**, then a **`VARCHAR` key
+column**, then **`NOCASE`**, which together take the write path from 95 of 111 tables to 107.
+Step (a) of the multi-column item is desk work on files already committed and is where to start;
+step (b) is the first that needs the engine.
 
-1. **A multi-column index**, which is what is left of the write path's reach. With the
-   `AUTOINC` column closed, sixteen tables in the corpus still refuse a write and **eight** of
-   them refuse for a multi-column index — more than every other reason put together. Two
-   fixtures already exist (`Constraints.abs`'s `CPkMulti` and `CBoth`) and what they do not show
-   is the leaf: a concatenated key needs its own comparison and its own `KeyPrefixSize`, and no
-   file yet shows the engine splicing one. That is a fixture run, not a guess.
-2. **A split B-tree leaf**, which is the ceiling under `ErrIndexTooManyRows` and `ErrTableFull`
-   and the reason two of the remaining refusals exist. The corpus holds five split trees and
-   reads them correctly; what no file shows is the engine performing a split, and the fullest
-   observed leaf holds 232 of a possible 367, so the split point is not "leaf full".
-3. **The `ALTER TABLE` rebuild**, which would retire the last deliberate divergence from the
-   engine's byte output.
-4. **Encrypted writes**, which need the control block decoded first. A guess produces a file the
-   engine will not open, so this starts with analysis, not code.
-
-The remaining validation gaps need the Delphi engine driven directly: evidence for a **split
-B-tree leaf** or a **second PFS page**, and a **`Bytes` value** — the last needs a parameterised
-insert rather than DBManager's SQL tab. The fixture recipe in `testdata/README.md` is the route
-to the first two; it is what produced `Types.abs`, `Types2.abs` and the `Keys*.abs` and
-`Auto*.abs` families, each of which closed a gap this list used to carry.
+Three of the remaining validation gaps need the Delphi engine driven directly rather than through
+DBManager's SQL tab: a **`Bytes` value**, a **split B-tree leaf**, and a **second PFS page**. The
+fixture recipe in `testdata/README.md` is the route to the last two; it is what produced
+`Types.abs`, `Types2.abs` and the `Keys*.abs` and `Auto*.abs` families, each of which closed a
+gap this list used to carry.
