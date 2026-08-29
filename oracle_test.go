@@ -587,3 +587,68 @@ func TestOracleRecordLayout(t *testing.T) {
 		})
 	}
 }
+
+// TestOracleSchemaNullabilityAcrossCorpus is the regression guard on the
+// second pass Table.Schema makes over the schema tail.
+//
+// Two things must hold for every table in every fixture. Schema must still
+// succeed: it read these files before the tail was parsed at all, and a tail
+// this package cannot understand must leave nullability unknown rather than
+// fail the whole call. And a column reported NOT NULL must be reported so
+// because a kind-3 constraint record named it, which is checked here by
+// requiring that any table with a NOT NULL column also carries such a record.
+func TestOracleSchemaNullabilityAcrossCorpus(t *testing.T) {
+	for _, name := range fixtureNames(t) {
+		t.Run(name, func(t *testing.T) {
+			db := openFixture(t, name)
+
+			for _, tbl := range fixtureTables(t, db) {
+				schema, err := tbl.Schema()
+				if err != nil {
+					t.Fatalf("table %q: Schema(): %v", tbl.Name(), err)
+				}
+
+				pageNo, err := tbl.schemaPageNo()
+				if err != nil {
+					t.Fatalf("table %q: schemaPageNo: %v", tbl.Name(), err)
+				}
+
+				raw, err := db.readSchemaStream(pageNo)
+				if err != nil {
+					t.Fatalf("table %q: readSchemaStream: %v", tbl.Name(), err)
+				}
+
+				_, _, _, constraints, _, tailErr := parseSchemaTail(raw)
+
+				for _, c := range schema.Columns {
+					notNull, known := c.NotNull()
+
+					if known != (tailErr == nil) {
+						t.Errorf("table %q column %q: NotNull() known = %v, tail parsed = %v",
+							tbl.Name(), c.Name, known, tailErr == nil)
+					}
+
+					if !notNull {
+						continue
+					}
+
+					if !constraintNamesColumn(constraints, c.Name) {
+						t.Errorf("table %q column %q: reported NOT NULL with no kind-3 record naming it",
+							tbl.Name(), c.Name)
+					}
+				}
+			}
+		})
+	}
+}
+
+// constraintNamesColumn reports whether a NOT NULL record covers the column.
+func constraintNamesColumn(records []constraintRecord, column string) bool {
+	for _, rec := range records {
+		if rec.kind == constraintNotNull && rec.namesColumn(column) {
+			return true
+		}
+	}
+
+	return false
+}

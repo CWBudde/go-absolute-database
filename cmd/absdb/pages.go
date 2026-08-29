@@ -65,7 +65,7 @@ func pagesCmd() *cobra.Command {
 
 				empty := ""
 				if page.IsEmpty() {
-					empty = "yes"
+					empty = yes
 				}
 
 				fmt.Printf("%-6d %-12s %-6s %-6s %-6s\n", i, typeName, next, objID, empty)

@@ -401,3 +401,129 @@ func TestCompressInternalFileReproducesCorpus(t *testing.T) {
 		t.Skip("no compressed internal files in the fixtures")
 	}
 }
+
+// TestColumnNotNull pins the nullability Table.Schema reads out of the
+// constraint array against Constraints.abs, whose tables differ from the
+// control by one clause each. The point of the fixture here is CNone against
+// CNotNull: their column definitions are byte-identical apart from the object
+// id, so the answer cannot come from the column definition and has to come
+// from the kind-3 constraint record.
+func TestColumnNotNull(t *testing.T) {
+	db := openFixture(t, "Constraints.abs")
+
+	tests := []struct {
+		table string
+		want  map[string]bool
+	}{
+		{"CNone", map[string]bool{"A": false, "B": false}},
+		{"CNotNull", map[string]bool{"A": true, "B": false}},
+		// A PRIMARY KEY is UNIQUE and NOT NULL, but the engine writes only
+		// the kind-0 record for it, so nothing here reports A as NOT NULL.
+		{"CPk", map[string]bool{"A": false, "B": false}},
+		{"CUnique", map[string]bool{"A": false, "B": false}},
+		{"CDefault", map[string]bool{"A": false, "B": false}},
+		{"CMinMax", map[string]bool{"A": false, "B": false}},
+		// Two records on two columns, only one of which is NOT NULL.
+		{"CBoth", map[string]bool{"A": true, "B": false}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.table, func(t *testing.T) {
+			tbl, err := db.Table(tt.table)
+			if err != nil {
+				t.Fatalf("Table(%q): %v", tt.table, err)
+			}
+
+			schema, err := tbl.Schema()
+			if err != nil {
+				t.Fatalf("Schema(): %v", err)
+			}
+
+			for _, c := range schema.Columns {
+				notNull, known := c.NotNull()
+				if !known {
+					t.Errorf("column %q: NotNull() known = false, want true", c.Name)
+
+					continue
+				}
+
+				if want := tt.want[c.Name]; notNull != want {
+					t.Errorf("column %q: NotNull() = %v, want %v", c.Name, notNull, want)
+				}
+			}
+		})
+	}
+}
+
+// TestColumnNullabilityUnknownWithoutTail records the difference between
+// "nullable" and "not established". parseSchema reads column definitions
+// alone and never sees the constraint array, so every column it produces must
+// report known = false rather than a nullable it did not read.
+func TestColumnNullabilityUnknownWithoutTail(t *testing.T) {
+	db := openFixture(t, "Constraints.abs")
+	raw := schemaStreamOf(t, db, "CNotNull")
+
+	schema, err := parseSchema(raw)
+	if err != nil {
+		t.Fatalf("parseSchema: %v", err)
+	}
+
+	for _, c := range schema.Columns {
+		notNull, known := c.NotNull()
+		if known {
+			t.Errorf("column %q: NotNull() known = true, want false", c.Name)
+		}
+
+		if notNull {
+			t.Errorf("column %q: NotNull() = true, want false", c.Name)
+		}
+	}
+
+	// The same stream through Table.Schema does establish it, which is what
+	// says the difference is the tail pass and not the fixture.
+	tbl, err := db.Table("CNotNull")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	full, err := tbl.Schema()
+	if err != nil {
+		t.Fatalf("Schema(): %v", err)
+	}
+
+	if notNull, known := full.Columns[0].NotNull(); !known || !notNull {
+		t.Errorf("CNotNull.A through Schema(): NotNull() = %v, %v, want true, true", notNull, known)
+	}
+}
+
+// TestColumnHasDefault pins the DEFAULT accessor against the one fixture table
+// that carries one.
+func TestColumnHasDefault(t *testing.T) {
+	db := openFixture(t, "Constraints.abs")
+
+	for _, tt := range []struct {
+		table string
+		want  map[string]bool
+	}{
+		{"CDefault", map[string]bool{"A": true, "B": false}},
+		{"CNone", map[string]bool{"A": false, "B": false}},
+	} {
+		t.Run(tt.table, func(t *testing.T) {
+			tbl, err := db.Table(tt.table)
+			if err != nil {
+				t.Fatalf("Table(%q): %v", tt.table, err)
+			}
+
+			schema, err := tbl.Schema()
+			if err != nil {
+				t.Fatalf("Schema(): %v", err)
+			}
+
+			for _, c := range schema.Columns {
+				if got := c.HasDefault(); got != tt.want[c.Name] {
+					t.Errorf("column %q: HasDefault() = %v, want %v", c.Name, got, tt.want[c.Name])
+				}
+			}
+		})
+	}
+}

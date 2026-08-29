@@ -109,3 +109,7 @@ func selectTable(db *absdb.File) (*absdb.Table, error) {
 
 	return nil, fmt.Errorf("%w: pass --table with one of %s", err, strings.Join(names, ", "))
 }
+
+// yes is what every column of every table this command prints uses to mark a
+// boolean that is set; an unset one is left blank so the set ones stand out.
+const yes = "yes"

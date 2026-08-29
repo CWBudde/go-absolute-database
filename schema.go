@@ -146,11 +146,42 @@ type Column struct {
 	// caller building a Column for CreateTable has no default to declare;
 	// only parseColumnDef ever sets it.
 	hasDefault bool
+
+	// notNull and nullabilityKnown carry what the table's constraint array
+	// said about this column. Nullability is not in the column definition at
+	// all -- CNone.A and CNotNull.A in Constraints.abs differ only by their
+	// object id -- so it comes from the kind-3 constraint record, and only
+	// Table.Schema, which has the whole stream, can fill it in. Both are
+	// unexported so that a caller building a Column for CreateTable cannot
+	// declare a constraint this package has no way to write, and so that
+	// re-serializing a parsed column cannot lose one: it was never in the
+	// bytes serializeColumnDef writes.
+	notNull          bool
+	nullabilityKnown bool
 }
 
 // IsBLOB returns true if this column stores BLOB data (Memo, Graphic, etc.).
 func (c Column) IsBLOB() bool {
 	return c.BaseType == BftBlob || c.BaseType == BftClob || c.BaseType == BftWideClob
+}
+
+// NotNull reports whether a NOT NULL constraint record names this column.
+//
+// known is false when the table's constraint array was not read -- because the
+// column came from parseSchema directly, or because the schema tail did not
+// parse -- and it is the difference between "this column is nullable" and
+// "this was never established". A caller that treats an unknown as nullable is
+// making the guess this package otherwise refuses to make for it.
+func (c Column) NotNull() (notNull, known bool) {
+	return c.notNull, c.nullabilityKnown
+}
+
+// HasDefault reports whether this column's definition carries a DEFAULT value.
+// The value itself is not decoded; what this answers is whether re-serializing
+// the column would drop a clause the engine wrote, which is why CreateTable
+// and compaction refuse a column that has one.
+func (c Column) HasDefault() bool {
+	return c.hasDefault
 }
 
 // TableSchema holds the parsed schema for one table.
@@ -213,7 +244,45 @@ func (t *Table) Schema() (*TableSchema, error) {
 		return nil, err
 	}
 
-	return parseSchema(decompressed)
+	schema, err := parseSchema(decompressed)
+	if err != nil {
+		return nil, err
+	}
+
+	applyNullability(schema, decompressed)
+
+	return schema, nil
+}
+
+// applyNullability fills in each column's NotNull from the schema stream's
+// constraint array.
+//
+// It is best-effort by design: a tail this package cannot read leaves every
+// column's nullability simply unknown, because Schema has always succeeded on
+// files whose tail parseSchemaTail refuses, and it must keep doing so. The
+// alternative -- reporting every column of such a table as nullable -- would
+// be indistinguishable from a table that really has no NOT NULL anywhere.
+func applyNullability(schema *TableSchema, stream []byte) {
+	constraints, ok := tailConstraints(stream)
+	if !ok {
+		return
+	}
+
+	for i := range schema.Columns {
+		schema.Columns[i].nullabilityKnown = true
+	}
+
+	for _, rec := range constraints {
+		if rec.kind != constraintNotNull {
+			continue
+		}
+
+		for i := range schema.Columns {
+			if rec.namesColumn(schema.Columns[i].Name) {
+				schema.Columns[i].notNull = true
+			}
+		}
+	}
 }
 
 // schemaPageNo resolves the page holding this table's column definitions. The
