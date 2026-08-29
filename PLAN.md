@@ -66,8 +66,12 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 
 ### Phase 7 — record writes
 
-- [ ] Split a full B-tree leaf. `ErrIndexTooManyRows` and `ErrTableFull` are both single-page
-      ceilings; no fixture reaches one, so the split is unevidenced and refused.
+- [ ] Split a B-tree leaf. `ErrIndexTooManyRows` and `ErrTableFull` are both single-page
+      ceilings. Split trees themselves are in the corpus and read correctly (five of them, see
+      [`docs/format/indexes.md`](docs/format/indexes.md#capacity-and-splitting)); what no fixture
+      shows is the engine performing a split, and the fullest observed leaf holds 232 of a
+      possible 367, so the split point is not the ceiling either. The rule is unknown, so a
+      multi-level tree is refused.
 - [ ] Crash-atomic commit. Rollback is exact, but a crash inside `Commit` leaves some pages
       written; the engine's journalling is not reproduced.
 
