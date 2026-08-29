@@ -50,14 +50,16 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 - [x] `GUID` reading, via `Record.GUID` and `ParseGUID`.
 - [x] The fourteen uncovered field types, closed by `testdata/Types.abs`. It cost four
       corrections; see [docs/format/records.md](docs/format/records.md#what-typesabs-settled).
-- [ ] Decode a **TimeStamp**. It shares `BftDateTime`'s base type and not its layout, so
-      `Record.Time` returns the zero time for one and both write paths refuse it. Needs a fixture
-      holding several distinct instants.
+- [x] **TimeStamp**, decoded by `testdata/Types2.abs` and now read and written. The engine keeps
+      only year, month, day and hour of one; see
+      [docs/format/records.md](docs/format/records.md#timestamp).
 - [x] `Extended`, decoded from the x87 80-bit format and rounded to `float64` by
       `Record.Float`. That rounding is why it stays unwritable; see
       [docs/format/records.md](docs/format/records.md#extended).
-- [ ] What a `Bytes` or `VarBytes` column's **extra byte** holds. Both store `Size + 1`; every
-      such column in the corpus is NULL, because the engine takes no SQL literal for one.
+- [ ] What a `Bytes` or `VarBytes` column's **extra byte** holds. Both store `Size + 1`, and no
+      such column in any fixture holds a value. `Types2.abs` is eleven attempts at one, and the
+      reason they fail is now known — `MIMETOBIN` builds a BLOB value, not a fixed-width one — so
+      what is left is a parameterised insert against the Delphi engine.
 
 ### Phase 4 — BLOBs
 
@@ -140,7 +142,7 @@ In rough order of what unblocks the most:
    engine will not open, so this starts with analysis, not code.
 
 The remaining validation gaps need the Delphi engine driven directly: evidence for a **split
-B-tree leaf** or a **second PFS page**, a **TimeStamp** written with several distinct instants,
-and a **`Bytes` value**, which needs a parameterised insert rather than DBManager's SQL tab. The
-fixture recipe in `testdata/README.md` is the route to all of them — it is what produced
-`Types.abs` and closed the field-type gap.
+B-tree leaf** or a **second PFS page**, and a **`Bytes` value**, which needs a parameterised
+insert rather than DBManager's SQL tab — every literal form the SQL grammar offers has now been
+tried and refused. The fixture recipe in `testdata/README.md` is the route to both; it is what
+produced `Types.abs` and `Types2.abs` and closed the field-type gap between them.

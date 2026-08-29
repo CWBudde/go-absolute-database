@@ -45,15 +45,18 @@ What the format still hides, and what this package therefore refuses rather than
   is that round-trip against the engine. It cost four corrections — see
   [format/records.md](format/records.md#what-typesabs-settled) — and what remains of the gap is
   narrower and named below.
-- **A TimeStamp's layout.** It shares `BftDateTime` as its base type but stores something else:
-  `2019-03-07 01:02:03` is `e3 07 03 00 07 00 01 00`, which reads as 2019, 3, 7, 1 and accounts
-  for no minutes or seconds. One value cannot settle a layout; a fixture holding several distinct
-  instants would. Until then `Record.Time` returns the zero time for one and both write paths
-  refuse it.
-- **What a `Bytes` or `VarBytes` column's extra byte holds.** Both store `Size + 1`, and every
-  such column in the corpus is NULL: the engine rejects an SQL literal for one, `MIMETOBIN` and a
-  plain string alike, with `Invalid variant type or size`. Writing a value needs a parameterised
-  insert, which means driving the Delphi engine rather than DBManager's SQL tab.
+- **What a `Bytes` or `VarBytes` column's extra byte holds.** Both store `Size + 1`, and no such
+  column in any fixture holds a value. `Types2.abs` is eleven attempts at producing one — see
+  [format/records.md](format/records.md#bytes-and-varbytes) — and the reason they fail is now
+  known: `MIMETOBIN` builds a BLOB value, not a fixed-width one. A value needs a parameterised
+  insert, which means driving the Delphi engine rather than DBManager's SQL tab. Until then this
+  package leaves the byte zero, which reads back correctly here and is not known to be what the
+  engine writes.
+- **Whether a TimeStamp could ever carry minutes.** The engine keeps only year, month, day and
+  hour, because the remaining `TSQLTimeStamp` fields do not fit the eight bytes a `BftDateTime`
+  column gets — that much `Types2.abs` settles. What it does not say is whether some other path
+  into the engine (a parameterised insert again) stores something else; the one SQL literal
+  carrying a fraction was rejected by the parser.
 - **BZIP and PPM BLOB compression** are named by the format and unimplemented; no fixture uses
   either.
 

@@ -66,7 +66,7 @@ slots than rows, leaving most of the bitmap zero.
 | SmallInt   | ftSmallint       | 2 bytes (int16)                                 | SMALLINT, INT16                |
 | String     | ftString         | fixed bytes, Windows-1252 (up to 65500)         | STRING(n), CHAR(n), VARCHAR(n) |
 | Time       | ftTime           | 4 bytes, int32 LE — milliseconds since midnight | TIME                           |
-| TimeStamp  | ftTimeStamp      | 8 bytes, base type DateTime, layout undecoded   | TIMESTAMP                      |
+| TimeStamp  | ftTimeStamp      | 8 bytes: year, month, day, hour as uint16 LE    | TIMESTAMP                      |
 | VarBytes   | ftVarBytes       | Size + 1 bytes                                  | VARBYTES(n)                    |
 | WideMemo   | ftBlob (subtype) | BLOB pointer                                    | WIDEMEMO                       |
 | WideString | ftWideString     | fixed UTF-16LE (up to 65500)                    | WIDESTRING(n), NCHAR(n)        |
@@ -95,9 +95,8 @@ as it was written, so both forms occur.
 
 **`Bytes` and `VarBytes` store `Size + 1` bytes**, as `Char` and `Varchar` do. A `BYTES(16)`
 occupies seventeen. `VarBytes` is not the length-prefixed `Size + 2` it was modelled as. What the
-extra byte holds is not established: every byte column in the corpus is NULL, because the engine
-refuses an SQL literal for one — both `MIMETOBIN('...')` and a plain string are rejected with
-`Invalid variant type or size`, so a value can only be written through a parameter.
+extra byte holds is not established, because no such column anywhere holds a value; see
+[Bytes and VarBytes](#bytes-and-varbytes) below.
 
 **A TimeStamp is not a DateTime**, though it shares `BftDateTime` as its base type. Where a
 DateTime writes `{int32 Date; int32 Time}`, `2019-03-07 01:02:03` is stored as
@@ -106,10 +105,8 @@ DateTime writes `{int32 Date; int32 Time}`, `2019-03-07 01:02:03` is stored as
 e3 07 03 00 07 00 01 00     2019, 3, 7, 1
 ```
 
-which reads as the year, month, day and hour rather than as a day count and a millisecond count,
-and accounts for no minutes or seconds. The layout is **undecoded**: one value is not enough to
-settle it, and `Record.Time` returns the zero time for a TimeStamp rather than a confidently
-wrong instant.
+which reads as the year, month, day and hour rather than as a day count and a millisecond count.
+`Types2.abs` settled the rest; see [TimeStamp](#timestamp) below.
 
 Dates are **not** Delphi `TDateTime` floats. `ABSTypes.hpp` declares
 `TABSDateTime { int Date; int Time }`: `Date` is days with 0001-01-01 as day 1 (the BDE
@@ -129,7 +126,9 @@ wrote for exactly this purpose and which now covers every type in the table abov
 [../testing.md](../testing.md).
 
 That is engine-written evidence rather than field data, so it says what the engine stores, not
-what any application stores. One gap remains: **TimeStamp**'s layout is undecoded, and it is in
+what any application stores. One gap remains, and it is a gap in the _engine's_ SQL rather than
+in this package: no `Bytes` or `VarBytes` column anywhere holds a value, so the meaning of the
+byte they store beyond their declared size is still open. See
 [../open-questions.md](../open-questions.md).
 
 ### Extended
@@ -149,6 +148,55 @@ unbiased exponent of zero and a value of that integer over 2^63.
 significand do not fit in 53. That is also why an Extended column stays refused by the write
 path (`ErrColumnNotWritable`) — a rewrite of some other column in the row would silently
 truncate this one.
+
+### TimeStamp
+
+A `TIMESTAMP` column is eight bytes holding four little-endian 16-bit values — **year, month,
+day, hour** — and nothing else. It shares `BftDateTime` as its base type, which is where those
+eight bytes come from, and shares none of its layout.
+
+Those four are the first four fields of dbExpress's `TSQLTimeStamp`, which the engine works in:
+`ABSMain.hpp` includes `Data.SqlTimSt.hpp`, and the manual describes `aftTimeStamp` as "date and
+time field accessed through dbExpress". That record's remaining `Minute`, `Second` and
+`Fractions` do not fit into eight bytes, and the engine writes only what fits. **The minutes and
+seconds of the value inserted are lost**, silently.
+
+`Types2.abs`'s `TStamp` proves that rather than inferring it. Its rows 1, 2 and 3 hold
+`01:02:03`, `01:02:04` and `01:03:03`:
+
+```
+row 1   e3 07 03 00 07 00 01 00     2019, 3, 7, 1
+row 2   e3 07 03 00 07 00 01 00     identical
+row 3   e3 07 03 00 07 00 01 00     identical
+```
+
+while the `DATETIME` column beside them differs in every row. Rows 4 to 7 each move one of the
+four fields that is kept, and row 9's `23:59:58` stores the hour and drops the rest. A row
+carrying `01:02:03.456` was rejected by the SQL parser outright, so nothing here says whether a
+`Fractions` value could ever have been supplied.
+
+`Record.Time` returns the instant to the hour; a field whose parts are not a real date reads as
+the zero time, which covers NULL and anything malformed. The write path accepts a TimeStamp and
+refuses a value carrying minutes or seconds (`ErrValueRange`) rather than truncating it the way
+the engine does.
+
+### Bytes and VarBytes
+
+Both store `Size + 1` bytes, and **what the extra byte holds is unknown**, because no `Bytes` or
+`VarBytes` column in any fixture holds a value. That is not for want of trying: `Types2.abs`'s
+`TBin2` and `TVar2` between them offer eleven ways of writing one — `MIMETOBIN` of 8, 9, 7 and 4
+bytes, a plain string, a `CAST` — and the engine rejected every one with
+`Invalid variant type or size for field`.
+
+The reason is that `MIMETOBIN` builds a **BLOB** value: the parser's node for it is
+`TABSExprNodeBlob` (`ABSExpressions.hpp`), so it is assignable to a BLOB column and not to a
+fixed one. `TBlob2` in the same fixture takes the very payload the `BYTES` columns refused. And
+`TBin2`'s row 8 was inserted as row 7 and renumbered by an `UPDATE`, so the refusals are about
+the value and not about the statement.
+
+Writing a value therefore needs a parameterised insert — the Delphi engine directly, rather than
+DBManager's SQL tab. Until one exists, this package writes the whole field and leaves the extra
+byte zero, which reads back correctly here and is not known to be what the engine writes.
 
 ## Capacity limits
 
