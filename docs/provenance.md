@@ -25,6 +25,33 @@ interoperability of the independently created program. That is why the format re
 of this library's source tree, documenting the code that sits beside it, rather than published
 as a standalone specification.
 
+## The interoperability purpose
+
+Art. 6 protects decompilation undertaken to achieve interoperability, so the purpose has to be
+real and specific rather than asserted after the fact. It is both, and it is recorded here so
+that it cannot go stale:
+
+**The independently created program is [Aconiq](https://github.com/CWBudde/Aconiq)**, an
+environmental noise modelling system (MIT). **The programs it must interoperate with are
+SoundPLAN and the Absolute Database engine.** SoundPLAN — the dominant noise-calculation tool in
+the DACH region — stores its result tables, train-type catalogues, address lists and attribute
+tables as `.abs` files. Users who own those files cannot get their own data out of them without
+a Delphi toolchain and a Windows machine. This library is how Aconiq reads them; it is a
+dependency of Aconiq's `soundplanimport` package, not a standalone republication of somebody
+else's format.
+
+Two limits follow from that purpose and are binding on this project:
+
+- **No substantially similar expression.** Art. 6(2)(c) forbids using what decompilation reveals
+  to develop a program substantially similar _in its expression_. Competing on function is
+  expressly permitted — that is the holding in _SAS v WPL_ — and Aconiq competes with SoundPLAN
+  on function. Nothing here may reproduce anyone's code, and nothing here does.
+- **Customers' own data only, never the vendors' shipped datasets.** Reading a `.abs` file that a
+  SoundPLAN user's own installation wrote is interoperability. Extracting and redistributing the
+  reference catalogues SoundPLAN _ships_ — emission tables, train-type data — is a different act
+  that copyright and the sui generis database right (§§87a–87b UrhG, Directive 96/9/EC) may well
+  reach, and no amount of Art. 6 helps with it. Keep the distinction sharp in Aconiq.
+
 ## What is not here
 
 The ComponentAce SDK — the compiled units, the C++Builder headers, DBManager's Delphi source, the
