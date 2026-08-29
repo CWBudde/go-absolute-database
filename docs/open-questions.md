@@ -24,13 +24,14 @@ What the format still hides, and what this package therefore refuses rather than
   What no file shows is the engine performing the split: the fullest observed leaf holds 232 of a
   possible 367, so the split point is not "leaf full", and the rule is unknown. Every write path
   refuses a multi-level tree.
-- **The column definition's autoinc block ever varying.** The five `TABSFieldDef` autoinc fields
-  decoded in [format/schema.md](format/schema.md#column-definition) carry `increment 1`,
-  `initial 0`, `min 0`, `max High(Int64)`, `cycled False` in all 495 column definitions in the
-  corpus — the AutoInc columns included, so even they are stored with the defaults. The reading
-  rests on `TABSFieldDef`'s declaration order plus a byte-exact fit that leaves nothing over, not
-  on having seen the fields hold anything else. A single `CREATE TABLE` with explicit
-  `INCREMENT`/`INITIALVALUE`/`MAXVALUE` options would confirm it outright.
+- ~~**The column definition's autoinc block ever varying.**~~ Closed, and it was closed by
+  `Types.abs` before this list noticed. `TAutoInc.A` is the `CREATE TABLE` with explicit options
+  the entry asked for: it carries `increment 5, initial 100, min 10, max 999` where every other
+  column in the corpus carries the defaults, and its two rows are numbered 105 and 110, which
+  corroborates two of the fields from outside the definition. What the entry got right is that
+  the AutoInc columns themselves are stored with the defaults — the running counter is not in
+  the column definition at all but in the
+  [table info file](format/internal-files.md#the-autoinc-counters).
 - **A second PFS or EAM page.** The engine's `PfsPageNoForPageNo` says they recur; one PFS
   payload addresses 32 448 pages at 4096 bytes and the largest file in the corpus is 78.
 - **Page sizes other than 4096 and 2048.** The payload model is expressed in terms of
@@ -79,14 +80,21 @@ What the format still hides, and what this package therefore refuses rather than
   What the fixtures did change is two things nobody would have guessed — a `NULL` key sorts
   _before_ every value, and a `UNIQUE` index treats a second `NULL` as a duplicate. See
   [format/indexes.md](format/indexes.md#key-enforcing-indexes).
-- **Whether an `AUTOINC` column has anything a write must maintain.** This is the gap that now
-  stands between the write path and most of the private corpus: fifteen of its twenty-five key
-  constraints are backed by a single-column, single-page index over an `AUTOINC` column, whose
-  index record and leaf are the `Int32` shape exactly. `Auto-ins.abs` says there is no counter
-  page — an `AUTOINC` insert touches the same page types an `Int32`-keyed one does — but it
-  says nothing about how the engine picks the next value when a row is inserted **without**
-  one, which is the case DBManager's SQL tab exercises and a caller of this package does not.
-  Until that is settled, `describeIndex` refuses the column's field type.
+- ~~**Whether an `AUTOINC` column has anything a write must maintain.**~~ Closed, and the
+  answer is yes: a per-column counter in the table info file, which the seven new `Auto*.abs`
+  fixtures locate and pin. See
+  [format/internal-files.md](format/internal-files.md#the-autoinc-counters).
+
+  The entry is worth keeping for how it was wrong. It reported `Auto-ins.abs` as saying there is
+  no counter page, on the grounds that an `AUTOINC` insert touches the same page _types_ an
+  `Int32`-keyed one does. That is true and does not follow: the counter is on one of those page
+  types, and an ordinary insert rewrites that page anyway for the record count. Comparing page
+  types is not comparing pages, and the array the counter lives in reads as padding in every
+  table that has no `AUTOINC` column.
+
+  What is still open is only the edges: whether the engine refuses or wraps at `MAXVALUE` (no
+  fixture reaches a bound, so this package refuses with `ErrAutoIncExhausted`), and what a
+  `CYCLED` column does (`ErrAutoIncNotMaintained`; no column anywhere is one).
 
 ## Deliberate divergences
 

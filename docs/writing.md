@@ -112,13 +112,35 @@ Every refusal is made before any page is touched, because that is what the engin
 the refused statements left its file byte-identical to its parent, transaction counter
 included.
 
+### An `AUTOINC` column
+
+An index over an `AUTOINC` column is maintained on the same terms as one over an `Integer`
+column, because it is the same index: `Auto.abs`'s record and leaf are the `Int32` shape byte
+for byte. What kept it refused was never the key but the column's **counter**, which the engine
+keeps in the [table info file](format/internal-files.md#the-autoinc-counters) and which a
+writer that ignored it would leave stale — so the engine's next insert would reissue a value the
+table already holds, and on the `PRIMARY KEY` column such a column usually is, refuse its own
+write.
+
+This package maintains it by the rule those fixtures pin: an insert raises the counter to the
+value written when that value is larger, and a delete and an update leave it alone. Passing
+`nil` for an `AUTOINC` column means "number this row", which takes `counter + Increment` — the
+engine's own `INSERT INTO Auto (Name) VALUES (…)`. Seven pairs are byte-identical with no
+`State` exclusion, three of them writing a value this package chose rather than one copied out
+of the fixture, and the whole of `Auto.abs` is rebuilt from `Empty.abs` with only page `State`
+words excluded.
+
+Two edges stay refused rather than guessed: a `CYCLED` column (`ErrAutoIncNotMaintained`; none
+exists anywhere) and an assignment past `MAXVALUE` (`ErrAutoIncExhausted`; no fixture reaches a
+bound, so whether the engine refuses or wraps is unknown). The narrower `AUTOINC` field types —
+`AutoIncInt8` through `AutoIncUint32` — are refused by name for the same reason, so that a
+column of one is never mistaken for an ordinary integer and left with a stale counter.
+
 Everything else is refused with `ErrIndexNotMaintained` rather than guessed at: a tree deep
 enough to have split, a key of another shape, a multi-column index (`ErrMultiColumnIndex`), a
 `DESC` or `NOCASE` index, which orders its leaf differently than this package compares, and a
-column that is not `Int32`/`Integer`. That last one is what now covers most of the private
-corpus: fifteen of its twenty-five key constraints are backed by a single-column, single-page
-index over an **`AUTOINC`** column, whose record and leaf are the `Int32` shape exactly — see
-[open-questions.md](open-questions.md).
+column that is not `Int32`. A multi-column index is what now covers most of what is left: eight
+of the sixteen tables the writer still refuses are refused for that.
 
 Indexes are resolved from the table's own schema records, with the pages kept as a cross-check
 in the other direction: an index the pages show that the schema does not name stops the write.
@@ -304,6 +326,8 @@ Each is an error rather than a silent success.
 | `ErrConstraintsNotRebuilt`   | Compaction of a table carrying a constraint record `CREATE TABLE` cannot write back — a key over more than one column, or over a column an index leaf is not built for                   |
 | `ErrConstraintsNotEnforced`  | A write to a table declaring a constraint this package does not check — a record whose column or bound type does not resolve, or a key whose index is not maintained                     |
 | `ErrDuplicateKey`            | A write whose key a `UNIQUE` or `PRIMARY` index already holds, or `CreateUniqueIndex` over a column that already holds one twice                                                         |
+| `ErrAutoIncNotMaintained`    | A table carrying an `AUTOINC` column whose counter this package will not keep in step — a `CYCLED` column, or one of the narrower `AUTOINC` field types                                  |
+| `ErrAutoIncExhausted`        | An `AUTOINC` value to assign past the column's `MAXVALUE`, or past what an `Int32` column holds                                                                                          |
 | `ErrNotNullViolated`         | A write storing `NULL` in a column a `NOT NULL` record covers, or in one a `PRIMARY` index covers                                                                                        |
 | `ErrCheckViolated`           | A write storing a value outside a column's `MINVALUE`/`MAXVALUE` pair                                                                                                                    |
 | `ErrEncryptionUnsupported`   | `CreateDatabase` with `Encrypted: true`, or compaction of an encrypted database                                                                                                          |

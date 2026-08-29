@@ -68,8 +68,14 @@ ff ff ff ff ff ff ff 7f    AutoincMaxValue     = High(Int64)
 07 ff                      DEFAULT: type tag, then the absent marker
 ```
 
-All five fields carry those same values in **all 495 column definitions in the corpus**, including
-the AutoInc columns, so nothing in it has ever been observed to vary. The BLOB descriptor does
+All five fields carry those same values in every column definition in the corpus but one, the
+AutoInc columns included: even a column the engine numbers itself is stored with the defaults,
+because what it counts with lives elsewhere — the running counter is in the
+[table info file](internal-files.md#the-autoinc-counters), not here. The exception is
+`Types.abs`'s `TAutoInc.A`, declared with explicit options and holding
+`increment 5, initial 100, min 10, max 999`, which is what shows these are the AUTOINC clause's
+parameters rather than five fields that happen to be constant. Its two rows are numbered 105 and
+110, corroborating `increment` and `initialValue` from outside the definition. The BLOB descriptor does
 vary: `Addresses.abs` and `RPDG0011.abs` store their BLOBs uncompressed (`0 / 0 / 102400`) and
 `TS03.abs` stores its `Kommentar` and `Graphic` columns zlib-compressed at level 4
 (`1 / 4 / 102400`).

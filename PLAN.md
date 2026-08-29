@@ -96,15 +96,17 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
       fixtures. `CREATE TABLE` builds the backing index, compaction rebuilds both, the index
       refuses a duplicate (`ErrDuplicateKey`) and `CreateUniqueIndex` writes the pair the engine
       writes. See [docs/writing.md](docs/writing.md#a-unique-or-primary-index).
-- [ ] **Index an `AUTOINC` column.** This is what the item above turned out to be blocked
-      behind, and it is worth more than it was: fifteen of the corpus's twenty-five key
-      constraints are backed by a single-column, single-page index over an `AUTOINC` column,
-      whose record and leaf are the `Int32` shape exactly. What is unknown is how the engine
-      picks the next value for a row inserted without one; see
-      [docs/open-questions.md](docs/open-questions.md).
+- [x] **Index an `AUTOINC` column.** Closed by seven more `Auto*.abs` fixtures, which located
+      the counter the engine keeps for such a column: one `int64` per column in the table info
+      file, raised by an insert and left alone by a delete and an update. `CREATE TABLE`,
+      compaction and index maintenance all take the column now, and this package assigns the
+      next value the way the engine does. See
+      [docs/format/internal-files.md](docs/format/internal-files.md#the-autoinc-counters).
 - [ ] **A multi-column or `VARCHAR` key.** The other two shapes still refused, by index
       maintenance and by the rebuild alike: `Constraints.abs`'s `CPkMulti` and `CBoth`, and the
-      three private fixtures whose key covers two or three columns.
+      three private fixtures whose key covers two or three columns. This is now the largest
+      single blocker: eight of the sixteen tables the writer still refuses are refused for a
+      multi-column index.
 - [ ] **Write a `DEFAULT`.** The same problem one level down, refused the same way
       (`ErrColumnDefault`): it lives in the column definition rather than the constraint array,
       and `serializeColumnDef` writes the absent marker unconditionally.
@@ -141,22 +143,23 @@ Deferred until there is a concrete use case.
 
 In rough order of what unblocks the most:
 
-1. **An `AUTOINC` key column**, which is what a key-enforcing index turned out to be blocked
-   behind rather than the key itself. Fifteen of the corpus's twenty-five key constraints are
-   backed by an index over one, and the index is the shape this package already maintains — the
-   refusal is on the column's field type, because nothing here knows how the engine picks the
-   next value for a row inserted without one. `testdata/Auto.abs` and `Auto-ins.abs` are the
-   start of the evidence and say a counter page is not involved; a parameterised insert against
-   the Delphi engine is what would finish it. A `DEFAULT` is a separate gap one level down
-   (`ErrColumnDefault`).
-2. **The `ALTER TABLE` rebuild**, which would retire the last deliberate divergence from the
+1. **A multi-column index**, which is what is left of the write path's reach. With the
+   `AUTOINC` column closed, sixteen tables in the corpus still refuse a write and **eight** of
+   them refuse for a multi-column index — more than every other reason put together. Two
+   fixtures already exist (`Constraints.abs`'s `CPkMulti` and `CBoth`) and what they do not show
+   is the leaf: a concatenated key needs its own comparison and its own `KeyPrefixSize`, and no
+   file yet shows the engine splicing one. That is a fixture run, not a guess.
+2. **A split B-tree leaf**, which is the ceiling under `ErrIndexTooManyRows` and `ErrTableFull`
+   and the reason two of the remaining refusals exist. The corpus holds five split trees and
+   reads them correctly; what no file shows is the engine performing a split, and the fullest
+   observed leaf holds 232 of a possible 367, so the split point is not "leaf full".
+3. **The `ALTER TABLE` rebuild**, which would retire the last deliberate divergence from the
    engine's byte output.
-3. **Encrypted writes**, which need the control block decoded first. A guess produces a file the
+4. **Encrypted writes**, which need the control block decoded first. A guess produces a file the
    engine will not open, so this starts with analysis, not code.
 
 The remaining validation gaps need the Delphi engine driven directly: evidence for a **split
-B-tree leaf** or a **second PFS page**, an **`AUTOINC` value the engine assigned**, and a
-**`Bytes` value** — the last two need a parameterised insert rather than DBManager's SQL tab.
-The fixture recipe in `testdata/README.md` is the route to the first two; it is what produced
-`Types.abs`, `Types2.abs` and the `Keys*.abs` family, each of which closed a gap this list used
-to carry.
+B-tree leaf** or a **second PFS page**, and a **`Bytes` value** — the last needs a parameterised
+insert rather than DBManager's SQL tab. The fixture recipe in `testdata/README.md` is the route
+to the first two; it is what produced `Types.abs`, `Types2.abs` and the `Keys*.abs` and
+`Auto*.abs` families, each of which closed a gap this list used to carry.

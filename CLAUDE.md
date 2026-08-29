@@ -60,13 +60,16 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   `TestCreateIndexMatchesEngineByteForByte`, `TestGrowthMatchesEngineByteForByte`,
   `TestCreateDatabaseMatchesEngineByteForByte`, `TestCompactDatabaseMatchesEngineByteForByte`,
   `TestKeyIndexWritesMatchEngineByteForByte`,
-  `TestCreateTableWithAPrimaryKeyMatchesEngineByteForByte` and
-  `TestCreateUniqueIndexMatchesEngineByteForByte`
+  `TestCreateTableWithAPrimaryKeyMatchesEngineByteForByte`,
+  `TestCreateUniqueIndexMatchesEngineByteForByte`,
+  `TestAutoIncWritesMatchEngineByteForByte`,
+  `TestCreateAutoIncTableMatchesEngineByteForByte` and
+  `TestCompactAutoIncMatchesEngineByteForByte`
   require each operation to reproduce the file DBManager itself produced for the same SQL statement
-  or menu action. That includes index maintenance: four of the `Writes-idx*` pairs and seven
-  `Keys*` pairs pin the B-tree leaf splices an insert, a delete and a key-moving update perform on
-  a plain and on a key-enforcing index, with **no `State` exclusion**, because maintenance
-  allocates no page. Reading a write back correctly is not sufficient
+  or menu action. That includes index maintenance: four of the `Writes-idx*` pairs, seven
+  `Keys*` pairs and seven `Auto*` pairs pin the B-tree leaf splices an insert, a delete and a
+  key-moving update perform on a plain, a key-enforcing and an `AUTOINC`-keyed index, with
+  **no `State` exclusion**, because maintenance allocates no page. Reading a write back correctly is not sufficient
   evidence — the engine keeps counters a naive writer would miss, and this package's own reader would
   not notice. If you change the write path, those are the tests that matter.
 
@@ -113,17 +116,37 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   consequence of reallocation.
 
 - **Index maintenance is deliberately narrow, and its narrowness is load-bearing**: insert, delete
-  and a key-moving update keep a **single-page index over an `Int32`/`Integer` column** in step,
-  which is exactly the shape `CREATE INDEX` builds. Everything else is refused with
-  `ErrIndexNotMaintained` rather than guessed at: a tree deep enough to have split, a key of another
-  shape, an index whose ordering this package does not reproduce (multi-column, `DESC`, `NOCASE`),
-  and a column of another field type — `AUTOINC` above all, which is what fifteen of the corpus's
-  twenty-five key constraints are keyed on and what now stands between the write path and most
-  private fixtures. Three behaviours come from fixtures and must not be "tidied": a removal
+  and a key-moving update keep a **single-page index over an `Int32` column** in step — `Integer`
+  or `AUTOINC`, which are the same index byte for byte — and that is exactly the shape
+  `CREATE INDEX` builds. `indexableKeyColumn` (`index.go`) is the single definition of that rule;
+  it had four copies before, and they have to agree, because a rebuild that builds an index the
+  writer will not maintain produces a table nothing can insert into. Everything else is refused
+  with `ErrIndexNotMaintained` rather than guessed at: a tree deep enough to have split, a key of
+  another shape, and an index whose ordering this package does not reproduce (multi-column,
+  `DESC`, `NOCASE`). **A multi-column index is now the largest single blocker** — eight of the
+  sixteen tables the writer still refuses are refused for one, more than every other reason
+  together. Three behaviours come from fixtures and must not be "tidied": a removal
   **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), a key-moving update is a
   **removal followed by a sorted insertion** rather than an in-place patch (`Writes-idx-upd.abs`),
   and a `NULL` key **sorts before every value** (`Keys-uniqnull.abs`, which is the only file
   anywhere holding one).
+
+- **An `AUTOINC` column's next value is stored, not derived, and a write must maintain it**: it
+  is one `int64` per column in the **table info file**, in the array `buildTableInfoFile` writes
+  as zeroes (`writer_autoinc.go`, `docs/format/internal-files.md`). An insert raises it to the
+  value written when that value is larger; a delete and an update **leave it alone**, so it
+  records what the engine has assigned rather than what the column holds — `Auto-upd.abs` sets
+  `Id` to 20 and leaves the counter at 3, and a writer that recomputed it from the rows would be
+  wrong on exactly that file. Passing `nil` for such a column means "number this row" and takes
+  `counter + Increment`. **Never recompute this counter from the data**, and never leave it
+  stale: a stale counter has the engine reissue a value the table already holds and then refuse
+  its own insert.
+
+  The way this was missed for a whole cycle is worth keeping. `Auto-ins.abs` was read as saying
+  no counter is stored, because an `AUTOINC` insert touches the same page _types_ an
+  `Int32`-keyed insert does. It does — and the counter is on one of them, on the page an
+  ordinary insert rewrites anyway for the record count. Comparing page types is not comparing
+  pages.
 
   A `UNIQUE`/`PRIMARY KEY` index used to be on that refusal list, and lifting it was gated in this
   file on "do not do it on the strength of the duplicate check alone". That gate was met the way it

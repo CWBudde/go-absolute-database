@@ -77,10 +77,11 @@ last table twice and never notice the dropped one was gone.
 
 ## Table info — type 9
 
-Two counters at the **end** of the file, so their position moves with the table's width:
+Stored uncompressed. Two counters sit at the **end** of the file, so their position moves with
+the table's width, and between the column count and them is one `int64` per column:
 
 ```
-int32 ColumnCount, ColumnCount * 8 bytes, int32 Changes, int32 Records
+int32 ColumnCount, ColumnCount x int64 AutoIncCounter, int32 Changes, int32 Records
 ```
 
 `Records` is the number of live rows. `Changes` counts **records touched**, not transactions:
@@ -89,6 +90,46 @@ move by one.
 
 Every fixture obeys this shape, across 5.13, 7.61 and 7.94, and every stored record count
 matches the rows actually present.
+
+### The AUTOINC counters
+
+The per-column array is where an `AUTOINC` column's next value comes from. It read as padding
+for a long time, and understandably: every slot of it is zero in a table with no `AUTOINC`
+column, which is all but twenty of the corpus's columns.
+
+`Types.abs`'s `TAutoInc` is what makes it unmistakable. Declared `INITIALVALUE 100 INCREMENT 5`,
+it holds two rows numbered 105 and 110, and its slot holds **110** — a number that is neither
+the row count nor anything else on the page. Across the corpus all twenty `AUTOINC` columns
+carry their column's maximum and no other column anywhere carries a non-zero slot.
+
+What moves the counter is narrower than "the column's maximum", and the `Auto*.abs` family
+settles each case separately:
+
+| Operation                       | Counter                       | Fixture               |
+| ------------------------------- | ----------------------------- | --------------------- |
+| insert, no value given          | `counter + Increment`, stored | `Auto-insnext.abs`    |
+| insert, explicit value above it | raised to that value          | `Auto-insexp.abs`     |
+| insert, explicit value below it | unchanged                     | `Auto-inslow.abs`     |
+| delete                          | unchanged                     | `Auto-del.abs`        |
+| update                          | unchanged                     | `Auto-upd.abs`        |
+| compaction                      | rebuilt from the rows         | `Auto-updcompact.abs` |
+
+So the counter records what the engine has **assigned**, not what the column holds. Two
+consequences follow that a reader guessing from the data would get wrong:
+
+- A value a delete freed is never reissued — `Auto-delins.abs` deletes row 3 and the next
+  insert takes 4.
+- The counter can end up **below** the column's maximum. `Auto-upd.abs` sets `Id` to 20 and
+  leaves the counter at 3, so the engine will hand out 4 … 20 and then collide with a row it
+  wrote itself, on a `PRIMARY KEY` column, and refuse its own insert. That is the engine's
+  behaviour; this package reproduces it rather than repairing it.
+
+The compaction row is not a further rule but this one applied by a replay, which is more
+evidence for `CompactDatabase` being `InternalCopyDatabase`: re-inserting each row with its
+stored value raises the counter to the maximum, which is exactly the 3 → 20 that file shows.
+
+The remaining `AUTOINC` parameters live in the [column definition](schema.md#column-definition),
+not here.
 
 ## The schema stream — type 8
 
