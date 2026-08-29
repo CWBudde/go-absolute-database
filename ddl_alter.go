@@ -10,16 +10,34 @@ import (
 // ALTER TABLE ADD COLUMN and ALTER TABLE DROP COLUMN.
 //
 // Read this file's honesty warning before trusting it more than the corpus
-// does: no fixture pair pins either operation's output. PLAN.md records the
-// byte diffs of two single-statement ALTER TABLE runs against MultiTable.abs
-// (ADD (W INTEGER) = 248 bytes, DROP (V) = 234 bytes), but the files
-// themselves were never committed and cannot be regenerated here. Every other
-// write in this package is judged byte-for-byte against what the Delphi
-// engine wrote for the same statement; these two cannot be, so
-// TestAlterTableMatchesEngineByteForByte exists only as a placeholder that
-// starts running the day someone produces those files under DBManager. Until
-// then this package's guarantee is weaker than DropTable's or CreateTable's:
-// round-trip correctness plus the B-tree leaf oracle, not byte identity.
+// does. These two operations are the only writes in this package that do not
+// reproduce the engine's bytes, and that is a decision rather than a gap.
+//
+// The fixtures exist: MultiTable-alteradd.abs and MultiTable-alterdrop.abs
+// are what DBManager wrote for the two statements below, run against
+// MultiTable.abs. They show the engine does not edit a table in place at all.
+// It runs CREATE TABLE <temp> / copy the rows / rename <temp> to the original
+// name / DROP TABLE the original -- four transactions, three catalog writes,
+// a new object id for the table and every one of its columns, the old pages
+// tombstoned and six new ones allocated. ddl_alter_test.go's own section
+// comment lays out the counter-by-counter evidence, and
+// TestEngineAlterTableRebuildsTheTable pins it.
+//
+// Reproducing that sequence was considered and rejected: it needs six free
+// pages, and nothing here can grow a database. MultiTable.abs is the only
+// file in the corpus that has six. Writes.abs has three, every
+// Employees-*.abs has two, and the customer fixtures have between none and
+// five, so an engine-faithful ALTER TABLE would be byte-perfect on one
+// fixture and refuse on every other file this package exists to read. The
+// splice below works on all of them.
+//
+// So the guarantee here is weaker than DropTable's or CreateTable's, and
+// differently shaped: not byte identity, but semantic identity against the
+// engine's own output for the same statement -- same tables, same columns,
+// same rows, checked by TestAlterTableMatchesEngineSemantically -- plus
+// round-trip correctness and the B-tree leaf oracle. Column ids are the one
+// thing that legitimately differs, because the engine's rebuild reallocates
+// them and this splice does not.
 //
 // Two edits, and the second is the one with teeth:
 //

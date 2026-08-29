@@ -10,7 +10,7 @@ validated against real customer files — run `just test` locally for that.
 ## The committed fixtures
 
 Three sets are committed: the eight `Employees-*.abs` files, one per encryption algorithm,
-the eleven `Writes*.abs` files that pin the write path, and the six `MultiTable*.abs` files
+the eleven `Writes*.abs` files that pin the write path, and the eight `MultiTable*.abs` files
 that pin the table catalog and the schema operations over it.
 
 ### `Employees-*.abs` — one per encryption algorithm
@@ -119,9 +119,9 @@ name and the invented row values.
 
 ### `MultiTable*.abs` — the table catalog and the schema operations over it
 
-Six unencrypted files, the only ones in the corpus holding more than one table. Every other
-fixture, customer files included, has exactly one, which is why the multi-table bug they
-close survived unnoticed for so long.
+Eight unencrypted files, the only ones in the corpus holding more than one table. Every
+other fixture, customer files included, has exactly one, which is why the multi-table bug
+they close survived unnoticed for so long.
 
 | File                        | Made from               | Contents                                           |
 | --------------------------- | ----------------------- | -------------------------------------------------- |
@@ -131,13 +131,25 @@ close survived unnoticed for so long.
 | `MultiTable-droplast.abs`   | `MultiTable.abs`        | the same, then `DROP TABLE Gamma`                  |
 | `MultiTable-create.abs`     | `MultiTable.abs`        | the same, then `CREATE TABLE Delta (X, Y)`         |
 | `MultiTable-createdrop.abs` | `MultiTable-create.abs` | the same, then `DROP TABLE Delta`                  |
+| `MultiTable-alteradd.abs`   | `MultiTable.abs`        | the same, then `ALTER TABLE Gamma ADD (W INTEGER)` |
+| `MultiTable-alterdrop.abs`  | `MultiTable.abs`        | the same, then `ALTER TABLE Gamma DROP (V)`        |
 
-The last four are what `TestDropTableMatchesEngineByteForByte` holds the drop to, and each
+The `drop*` files are what `TestDropTableMatchesEngineByteForByte` holds the drop to, and each
 covers something the original pair could not. Dropping `Alpha` rewrites every catalog entry
 behind it and frees the file's highest page, so `LastUsedPageNo` has to move; dropping
 `Gamma` rewrites none; dropping `Delta`, which was created and never inserted into, is the
 only case of a table that owns no data page at all, so its index page can only be found by
 reading the page number out of its column definitions.
+
+The two `alter*` files are the newest and the ones that changed a conclusion rather than
+confirming one. They were long recorded as impossible to regenerate; produced under
+DBManager they show that the engine implements `ALTER TABLE` as `CREATE TABLE <temp>` +
+copy rows + rename + `DROP TABLE`, not as an in-place edit — four transactions, three
+catalog writes, new object ids, six pages allocated and six freed. This package splices in
+place instead, because matching the engine needs six free pages and `MultiTable.abs` is the
+only file in the corpus that has them. See PLAN.md's "What `ALTER TABLE` does instead of
+what the engine does"; `TestAlterTableMatchesEngineSemantically` and
+`TestEngineAlterTableRebuildsTheTable` are what these two fixtures pin.
 
 `MultiTable-create.abs` earns its place twice over. Besides being the base of the
 `createdrop` case, it is the only evidence for what `CREATE TABLE` allocates: five pages

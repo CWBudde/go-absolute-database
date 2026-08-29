@@ -1519,6 +1519,10 @@ Phase 8.
 - [x] Implement `ALTER TABLE DROP COLUMN` — update schema, re-encode existing records
 - [x] Implement `CREATE INDEX` — build B-tree from existing data
 - [x] Implement `DROP INDEX` — remove index pages, update schema
+- [ ] Implement database growth — extend a file by an extent when no free pages remain. Not
+      previously listed: it surfaced as the reason an engine-faithful `ALTER TABLE` is out of
+      reach, since every file in the corpus but `MultiTable.abs` has too few free pages for one.
+      No fixture captures a grow event, so it needs one before it can be written.
 - [ ] Implement database compaction (defragment free space)
 
 ### What blocked the other five, and how it was unblocked
@@ -1623,34 +1627,73 @@ Because so much of the region is undecoded, all four operations edit the stream
 `TableSchema` and re-serializing. A re-serializer would silently drop what it does not
 understand.
 
-### What `ALTER TABLE` does not have, and what would give it to it
+### What `ALTER TABLE` does instead of what the engine does
 
-Neither `ALTER TABLE` form has an engine fixture. `PLAN.md` records the diffs below but the
-files were never committed and could not be regenerated in the round that implemented them,
-so unlike every other write in this package neither is checked against bytes the engine
-produced. `TestAlterTableMatchesEngineByteForByte` is written and **skips** on the two
-absent fixtures, naming the SQL that regenerates them; the day either is committed the
-check runs with no code change.
+Both `ALTER TABLE` fixtures now exist. `MultiTable-alteradd.abs` and
+`MultiTable-alterdrop.abs` are what DBManager wrote for
+`ALTER TABLE Gamma ADD (W INTEGER)` and `ALTER TABLE Gamma DROP (V)` against
+`MultiTable.abs`, and they reproduce the 248- and 234-byte diffs recorded in the round that
+first implemented these operations. What they revealed is not a near-miss.
 
-Until then the evidence is round-trip plus the independent B-tree leaf oracle. The case
-most likely to be silently wrong is covered deliberately: the null-flag prefix is sized
-from the column count, so a count crossing a multiple of 8 moves every field in every
-record — the shape of the Phase 5c bug — and `TestAlterTableColumnCountBoundary` drives
-8→9 and 16→17 and back on synthetic fixtures, asserting that `nullFlagBytes` actually
-changed so an implementation that kept the old width cannot pass by coincidence.
+**The engine does not edit a table in place.** It runs a four-statement sequence:
+
+```
+CREATE TABLE <temp> (the new column list)
+copy every row across
+rename <temp> to the original name
+DROP TABLE the original
+```
+
+Every counter in the file agrees, and nothing else explains all of them at once:
+
+| observation                                                                        | what it means                                                    |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| file header `State` 11 → 15                                                        | four transactions; `CREATE TABLE` alone advances it by one       |
+| catalog page `State` +3                                                            | the append, the rename, and the drop's shift                     |
+| `Gamma` still third in the catalog, and a stale fourth entry already named `Gamma` | the drop of the old entry shifts the new one down into its place |
+| table id 8 → 12, columns 9,10 → 13,14,15, `LastObjectID` 11 → 15                   | a new object, not an edited one                                  |
+| pages 17–22 all at `pageStateFree`; 24–28 a fresh five-page image; 29 a data page  | `allocateTablePages`' order exactly, then one page for the rows  |
+| page 0 `State` +12, page 1 `State` +2                                              | six pages allocated and six freed; one extent on each side       |
+
+This package splices the schema stream and rewrites the records in place instead: three
+pages touched, thirty bytes, object ids preserved.
+
+**Reproducing the engine's sequence was considered and deliberately rejected.** It needs six
+free pages, and nothing in this package can grow a database. `MultiTable.abs` is the only
+file in the entire corpus that has six — `Writes.abs` has three, every `Employees-*.abs` has
+two, and the customer fixtures have between none and five. An engine-faithful `ALTER TABLE`
+would be byte-perfect on one fixture and refuse on every other file this package exists to
+read. File growth would fix that, but no fixture in the corpus captures a grow event, so its
+accounting would be inferred rather than verified — the one thing the byte-identity tests
+exist to prevent.
+
+So byte identity is out of reach here, recorded as a measured divergence rather than an open
+question. What the fixtures do pin:
+
+- `TestAlterTableMatchesEngineSemantically` — run the statement through this package and
+  require the result to be indistinguishable from the engine's own output through every read
+  path: the table list, the altered table's columns, and every row of every table. Column
+  ids are excluded, and only column ids, because the engine's rebuild reallocates them.
+- `TestEngineAlterTableRebuildsTheTable` — asserts the strategy above against the fixtures
+  themselves, so the reasoning that byte identity is unreachable cannot quietly stop being
+  true.
+
+Alongside those, the case most likely to be silently wrong is still covered deliberately:
+the null-flag prefix is sized from the column count, so a count crossing a multiple of 8
+moves every field in every record — the shape of the Phase 5c bug — and
+`TestAlterTableColumnCountBoundary` drives 8→9 and 16→17 and back on synthetic fixtures,
+asserting that `nullFlagBytes` actually changed so an implementation that kept the old width
+cannot pass by coincidence.
 
 What the tests still do not prove:
 
-- no byte-for-byte guarantee against the engine for either `ALTER TABLE` form;
+- no byte-for-byte guarantee against the engine for either `ALTER TABLE` form, by the
+  decision above rather than for want of a fixture;
 - the table-info counters file is not touched or validated by them;
 - the B-tree oracle cross-check runs against one indexed table only, since no
   multi-index or composite-key fixture survives an `ALTER` in this corpus;
 - constrained tables are never run through `ADD COLUMN`, so the claim that the splice is
   constraint-agnostic rests on its structure rather than a direct test.
-
-To regenerate the two missing fixtures under DBManager, against `MultiTable.abs`:
-`ALTER TABLE Gamma ADD (W INTEGER)` → `MultiTable-alteradd.abs`, and
-`ALTER TABLE Gamma DROP (V)` → `MultiTable-alterdrop.abs`.
 
 ### The allocation model, decoded
 

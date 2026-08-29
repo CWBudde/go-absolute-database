@@ -52,10 +52,16 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   not notice. If you change the write path, those are the tests that matter.
 
   Two operations cannot meet that bar, for reasons recorded rather than waved away. `ALTER TABLE ADD`
-  and `DROP COLUMN` have **no engine fixture at all** — none was ever produced — so they rest on
-  round-trip plus the independent B-tree leaf oracle, and `TestAlterTableMatchesEngineByteForByte`
-  skips until `MultiTable-alteradd.abs`/`-alterdrop.abs` exist. And every comparison excludes page
-  `State` words, because of the next point.
+  and `DROP COLUMN` **diverge from the engine by design**, and the fixtures that prove it are
+  committed: `MultiTable-alteradd.abs`/`-alterdrop.abs` show the engine implements `ALTER TABLE` as
+  `CREATE TABLE <temp>` + copy rows + rename + `DROP TABLE` — four transactions, new object ids, six
+  pages allocated and six freed. Matching that needs six free pages, and nothing here can grow a
+  database; `MultiTable.abs` is the only file in the corpus that has six, so a faithful `ALTER` would
+  refuse on every other file. This package splices in place instead and is held to _semantic_
+  identity against those same fixtures (`TestAlterTableMatchesEngineSemantically`), with
+  `TestEngineAlterTableRebuildsTheTable` pinning the engine's strategy so the reasoning cannot go
+  stale. **Do not "fix" this into a rebuild without solving file growth first.** And every byte
+  comparison excludes page `State` words, because of the next point.
 
 - **A page's `State` is seeded randomly, so allocating a page breaks byte identity**: across the
   corpus's 663 live pages `State` is uniform in `[0, 2^30)`, and 29 groups of byte-identical page

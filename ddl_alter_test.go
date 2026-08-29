@@ -610,28 +610,87 @@ func requireFixtureName(t *testing.T, name string) string {
 	return name
 }
 
-// TestAlterTableMatchesEngineByteForByte holds ALTER TABLE to the same
-// standard DropTable and CreateTable are held to, for the day it can be met.
+// --- what the engine's ALTER TABLE actually does, and why this package does
+// --- something else
 //
-// No fixture pair for either statement exists in this corpus: PLAN.md records
-// the byte diffs (ADD (W INTEGER) = 248 bytes, DROP (V) = 234 bytes, both
-// against MultiTable.abs) but the files that would let this test assert
-// byte-for-byte equality were never committed and cannot be regenerated here.
-// Until testdata/MultiTable-alteradd.abs and testdata/MultiTable-alterdrop.abs
-// exist, each case skips with the exact statement to run against
-// testdata/MultiTable.abs under DBManager to produce it. The day one is
-// committed, this test starts actually comparing bytes with no code change.
-func TestAlterTableMatchesEngineByteForByte(t *testing.T) {
+// MultiTable-alteradd.abs and MultiTable-alterdrop.abs are the two fixtures
+// PLAN.md long recorded as "never committed and could not be regenerated".
+// They exist now, produced under DBManager against testdata/MultiTable.abs by
+// exactly the statements the tests below name, and they reproduce the byte
+// diffs PLAN.md measured in the round that first implemented ALTER TABLE
+// (248 bytes for the ADD, 234 for the DROP).
+//
+// What they show is not a near-miss this package could close by fixing an
+// accounting detail. The engine does not edit a table in place at all. It
+// runs a four-statement sequence:
+//
+//	CREATE TABLE <temp> (the new column list)
+//	copy every row across
+//	rename <temp> to the original name
+//	DROP TABLE the original
+//
+// Every counter in the file agrees with that reading, and nothing else
+// explains all of them at once:
+//
+//   - the file header State advances 11 -> 15: four transactions, where
+//     CREATE TABLE alone advances it by one.
+//   - the table catalog page's State advances by three: the append, the
+//     rename, and the drop's shift. The copy does not touch the catalog.
+//   - Gamma keeps catalog position 2 -- it is the *drop* of the old entry
+//     that shifts the new one down into place -- and the catalog carries a
+//     stale fourth entry, already named Gamma, past its shortened length.
+//     That is exactly the artifact dropCatalogEntry (ddl.go) documents.
+//   - Gamma is a new object: table id 8 -> 12, its columns 9,10 -> 13,14,15,
+//     and LastObjectID 11 -> 15. An in-place edit would have kept them.
+//   - pages 17-22, the old table's, all carry pageStateFree. Pages 24-28 are
+//     a fresh five-page table image in allocateTablePages' order (system,
+//     system, schema, info, index), and page 29 is a new data page holding
+//     the copied row.
+//   - page 0's State advances by twelve (six pages allocated, six freed) and
+//     page 1's by two (one extent each side), which is the PFS/EAM
+//     accounting ddl.go already implements, applied to twelve bit changes.
+//
+// This package's AddColumn and DropColumn splice the schema stream and
+// rewrite the records in place instead: three pages touched, thirty bytes,
+// object ids preserved. The two are not reconcilable, and reproducing the
+// engine's sequence was considered and deliberately rejected: it needs six
+// free pages, and nothing in this package can grow a database. MultiTable.abs
+// is the only file in the whole corpus that has six -- Writes.abs has three,
+// every Employees-*.abs has two, and the customer fixtures have between none
+// and five. An engine-faithful ALTER TABLE would be byte-perfect on one
+// fixture and refuse on every other file this package exists to read.
+//
+// So byte identity is out of reach for these two operations, and is recorded
+// as a measured divergence rather than an open question. What the fixtures
+// can still hold ALTER TABLE to is that the two files mean the same thing,
+// which is TestAlterTableMatchesEngineSemantically below, and that the
+// engine's strategy is what this comment says it is, which is
+// TestEngineAlterTableRebuildsTheTable.
+
+// TestAlterTableMatchesEngineSemantically is what replaces byte identity for
+// ALTER TABLE: run the statement through this package, and require the result
+// to be indistinguishable from the engine's own output through every read
+// path this package has -- the table list, the altered table's columns, and
+// every row of every table, not just the altered one.
+//
+// Column ids are excluded, and only column ids. They are the one thing the
+// two files genuinely disagree about, because the engine's rebuild allocates
+// fresh object ids for a table it re-creates while the splice keeps the ones
+// already there. Everything else -- names, types, sizes, positions, order,
+// and all the data -- must match exactly.
+func TestAlterTableMatchesEngineSemantically(t *testing.T) {
 	cases := []struct {
 		name      string
 		want      string
 		statement string
+		table     string
 		apply     func(db *File) error
 	}{
 		{
 			name:      "ADD COLUMN",
 			want:      "MultiTable-alteradd.abs",
 			statement: "ALTER TABLE Gamma ADD (W INTEGER)",
+			table:     "Gamma",
 			apply: func(db *File) error {
 				return db.AddColumn("Gamma", Column{Name: "W", BaseType: BftInt32, FieldType: FieldInteger})
 			},
@@ -640,6 +699,7 @@ func TestAlterTableMatchesEngineByteForByte(t *testing.T) {
 			name:      "DROP COLUMN",
 			want:      "MultiTable-alterdrop.abs",
 			statement: "ALTER TABLE Gamma DROP (V)",
+			table:     "Gamma",
 			apply: func(db *File) error {
 				return db.DropColumn("Gamma", "V")
 			},
@@ -648,11 +708,6 @@ func TestAlterTableMatchesEngineByteForByte(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := os.Stat(testdataPath(c.want)); errors.Is(err, os.ErrNotExist) {
-				t.Skipf("fixture %s not present; regenerate by running %q against testdata/MultiTable.abs "+
-					"under DBManager and committing the result as testdata/%s", c.want, c.statement, c.want)
-			}
-
 			wantPath := requireFixture(t, c.want)
 			path := writableCopy(t, "MultiTable.abs")
 
@@ -669,35 +724,237 @@ func TestAlterTableMatchesEngineByteForByte(t *testing.T) {
 				t.Fatalf("Close: %v", err)
 			}
 
-			got, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("reading result: %v", err)
-			}
+			compareTableNames(t, path, wantPath, c.statement)
+			compareColumnsIgnoringIDs(t, path, wantPath, c.table, c.statement)
 
-			want, err := os.ReadFile(wantPath)
-			if err != nil {
-				t.Fatalf("reading %s: %v", c.want, err)
-			}
-
-			if !bytesEqual(got, want) {
-				t.Errorf("%s did not reproduce %s byte for byte", c.statement, c.want)
+			// Every table, not only the altered one: the splice must leave
+			// the file's other tables exactly as readable as the engine's
+			// rebuild left them.
+			for _, name := range []string{"Alpha", "Beta", "Gamma"} {
+				compareRows(t, path, wantPath, name, c.statement)
 			}
 		})
 	}
 }
 
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+// compareTableNames requires two files to list the same tables in the same
+// order. It compares names only: the engine's rebuild gives the altered table
+// a new id and new pages, which is the divergence this test exists to permit.
+func compareTableNames(t *testing.T, gotPath, wantPath, statement string) {
+	t.Helper()
+
+	got, want := tableNames(t, gotPath), tableNames(t, wantPath)
+
+	if len(got) != len(want) {
+		t.Fatalf("%s: wrote %d tables %v, the engine wrote %d %v", statement, len(got), got, len(want), want)
 	}
 
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("%s: table %d is %q, the engine wrote %q", statement, i, got[i], want[i])
+		}
+	}
+}
+
+func tableNames(t *testing.T, path string) []string {
+	t.Helper()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+
+	defer db.Close()
+
+	tables, err := db.Tables()
+	if err != nil {
+		t.Fatalf("Tables(%q): %v", path, err)
+	}
+
+	names := make([]string, len(tables))
+	for i, tbl := range tables {
+		names[i] = tbl.Name
+	}
+
+	return names
+}
+
+// compareColumnsIgnoringIDs requires a table's columns to agree in name,
+// type, size and position. Column.ID is deliberately not compared; see this
+// section's file comment for why the engine's differ.
+func compareColumnsIgnoringIDs(t *testing.T, gotPath, wantPath, table, statement string) {
+	t.Helper()
+
+	got := captureSchemaColumns(t, gotPath, table)
+	want := captureSchemaColumns(t, wantPath, table)
+
+	if len(got) != len(want) {
+		t.Fatalf("%s: %q has %d columns, the engine wrote %d", statement, table, len(got), len(want))
+	}
+
+	for i := range got {
+		g, w := got[i], want[i]
+
+		switch {
+		case g.Name != w.Name:
+			t.Errorf("%s: column %d is %q, the engine wrote %q", statement, i, g.Name, w.Name)
+		case g.BaseType != w.BaseType || g.FieldType != w.FieldType:
+			t.Errorf("%s: column %q is %d/%s, the engine wrote %d/%s",
+				statement, g.Name, g.BaseType, g.FieldType, w.BaseType, w.FieldType)
+		case g.Size != w.Size:
+			t.Errorf("%s: column %q has size %d, the engine wrote %d", statement, g.Name, g.Size, w.Size)
+		case g.Position != w.Position:
+			t.Errorf("%s: column %q is at position %d, the engine wrote %d", statement, g.Name, g.Position, w.Position)
+		}
+	}
+}
+
+// compareRows requires a table to read back the same rows, in the same order,
+// with the same values, from both files.
+func compareRows(t *testing.T, gotPath, wantPath, table, statement string) {
+	t.Helper()
+
+	got := captureRows(t, gotPath, table)
+	want := captureRows(t, wantPath, table)
+
+	if len(got) != len(want) {
+		t.Fatalf("%s: %q has %d rows, the engine wrote %d", statement, table, len(got), len(want))
+	}
+
+	for r := range got {
+		if len(got[r]) != len(want[r]) {
+			t.Errorf("%s: %q row %d has %d values, the engine wrote %d",
+				statement, table, r, len(got[r]), len(want[r]))
+
+			continue
+		}
+
+		for c := range got[r] {
+			if fmt.Sprintf("%v", got[r][c]) != fmt.Sprintf("%v", want[r][c]) {
+				t.Errorf("%s: %q row %d column %d is %v, the engine wrote %v",
+					statement, table, r, c, got[r][c], want[r][c])
+			}
+		}
+	}
+}
+
+// TestEngineAlterTableRebuildsTheTable pins the finding the section comment
+// above rests on, so it cannot quietly stop being true. It asserts nothing
+// about this package's own writes: every claim is about the two engine
+// fixtures and MultiTable.abs, read side by side.
+//
+// If this test ever fails, the reasoning that byte identity is unreachable
+// has to be revisited -- which is the point of writing it down as a test
+// rather than only as prose.
+func TestEngineAlterTableRebuildsTheTable(t *testing.T) {
+	basePath := requireFixture(t, "MultiTable.abs")
+
+	for _, c := range []struct {
+		fixture     string
+		wantColumns int
+		wantLastObj int32
+	}{
+		{"MultiTable-alteradd.abs", 3, 15},
+		{"MultiTable-alterdrop.abs", 1, 13},
+	} {
+		t.Run(c.fixture, func(t *testing.T) {
+			altered := requireFixture(t, c.fixture)
+
+			baseInfo := tableInfoByName(t, basePath, "Gamma")
+			newInfo := tableInfoByName(t, altered, "Gamma")
+
+			// The table is a new object on new pages, not an edited one.
+			if newInfo.ID == baseInfo.ID {
+				t.Errorf("Gamma kept object id %d; the engine's ALTER re-creates the table", newInfo.ID)
+			}
+
+			if newInfo.SchemaPageNo == baseInfo.SchemaPageNo {
+				t.Errorf("Gamma kept schema page %d; the engine's ALTER allocates a new one", newInfo.SchemaPageNo)
+			}
+
+			// ...but it keeps its name and its place in the catalog, because
+			// the drop of the old entry shifts the new one down into it.
+			if got := tableNames(t, altered); len(got) != 3 || got[2] != "Gamma" {
+				t.Errorf("catalog is %v, want Gamma still third", got)
+			}
+
+			// The old table's pages are freed, not reused in place.
+			for _, no := range []int{
+				baseInfo.systemPageNo, baseInfo.SchemaPageNo, baseInfo.InfoPageNo,
+			} {
+				if !pageIsFreed(t, altered, no) {
+					t.Errorf("page %d (one of old Gamma's) is not freed", no)
+				}
+			}
+
+			if got := len(captureSchemaColumns(t, altered, "Gamma")); got != c.wantColumns {
+				t.Errorf("Gamma has %d columns, want %d", got, c.wantColumns)
+			}
+
+			// LastObjectID moves by one table object plus one per column,
+			// which is what CreateTable's own accounting would produce.
+			if got := lastObjectID(t, altered); got != c.wantLastObj {
+				t.Errorf("LastObjectID is %d, want %d", got, c.wantLastObj)
+			}
+		})
+	}
+}
+
+func tableInfoByName(t *testing.T, path, name string) TableInfo {
+	t.Helper()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+
+	defer db.Close()
+
+	tables, err := db.Tables()
+	if err != nil {
+		t.Fatalf("Tables(%q): %v", path, err)
+	}
+
+	for _, tbl := range tables {
+		if tbl.Name == name {
+			return tbl
 		}
 	}
 
-	return true
+	t.Fatalf("%q has no table %q", path, name)
+
+	return TableInfo{}
+}
+
+func pageIsFreed(t *testing.T, path string, no int) bool {
+	t.Helper()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+
+	defer db.Close()
+
+	page, err := db.ReadPage(no)
+	if err != nil {
+		t.Fatalf("ReadPage(%d): %v", no, err)
+	}
+
+	return page.Freed()
+}
+
+func lastObjectID(t *testing.T, path string) int32 {
+	t.Helper()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+
+	defer db.Close()
+
+	return db.lastObjectID
 }
 
 // --- the column-count boundary ---

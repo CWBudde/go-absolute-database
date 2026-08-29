@@ -67,6 +67,8 @@ testdata/*
 !testdata/MultiTable-droplast.abs
 !testdata/MultiTable-create.abs
 !testdata/MultiTable-createdrop.abs
+!testdata/MultiTable-alteradd.abs
+!testdata/MultiTable-alterdrop.abs
 !testdata/README.md
 
 legacy/
