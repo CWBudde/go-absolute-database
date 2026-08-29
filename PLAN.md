@@ -40,15 +40,22 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 
 ### Phase 2 — schema
 
-- [ ] Expose the column definition's **flags byte**, which is parsed and discarded, so `Column`
-      can report nullability without going through the constraint records.
+- [x] Nullability is reported by `Column.NotNull`, read from the `NOT NULL` constraint records.
+      The item this replaces asked for it via the column definition's "flags byte"; there is no
+      such byte, and nullability is not in the column definition at all. See
+      [docs/format/schema.md](docs/format/schema.md#column-definition).
 
 ### Phase 3 — records
 
-- [ ] `GUID` deserialization.
-- [~] `Currency`, `Single`, `SmallInt`, `Word`, `Int64`, `WideString` and the date/time types
-  are implemented against the SDK declaration and have **zero corpus coverage**. See
-  [docs/open-questions.md](docs/open-questions.md#validation-gaps).
+- [x] `GUID` reading, via `Record.GUID` and `ParseGUID`.
+- [x] The fourteen uncovered field types, closed by `testdata/Types.abs`. It cost four
+      corrections; see [docs/format/records.md](docs/format/records.md#what-typesabs-settled).
+- [ ] Decode a **TimeStamp**. It shares `BftDateTime`'s base type and not its layout, so
+      `Record.Time` returns the zero time for one and both write paths refuse it. Needs a fixture
+      holding several distinct instants.
+- [ ] `Extended`, read as 10 bytes and decoded as nothing — Go has no 80-bit float.
+- [ ] What a `Bytes` or `VarBytes` column's **extra byte** holds. Both store `Size + 1`; every
+      such column in the corpus is NULL, because the engine takes no SQL literal for one.
 
 ### Phase 4 — BLOBs
 
@@ -87,6 +94,10 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 - [ ] **Write a `DEFAULT`.** The same problem one level down, refused the same way
       (`ErrColumnDefault`): it lives in the column definition rather than the constraint array,
       and `serializeColumnDef` writes the absent marker unconditionally.
+- [ ] **Write a column's `AUTOINC` options.** The same shape again (`ErrColumnAutoIncOptions`):
+      the five parameters are read, and `serializeColumnDef` writes the engine's defaults
+      unconditionally, so a column carrying real ones is refused rather than silently reset.
+      `Types.abs`'s `TAutoInc` is the only table anywhere that has any.
 - [ ] **Encrypted writes at the database level.** Existing encrypted files are read and written
       page by page, but `CreateDatabase` refuses `Encrypted: true` and compaction refuses an
       encrypted database, because the 260-byte control block at header offset 80 is located and
@@ -126,7 +137,8 @@ In rough order of what unblocks the most:
 3. **Encrypted writes**, which need the control block decoded first. A guess produces a file the
    engine will not open, so this starts with analysis, not code.
 
-Two validation gaps cannot be closed from inside this repository, and both need the Delphi
-engine driven directly: the **fourteen uncovered field types**, and any evidence for a **split
-B-tree leaf** or a **second PFS page**. The fixture recipe in `testdata/README.md` is the route
-to all three.
+The remaining validation gaps need the Delphi engine driven directly: evidence for a **split
+B-tree leaf** or a **second PFS page**, a **TimeStamp** written with several distinct instants,
+and a **`Bytes` value**, which needs a parameterised insert rather than DBManager's SQL tab. The
+fixture recipe in `testdata/README.md` is the route to all of them — it is what produced
+`Types.abs` and closed the field-type gap.

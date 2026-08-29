@@ -3,17 +3,18 @@
 Almost everything in this directory is **deliberately not committed**. The `.abs`
 fixtures the parser is developed against are real private project data, and
 `.gitignore` excludes `testdata/*` for that reason. A fresh clone therefore has only the
-`Employees-*`, `Writes*`, `MultiTable*`, `Empty*` and `Constraints` fixtures below, and every
+`Employees-*`, `Writes*`, `MultiTable*`, `Empty*`, `Constraints` and `Types` fixtures below, and every
 test that needs one of the others skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
 validated against real private project files — run `just test` locally for that.
 
 ## The committed fixtures
 
-Five sets are committed, forty files in all: the eight `Employees-*.abs` files, one per
+Six sets are committed, forty-one files in all: the eight `Employees-*.abs` files, one per
 encryption algorithm, the fourteen `Writes*.abs` files that pin the write path, the twelve
 `MultiTable*.abs` files that pin the table catalog and the schema operations over it, the five
-`Empty*.abs` files that pin what the engine writes for a brand-new database, and
-`Constraints.abs`, which isolates one column constraint or index variation per table.
+`Empty*.abs` files that pin what the engine writes for a brand-new database,
+`Constraints.abs`, which isolates one column constraint or index variation per table, and
+`Types.abs`, which holds every field type the format supports.
 
 ### `Employees-*.abs` — one per encryption algorithm
 
@@ -295,6 +296,49 @@ Size, Required, Default, MinValue, MaxValue, BLOBCompressionAlgorithm, BLOBCompr
 BLOBBlockSize, and the per-index-column ones as ColumnName, CaseInsensitive, Asc,
 MaxIndexedSize.
 
+### `Types.abs` — every field type, with known values
+
+Eight tables in one database, between them using every field type the format supports, written
+from a single SQL script. It exists because `docs/open-questions.md` said what closing the type
+gap needed — "a round-trip against the Delphi engine: create a table with known values in every
+type" — and because only six base types occur anywhere in the private fixtures, so everything
+else was correct by construction and nothing more.
+
+| Table      | Holds                                                    | Settles                                   |
+| ---------- | -------------------------------------------------------- | ----------------------------------------- |
+| `TInt`     | every integer width, signed and unsigned, plus `BOOLEAN` | the integer storage widths                |
+| `TReal`    | `SINGLE`, `DOUBLE`, `EXTENDED`, `CURRENCY`               | that **Currency is a double**             |
+| `TChr`     | `CHAR`, `STRING`, `VARCHAR`, `WIDECHAR`, `WIDESTRING`    | that `VARCHAR` is an alias of `STRING`    |
+| `TTime`    | `DATE`, `TIME`, `DATETIME`, `TIMESTAMP`                  | that **a TimeStamp is not a DateTime**    |
+| `TBin`     | `BYTES(8)`, `VARBYTES(8)`                                | that both store `Size + 1`                |
+| `TGuid`    | `GUID` beside a `BYTES(16)`, braced and bare literals    | that **a GUID is `Char(38)` text**        |
+| `TAutoInc` | `AUTOINC` with every option set                          | the column definition's autoinc block     |
+| `TNull`    | three types × implicit / `NOT NULL` / explicit `NULL`    | that nullability is not in the column def |
+
+**Every column of an unknown stored width is followed by a `LARGEINT` sentinel** carrying a
+distinctive eight-byte pattern — `0x0102030405060708` and friends. That is what makes a wrong
+width fail loudly: it shows up as a sentinel that no longer reads, instead of as a plausible
+value. It is how `BYTES`/`VARBYTES` were caught storing one byte more than they declare, and
+`TestTypesFixtureSentinels` keeps checking it.
+
+`TAutoInc` earns its place twice over. Its options are the only ones anywhere that are not the
+engine's defaults, and before the autoinc block was decoded the table **could not be parsed at
+all** — the old parser scanned for a `0x7F 0x00` pair that is only present because every other
+column stores `MaxValue = High(Int64)`. The engine also numbered its two rows 105 and 110, which
+is `INITIALVALUE 100` by `INCREMENT 5`, corroborating the fields from the outside.
+
+Two things the engine would not do from SQL, recorded so the gaps are not mistaken for
+oversights. **`BYTES` and `VARBYTES` values cannot be inserted from a literal**: `MIMETOBIN(...)`
+and a plain string are both rejected with `Invalid variant type or size for field 'B1'`, so those
+columns are NULL and only their widths are pinned. And the **`TIMESTAMP` layout** needs several
+distinct instants to decode; one row gives `e3 07 03 00 07 00 01 00` and no more.
+
+It contains no private data and no vendor material, checked the same way as the other committed
+fixtures: scanning finds only `ABS0LUTEDATABASE`, `ABSP`, the eight invented table names, the
+invented column names and the invented values. Unlike the `MultiTable*` files it **does** contain
+UTF-16 strings, on purpose — `TChr`'s `WIDECHAR` and `WIDESTRING` values — so that file's "no
+UTF-16 strings at all" check does not apply here.
+
 ## Regenerating them
 
 They can be recreated on Linux by driving `DBManager.exe` from the SDK under Wine with a
@@ -329,8 +373,8 @@ virtual desktop. Three things make it much easier than it first appears:
 Verify the result by reading the file rather than by screenshot: byte 43 is the
 `Encrypted` flag and byte 78 is the algorithm, which must match the table above.
 
-The `Writes*`, `MultiTable*`, `Empty*` and `Constraints` files use the same route with the
-encryption checkbox left off, opening a copy of the parent through `argv[1]` and typing the
+The `Writes*`, `MultiTable*`, `Empty*`, `Constraints` and `Types` files use the same route with
+the encryption checkbox left off, opening a copy of the parent through `argv[1]` and typing the
 one statement into the SQL tab.
 **Always work on copies in a scratch directory.** The file dialogs open wherever they were
 last used, and that is often this directory, which is full of irreplaceable private files.

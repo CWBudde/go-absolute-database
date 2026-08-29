@@ -41,11 +41,21 @@ What the format still hides, and what this package therefore refuses rather than
 
 ## Validation gaps
 
-- **Fourteen field types have zero corpus coverage** — Single, SmallInt, Word, Int64, Currency,
-  WideString, GUID, Extended, VarBytes, Bytes, TimeStamp, Date, Time, DateTime. They are
-  correct by construction and covered only by hand-built records. Closing this needs a
-  round-trip against the Delphi engine: create a table with known values in every type, export,
-  compare.
+- ~~**Fourteen field types have zero corpus coverage.**~~ Closed by `testdata/Types.abs`, which
+  is that round-trip against the engine. It cost four corrections — see
+  [format/records.md](format/records.md#what-typesabs-settled) — and what remains of the gap is
+  narrower and named below.
+- **A TimeStamp's layout.** It shares `BftDateTime` as its base type but stores something else:
+  `2019-03-07 01:02:03` is `e3 07 03 00 07 00 01 00`, which reads as 2019, 3, 7, 1 and accounts
+  for no minutes or seconds. One value cannot settle a layout; a fixture holding several distinct
+  instants would. Until then `Record.Time` returns the zero time for one and both write paths
+  refuse it.
+- **What a `Bytes` or `VarBytes` column's extra byte holds.** Both store `Size + 1`, and every
+  such column in the corpus is NULL: the engine rejects an SQL literal for one, `MIMETOBIN` and a
+  plain string alike, with `Invalid variant type or size`. Writing a value needs a parameterised
+  insert, which means driving the Delphi engine rather than DBManager's SQL tab.
+- **Extended.** Read as 10 bytes and decoded as nothing, because Go has no 80-bit float.
+  `Types.abs` stores `1.6180339887498949` as `00 40 a5 bf dc bc 1b cf ff 3f` if it is ever wanted.
 - **BZIP and PPM BLOB compression** are named by the format and unimplemented; no fixture uses
   either.
 

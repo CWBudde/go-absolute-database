@@ -50,15 +50,15 @@ slots than rows, leaving most of the bitmap zero.
 | ---------- | ---------------- | ----------------------------------------------- | ------------------------------ |
 | AutoInc    | ftAutoInc        | uint32 (4 bytes)                                | AUTOINC                        |
 | BLOB       | ftBlob           | 6-byte pointer: PageNo int32 + ItemNo uint16    | BLOB                           |
-| Bytes      | ftBytes          | fixed byte array                                | BYTES(n)                       |
-| Currency   | ftCurrency       | 8 bytes (Delphi Currency = int64 / 10000)       | CURRENCY, MONEY                |
+| Bytes      | ftBytes          | Size + 1 bytes                                  | BYTES(n)                       |
+| Currency   | ftCurrency       | 8 bytes, IEEE-754 double — _not_ a scaled int64 | CURRENCY, MONEY                |
 | Date       | ftDate           | 4 bytes, int32 LE — days, 0001-01-01 = 1        | DATE                           |
 | DateTime   | ftDateTime       | 8 bytes, `TABSDateTime{int32 Date; int32 Time}` | DATETIME                       |
 | Extended   | ftExtended       | 10 bytes (80-bit extended)                      | EXTENDED                       |
 | Float      | ftFloat          | 8 bytes (float64)                               | FLOAT, DOUBLE, REAL, NUMERIC   |
 | FmtMemo    | ftFmtMemo        | BLOB pointer                                    | FMTMEMO                        |
 | Graphic    | ftGraphic        | BLOB pointer                                    | GRAPHIC                        |
-| GUID       | ftGUID           | 16 bytes                                        | GUID                           |
+| GUID       | ftGUID           | Char(38): the braced text, then a NUL           | GUID                           |
 | Integer    | ftInteger        | 4 bytes (int32)                                 | INTEGER, INT, INT32            |
 | LargeInt   | ftLargeInt       | 8 bytes (int64)                                 | LARGEINT, BIGINT, INT64        |
 | Logical    | ftBoolean        | 2 bytes (Delphi WordBool)                       | LOGICAL, BOOLEAN, BOOL, BIT    |
@@ -66,11 +66,50 @@ slots than rows, leaving most of the bitmap zero.
 | SmallInt   | ftSmallint       | 2 bytes (int16)                                 | SMALLINT, INT16                |
 | String     | ftString         | fixed bytes, Windows-1252 (up to 65500)         | STRING(n), CHAR(n), VARCHAR(n) |
 | Time       | ftTime           | 4 bytes, int32 LE — milliseconds since midnight | TIME                           |
-| TimeStamp  | ftTimeStamp      | 8 bytes                                         | TIMESTAMP                      |
-| VarBytes   | ftVarBytes       | length-prefixed bytes                           | VARBYTES(n)                    |
+| TimeStamp  | ftTimeStamp      | 8 bytes, base type DateTime, layout undecoded   | TIMESTAMP                      |
+| VarBytes   | ftVarBytes       | Size + 1 bytes                                  | VARBYTES(n)                    |
 | WideMemo   | ftBlob (subtype) | BLOB pointer                                    | WIDEMEMO                       |
 | WideString | ftWideString     | fixed UTF-16LE (up to 65500)                    | WIDESTRING(n), NCHAR(n)        |
 | Word       | ftWord           | 2 bytes (uint16)                                | WORD, UNSIGNEDINT16, UINT16    |
+
+### What `Types.abs` settled
+
+Four of those rows say something other than what this package assumed, and each was wrong in a
+way no synthetic test could have caught — the encoder and the decoder agreed with each other.
+
+**Currency is a `double`, not a scaled `int64`.** `TReal.R4` holds `8765.4321` as
+`4d 84 0d 4f b7 1e c1 40`, which is that IEEE-754 double exactly and is nothing like the scaled
+`87654321`. `ABSTypes.hpp` agrees: `typedef double TABSCurrency`. Read as a Delphi in-memory
+Currency, that field came back as `4.67e+14`.
+
+**A GUID is text.** `aftGuid` has no base type of its own — there is no `bftGuid` — and a GUID
+column is `Char` with `Size` 38, holding the braced form and a NUL:
+
+```
+7b 33 46 32 35 30 34 45 30 2d ... 33 30 31 7d 00    "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}"
+```
+
+So `TABSGuid`'s typedef of the Win32 `GUID` struct describes the in-memory value, not the stored
+one, and there is no byte order to reverse. The engine accepts a bare literal too and stores it
+as it was written, so both forms occur.
+
+**`Bytes` and `VarBytes` store `Size + 1` bytes**, as `Char` and `Varchar` do. A `BYTES(16)`
+occupies seventeen. `VarBytes` is not the length-prefixed `Size + 2` it was modelled as. What the
+extra byte holds is not established: every byte column in the corpus is NULL, because the engine
+refuses an SQL literal for one — both `MIMETOBIN('...')` and a plain string are rejected with
+`Invalid variant type or size`, so a value can only be written through a parameter.
+
+**A TimeStamp is not a DateTime**, though it shares `BftDateTime` as its base type. Where a
+DateTime writes `{int32 Date; int32 Time}`, `2019-03-07 01:02:03` is stored as
+
+```
+e3 07 03 00 07 00 01 00     2019, 3, 7, 1
+```
+
+which reads as the year, month, day and hour rather than as a day count and a millisecond count,
+and accounts for no minutes or seconds. The layout is **undecoded**: one value is not enough to
+settle it, and `Record.Time` returns the zero time for a TimeStamp rather than a confidently
+wrong instant.
 
 Dates are **not** Delphi `TDateTime` floats. `ABSTypes.hpp` declares
 `TABSDateTime { int Date; int Time }`: `Date` is days with 0001-01-01 as day 1 (the BDE
@@ -84,10 +123,15 @@ Windows-1252.
 
 ## Type coverage
 
-Only six base types occur anywhere in the fixture corpus: **Int32, Varchar, Double, Logical,
-Blob, Clob**. Everything else — LargeInt, SmallInt, Word, Single, Currency, WideString, GUID,
-Extended, VarBytes, Bytes, TimeStamp, Date, Time, DateTime — has zero rows of coverage and is
-correct by construction only. See [../open-questions.md](../open-questions.md).
+Only six base types occur anywhere in the **private** fixtures: Int32, Varchar, Double, Logical,
+Blob, Clob. Everything else was correct by construction only until `Types.abs`, which the engine
+wrote for exactly this purpose and which now covers every type in the table above — see
+[../testing.md](../testing.md).
+
+That is engine-written evidence rather than field data, so it says what the engine stores, not
+what any application stores. Two gaps remain: **Extended** is read as 10 bytes and decoded as
+nothing, because Go has no 80-bit float, and **TimeStamp**'s layout is undecoded. Both are in
+[../open-questions.md](../open-questions.md).
 
 ## Capacity limits
 
