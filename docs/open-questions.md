@@ -24,6 +24,13 @@ What the format still hides, and what this package therefore refuses rather than
   What no file shows is the engine performing the split: the fullest observed leaf holds 232 of a
   possible 367, so the split point is not "leaf full", and the rule is unknown. Every write path
   refuses a multi-level tree.
+- **The column definition's autoinc block ever varying.** The five `TABSFieldDef` autoinc fields
+  decoded in [format/schema.md](format/schema.md#column-definition) carry `increment 1`,
+  `initial 0`, `min 0`, `max High(Int64)`, `cycled False` in all 495 column definitions in the
+  corpus — the AutoInc columns included, so even they are stored with the defaults. The reading
+  rests on `TABSFieldDef`'s declaration order plus a byte-exact fit that leaves nothing over, not
+  on having seen the fields hold anything else. A single `CREATE TABLE` with explicit
+  `INCREMENT`/`INITIALVALUE`/`MAXVALUE` options would confirm it outright.
 - **A second PFS or EAM page.** The engine's `PfsPageNoForPageNo` says they recur; one PFS
   payload addresses 32 448 pages at 4096 bytes and the largest file in the corpus is 78.
 - **Page sizes other than 4096 and 2048.** The payload model is expressed in terms of
