@@ -138,6 +138,14 @@ type Column struct {
 	FieldType FieldType     // high-level field type
 	Size      uint32        // max size for variable-length types (string length, etc.)
 	Position  int           // 0-based position in the column list
+
+	// hasDefault records that this column's definition carries a present
+	// DEFAULT value. The value itself is not decoded -- nothing here needs it
+	// -- but its presence is what tells a caller that re-serializing this
+	// column would drop a clause the engine wrote. It is unexported because a
+	// caller building a Column for CreateTable has no default to declare;
+	// only parseColumnDef ever sets it.
+	hasDefault bool
 }
 
 // IsBLOB returns true if this column stores BLOB data (Memo, Graphic, etc.).
@@ -406,18 +414,19 @@ func parseColumnDef(data []byte, pos int, index int) (Column, int, error) {
 		pos += 6
 	}
 
-	pos, err := findColumnTerminator(data, pos, baseType)
+	pos, hasDefault, err := findColumnTerminator(data, pos, baseType)
 	if err != nil {
 		return Column{}, 0, err
 	}
 
 	col := Column{
-		Name:      name,
-		ID:        colID,
-		BaseType:  baseType,
-		FieldType: advType,
-		Size:      size,
-		Position:  index,
+		Name:       name,
+		ID:         colID,
+		BaseType:   baseType,
+		FieldType:  advType,
+		Size:       size,
+		Position:   index,
+		hasDefault: hasDefault,
 	}
 
 	return col, pos, nil
@@ -427,21 +436,71 @@ func parseColumnDef(data []byte, pos int, index int) (Column, int, error) {
 // column definition and returns the position just past it.
 //
 // After the flags (and optional BLOB info) there is variable-length padding
-// (zeros followed by 0xFF bytes), terminated by a 4-byte sequence:
+// (zeros followed by 0xFF bytes), then
 //
-//	0x7F 0x00 <byte> 0xFF
+//	0x7F 0x00 <byte> <default>
 //
-// where <byte> is either the baseType echo or 0x00 (varies by version).
-func findColumnTerminator(data []byte, pos int, baseType BaseFieldType) (int, error) {
+// where <byte> is either the baseType echo or 0x00 (varies by version) and
+// <default> is the column's DEFAULT clause, stored as the typed value
+// ddl_constraint.go documents: a single 0xFF when the column has no default,
+// and otherwise 0x00 followed by an int32 byte count and that many bytes. The
+// second result reports which of those two it was, so that a caller about to
+// re-serialize the column knows whether doing so would drop a DEFAULT.
+//
+// testdata/Constraints.abs isolates that last field. CDefault's
+// "A INTEGER DEFAULT 7" differs from the control CNone's plain "A INTEGER" in
+// exactly those bytes -- 7F 00 07 FF becomes
+// 7F 00 07 00 04 00 00 00 07 00 00 00 -- and until this function read them,
+// a table with a DEFAULT on any column could not be parsed at all: the scan
+// ran past every remaining column looking for a 0xFF that was no longer there.
+func findColumnTerminator(data []byte, pos int, baseType BaseFieldType) (end int, hasDefault bool, err error) {
 	for i := pos; i+3 < len(data); i++ {
-		if data[i] != 0x7F || data[i+1] != 0x00 || data[i+3] != 0xFF {
+		if data[i] != 0x7F || data[i+1] != 0x00 {
 			continue
 		}
 
-		if mid := data[i+2]; mid == byte(baseType) || mid == 0x00 {
-			return i + 4, nil
+		if mid := data[i+2]; mid != byte(baseType) && mid != 0x00 {
+			continue
+		}
+
+		// A candidate whose default field does not read is not the
+		// terminator: keep scanning rather than accept a position derived
+		// from bytes that did not parse.
+		if end, present, ok := columnDefaultEnd(data, i+3); ok {
+			return end, present, nil
 		}
 	}
 
-	return 0, errors.New("column terminator not found")
+	return 0, false, errors.New("column terminator not found")
+}
+
+// columnDefaultEnd returns the position just past the DEFAULT field at pos,
+// whether that field held a value, and false when it does not read as a DEFAULT
+// at all. It is readTypedValue's second half: the base type is the terminator's
+// own middle byte, so only the present/absent flag and the counted payload are
+// left here.
+func columnDefaultEnd(data []byte, pos int) (end int, present, ok bool) {
+	if pos >= len(data) {
+		return 0, false, false
+	}
+
+	switch data[pos] {
+	case typedValueAbsent:
+		return pos + 1, false, true
+	case typedValuePresent:
+		if pos+5 > len(data) {
+			return 0, false, false
+		}
+
+		size := int64(binary.LittleEndian.Uint32(data[pos+1 : pos+5]))
+
+		end := int64(pos) + 5 + size
+		if end > int64(len(data)) {
+			return 0, false, false
+		}
+
+		return int(end), true, true
+	default:
+		return 0, false, false
+	}
 }

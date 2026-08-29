@@ -118,11 +118,11 @@ var (
 // two system internal files at types 4 and 5, which every fixture carries
 // exactly once and which no observed write modifies.
 var databasePageTypes = map[uint16]bool{
-	PageTypeFileHdr:   true,
-	PageTypeSystemDir: true,
-	4:                 true,
-	5:                 true,
-	PageTypeTableList: true,
+	PageTypeFileHdr:         true,
+	PageTypeSystemDir:       true,
+	pageTypeSystemFileDir:   true,
+	pageTypeConnectionTable: true,
+	PageTypeTableList:       true,
 }
 
 // DropTable removes a table and every page it owns from the database.
@@ -415,8 +415,13 @@ func (db *File) setLastObjectID(id int32) error {
 	return nil
 }
 
-// ErrOutOfSpace reports a schema operation that needs more free pages than the
-// file currently has.
+// ErrOutOfSpace reports an allocation that found too few free pages even after
+// the file grew to make room for it. Running out of free pages is no longer a
+// refusal on its own -- allocatePages extends the file by whole extents (see
+// ddl_grow.go) -- so reaching this means the allocation maps and the file
+// disagree about what is free, not that the database is full. Growth that would
+// take the file past what those maps can describe is refused earlier, with
+// ErrDatabaseTooLarge.
 var ErrOutOfSpace = errors.New("absdb: not enough free pages")
 
 // newPageState returns the initial ABSP State a freshly allocated page is
@@ -431,9 +436,15 @@ func (db *File) newPageState() uint32 {
 		return db.randPageState()
 	}
 
+	return seedPageState()
+}
+
+// seedPageState is newPageState without a File to ask, for CreateDatabase,
+// which stamps its pages before any File exists to hold them.
+func seedPageState() uint32 {
 	//nolint:gosec // not a security context: the engine's own seed is
-	// unreproducible regardless (see above), so math/rand/v2 only needs to
-	// vary from run to run, and unlike crypto/rand it cannot fail.
+	// unreproducible regardless (see newPageState), so math/rand/v2 only needs
+	// to vary from run to run, and unlike crypto/rand it cannot fail.
 	return rand.N(uint32(1) << 30)
 }
 
@@ -446,11 +457,22 @@ func (db *File) newPageState() uint32 {
 // The payload is left zeroed, which is what an unallocated page already is;
 // initPage does not need to clear it, only the caller's later write does.
 func (db *File) initPage(buf *pageWriteBuf, pageType uint16, objectID int32) {
-	h := buf.raw[diskPageHeaderOffset : diskPageHeaderOffset+diskPageHeaderSize]
+	writeDiskPageHeader(buf.raw[diskPageHeaderOffset:diskPageHeaderOffset+diskPageHeaderSize],
+		db.newPageState(), pageType, objectID)
 
+	buf.stateBump = 0 // State was just set outright, like a tombstoned page's.
+	buf.dirty = true
+}
+
+// writeDiskPageHeader fills h, the diskPageHeaderSize bytes at
+// diskPageHeaderOffset of a page's block, with a complete ABSP header. It is
+// the one place the header's layout is written, shared by initPage -- which
+// stamps a page allocated out of an existing file -- and CreateDatabase, which
+// stamps the five pages of a file that did not exist a moment ago.
+func writeDiskPageHeader(h []byte, state uint32, pageType uint16, objectID int32) {
 	clear(h)
 	copy(h[0:4], "ABSP")
-	binary.LittleEndian.PutUint32(h[4:8], db.newPageState())
+	binary.LittleEndian.PutUint32(h[4:8], state)
 	binary.LittleEndian.PutUint16(h[8:10], pageType)
 	binary.LittleEndian.PutUint32(h[10:14], noPageNo) // NextPageNo: no chain yet
 	// CRC32, CRCType, HashType, CipherType, MACType are already zero from clear(h).
@@ -458,9 +480,6 @@ func (db *File) initPage(buf *pageWriteBuf, pageType uint16, objectID int32) {
 	binary.LittleEndian.PutUint32(h[26:30], noPageNo) // RecPageNo: not a record
 
 	// RecItemNo and the 8 reserved trailing bytes are already zero.
-
-	buf.stateBump = 0 // State was just set outright, like a tombstoned page's.
-	buf.dirty = true
 }
 
 // computeExtentState derives an Extent Allocation Map entry straight from the
@@ -470,13 +489,22 @@ func (db *File) initPage(buf *pageWriteBuf, pageType uint16, objectID int32) {
 // partial -> full depending on how many of its pages a single call just took
 // -- measured on CREATE TABLE Delta, whose five new pages leave their shared
 // extent partial, not full, because three of its eight pages stay free.
+//
+// An extent that runs off the end of the file counts its missing pages as
+// free, so a trailing extent is never full until the file is long enough to
+// hold all of it. That is the engine's own convention, not a choice: page 1 of
+// MultiTable-createidx.abs calls extent 3 partial although every page of it the
+// 30-page file actually has (24 through 29) is allocated, and page 1 of
+// Empty-p2048-e4.abs calls extent 1 partial although its only existing page is
+// allocated too. It matters as soon as the file can grow: an allocation that
+// filled the last extent of a short file would otherwise write "full", and the
+// growth that followed would have to write it back to "partial", advancing
+// page 1's State twice for a change the engine never made.
 func computeExtentState(pfs []byte, extent, perExtent, pageCount int) byte {
-	allocated, total := 0, 0
+	allocated := 0
 
-	for no := extent * perExtent; no < (extent+1)*perExtent && no < pageCount; no++ {
-		total++
-
-		if pfsAllocated(pfs, no) {
+	for no := extent * perExtent; no < (extent+1)*perExtent; no++ {
+		if no < pageCount && pfsAllocated(pfs, no) {
 			allocated++
 		}
 	}
@@ -484,7 +512,7 @@ func computeExtentState(pfs []byte, extent, perExtent, pageCount int) byte {
 	switch allocated {
 	case 0:
 		return extentFree
-	case total:
+	case perExtent:
 		return extentFull
 	default:
 		return extentPartial
@@ -527,7 +555,19 @@ func (db *File) allocatePages(w pageLoader, n int, pageType uint16, objectID int
 
 	newPages := findFreePages(pfs.payload, db.PageCount(), n)
 	if len(newPages) < n {
-		return nil, fmt.Errorf("%w: %d free, need %d", ErrOutOfSpace, len(newPages), n)
+		// The file is short of pages, so it grows -- by whole extents, in one
+		// extension sized to cover the whole request. See ddl_grow.go for the
+		// rule and the fixtures that measured it. Page 0 stays valid across
+		// this: extending the file appends zeroed pages and moves one header
+		// field, and touches neither allocation map.
+		if err := db.extendFile(n - len(newPages)); err != nil {
+			return nil, err
+		}
+
+		newPages = findFreePages(pfs.payload, db.PageCount(), n)
+		if len(newPages) < n {
+			return nil, fmt.Errorf("%w: %d free after growing the file, need %d", ErrOutOfSpace, len(newPages), n)
+		}
 	}
 
 	markPagesAllocated(pfs, newPages)
@@ -559,8 +599,18 @@ func (db *File) allocatePages(w pageLoader, n int, pageType uint16, objectID int
 
 // findFreePages scans the Page Free Space map for the n lowest-numbered pages
 // it marks free, in ascending order. It may return fewer than n.
+//
+// The scan stops at the last page the map itself has a bit for as well as at
+// the end of the file, and that second bound is load-bearing: pfsAllocated
+// reports a page past the end of the map as free, and markPagesAllocated writes
+// pfs[no/8] with no range check of its own, so without this a map too small for
+// the file it describes would be written past its end. extendFile refuses to
+// cross the same ceiling first (ErrDatabaseTooLarge), so in practice this only
+// ever binds on a malformed file.
 func findFreePages(pfs []byte, pageCount, n int) []int {
 	var free []int
+
+	pageCount = min(pageCount, len(pfs)*8)
 
 	for no := 0; no < pageCount && len(free) < n; no++ {
 		if !pfsAllocated(pfs, no) {

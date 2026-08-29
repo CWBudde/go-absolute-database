@@ -10,7 +10,7 @@
 #   record layout derivation, CRC, RIPEMD, the four in-tree ciphers, and the
 #   fuzz targets.
 #
-#   The exceptions are thirty fixtures that are ours and are committed (see
+#   The exceptions are forty fixtures that are ours and are committed (see
 #   testdata/README.md: synthetic data, no customer content):
 #
 #     - the eight Employees-*.abs, one per encryption algorithm. CI therefore
@@ -25,13 +25,22 @@
 #       four of the fourteen carry a user index and pin the B-tree leaf splices
 #       index maintenance performs. That is the strongest assertion in the suite
 #       and it does run on a runner.
-#     - the eight MultiTable*.abs, the only fixtures holding more than one
+#     - the twelve MultiTable*.abs, the only fixtures holding more than one
 #       table. CI therefore also covers the table catalog, per-table page
 #       partitioning and the two allocation maps -- none of which any customer
-#       fixture can exercise, since all 20 of them hold exactly one table. Six
-#       of the eight differ from a parent by one DROP TABLE, CREATE TABLE or
-#       ALTER TABLE, so TestDropTableMatchesEngineByteForByte and
+#       fixture can exercise, since all 20 of them hold exactly one table. Ten
+#       of the twelve differ from a parent by one DROP TABLE, CREATE TABLE,
+#       CREATE INDEX or ALTER TABLE, or by one Compact Database, so
+#       TestDropTableMatchesEngineByteForByte and
 #       TestAlterTableMatchesEngineSemantically run on a runner too.
+#     - the five Empty*.abs, each a brand-new database from DBManager with one
+#       setting changed, which are what pin the 380-byte database header and
+#       the fixed system pages a fresh file starts with. Two of them also pin
+#       file growth: the engine extends by whole extents of PageCountInExtent
+#       pages, and it takes two geometries to show the step is not a constant.
+#     - Constraints.abs, twelve tables differing from a control by exactly one
+#       column constraint or index variation each. It is what makes the schema
+#       stream's tail decodable without a customer file.
 #
 #   Everything else -- all 20 customer fixtures, and the byte-identical
 #   comparison of decryption against a plaintext twin -- is validated only on a

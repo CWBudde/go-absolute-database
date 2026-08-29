@@ -72,17 +72,23 @@ var oracleRowCounts = map[string]int{
 	"Writes-delins.abs":          3,
 }
 
-// unindexedFixtures are the fixtures with no user index to cross-check
+// unindexedFixtures are the fixtures with no user index rows to cross-check
 // against. Most were deliberately created without one, from a time when this
 // package refused to insert into or delete from an indexed table at all and the
 // write tests needed a table it would accept. Single-page Int32 indexes are
 // maintained now (writer_index.go), and the Writes-idx* files are the pairs
 // that pin it, so they are deliberately absent from this list.
-// MultiTable-dropfirst.abs is the exception: its index was dropped along with
-// Alpha, the only table that carried one. They are named here rather than
-// detected, so that an index silently disappearing from any other fixture still
-// fails the cross-check below.
+// MultiTable-dropfirst.abs is one exception: its index was dropped along with
+// Alpha, the only table that carried one. Constraints.abs is the other, and for
+// a different reason -- it carries four user indexes, but every one of its
+// twelve tables is empty, so there is not a single leaf entry to line up
+// against a row. It exists to isolate CREATE TABLE clauses (ddl_constraint.go),
+// not to exercise the reader.
+//
+// They are named here rather than detected, so that an index silently
+// disappearing from any other fixture still fails the cross-check below.
 var unindexedFixtures = map[string]bool{
+	"Constraints.abs":          true,
 	"Writes.abs":               true,
 	"Writes-ins1.abs":          true,
 	"Writes-ins2.abs":          true,
@@ -93,6 +99,16 @@ var unindexedFixtures = map[string]bool{
 	"Writes-del.abs":           true,
 	"Writes-delins.abs":        true,
 	"MultiTable-dropfirst.abs": true,
+
+	// The Empty* files hold no tables at all -- they are what File -> Create
+	// Database writes before anything is in them -- so there is nothing for a
+	// user index to be on. Empty-p2048-e4-grow.abs has one table and still no
+	// index: it exists to pin file growth, not indexing.
+	"Empty.abs":               true,
+	"Empty-encrypted.abs":     true,
+	"Empty-mc100.abs":         true,
+	"Empty-p2048-e4.abs":      true,
+	"Empty-p2048-e4-grow.abs": true,
 }
 
 // fixtureNames returns every testdata/*.abs in sorted order. It skips the test
@@ -277,7 +293,7 @@ func TestOracleReaderMatchesLeafScan(t *testing.T) {
 	for _, name := range fixtureNames(t) {
 		t.Run(name, func(t *testing.T) {
 			if unindexedFixtures[name] {
-				t.Skip("fixture has no user index by design; see unindexedFixtures")
+				t.Skip("fixture has no user index rows by design; see unindexedFixtures")
 			}
 
 			db := openFixture(t, name)
@@ -345,52 +361,82 @@ func crossCheckTable(t *testing.T, tbl *Table) int {
 	return len(userIndexes)
 }
 
-// TestOracleUserIndexesAgree checks the user indexes of a fixture against each
-// other. They cover different columns but must reference the same rows.
+// TestOracleUserIndexesAgree checks a table's user indexes against each other.
+// They cover different columns but must reference the same rows.
+//
+// The comparison is scoped to one table, and that scoping is the point. This
+// test used to take every user index in the file from the no-argument
+// OpenIndex and compare them all against the first, which held only because no
+// fixture had ever carried two user indexes in two different tables.
+// MultiTable-createidx.abs does -- Alpha keeps its index and Delta gains one --
+// and two indexes on two tables have no reason whatever to name the same rows.
+// The old form reported that as a failure. Per CLAUDE.md: when something scans
+// pages by type, ask what happens with three tables in the file.
 func TestOracleUserIndexesAgree(t *testing.T) {
 	for _, name := range fixtureNames(t) {
 		t.Run(name, func(t *testing.T) {
 			db := openFixture(t, name)
 
-			ir, err := db.OpenIndex()
-			if err != nil {
-				t.Fatalf("OpenIndex: %v", err)
+			compared := 0
+
+			for _, tbl := range fixtureTables(t, db) {
+				compared += compareTableIndexes(t, tbl)
 			}
 
-			userIndexes := ir.UserIndexes()
-			if len(userIndexes) < 2 {
-				t.Skipf("only %d user index(es); nothing to compare", len(userIndexes))
-			}
-
-			first := userIndexes[0]
-
-			baseline, err := leafRecordIDs(ir, first.RootPageNo)
-			if err != nil {
-				t.Fatalf("ScanIndex(%d): %v", first.RootPageNo, err)
-			}
-
-			sortedBaseline := sortIDs(baseline)
-
-			for _, idx := range userIndexes[1:] {
-				label := fmt.Sprintf("index root %d (keySize %d) vs root %d (keySize %d)",
-					idx.RootPageNo, idx.KeySize, first.RootPageNo, first.KeySize)
-
-				other, err := leafRecordIDs(ir, idx.RootPageNo)
-				if err != nil {
-					t.Errorf("%s: ScanIndex: %v", label, err)
-
-					continue
-				}
-
-				if len(other) != len(baseline) {
-					t.Errorf("%s: %d entries vs %d", label, len(other), len(baseline))
-				}
-
-				onlyOther, onlyBaseline := diffIDs(sortIDs(other), sortedBaseline)
-				reportDiff(t, label, onlyOther, onlyBaseline)
+			if compared == 0 {
+				t.Skip("no table carries two user indexes; nothing to compare")
 			}
 		})
 	}
+}
+
+// compareTableIndexes compares one table's user indexes against each other and
+// returns the number of pairs it checked.
+func compareTableIndexes(t *testing.T, tbl *Table) int {
+	t.Helper()
+
+	ir, err := tbl.OpenIndex()
+	if err != nil {
+		t.Fatalf("%s: OpenIndex: %v", tbl.Name(), err)
+	}
+
+	userIndexes := ir.UserIndexes()
+	if len(userIndexes) < 2 {
+		return 0
+	}
+
+	first := userIndexes[0]
+
+	baseline, err := leafRecordIDs(ir, first.RootPageNo)
+	if err != nil {
+		t.Fatalf("%s: ScanIndex(%d): %v", tbl.Name(), first.RootPageNo, err)
+	}
+
+	sortedBaseline := sortIDs(baseline)
+	compared := 0
+
+	for _, idx := range userIndexes[1:] {
+		label := fmt.Sprintf("%s: index root %d (keySize %d) vs root %d (keySize %d)",
+			tbl.Name(), idx.RootPageNo, idx.KeySize, first.RootPageNo, first.KeySize)
+
+		other, err := leafRecordIDs(ir, idx.RootPageNo)
+		if err != nil {
+			t.Errorf("%s: ScanIndex: %v", label, err)
+
+			continue
+		}
+
+		compared++
+
+		if len(other) != len(baseline) {
+			t.Errorf("%s: %d entries vs %d", label, len(other), len(baseline))
+		}
+
+		onlyOther, onlyBaseline := diffIDs(sortIDs(other), sortedBaseline)
+		reportDiff(t, label, onlyOther, onlyBaseline)
+	}
+
+	return compared
 }
 
 // TestOracleRowCounts pins the absolute row counts measured from the file

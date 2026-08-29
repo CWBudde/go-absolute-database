@@ -22,7 +22,9 @@ import (
 //     "system" internal file (systemPageNo in the catalog; its role is still
 //     unidentified), one type-8 page for the column definitions, one type-9
 //     page for the counters, one type-12 page for the empty record-page index
-//     root;
+//     root. Five is the count at a 4096-byte page size only: the system file
+//     spans however many pages its bytes need, which is three (and so six
+//     pages in all) at 2048 -- see systemFilePageCount;
 //   - appends a 272-byte entry to the table catalog;
 //   - writes the column-definition internal file: columnCount, one
 //     definition per column, an empty index-definition array, and the
@@ -59,6 +61,15 @@ var (
 	// does not build (a fresh table's is empty), so it must be edited
 	// surgically rather than through a general re-serializer.
 	ErrUnsupportedColumnType = errors.New("absdb: column type has no corpus evidence for CREATE TABLE")
+
+	// ErrColumnDefault reports a column whose definition carries a DEFAULT
+	// clause. serializeColumnDef always writes the no-default marker, because
+	// Column has no field for a default and CREATE TABLE has no syntax here to
+	// declare one. Re-serializing a parsed column that has one would therefore
+	// drop it silently -- the table would read back fine and would no longer
+	// fill the column in on an insert that omits it -- so the column is
+	// refused instead. testdata/Constraints.abs's CDefault is the fixture.
+	ErrColumnDefault = errors.New("absdb: column carries a DEFAULT clause this package cannot write")
 )
 
 const (
@@ -105,9 +116,10 @@ var knownColumnTypes = map[BaseFieldType]FieldType{
 //
 // It fails with ErrReadOnly unless the file was opened with OpenForWrite, and
 // refuses rather than guess when the table already exists, when the catalog
-// cannot be grown in place, when the file does not have five free pages, or
-// when a column's type has no corpus evidence backing its on-disk encoding
-// (ErrUnsupportedColumnType).
+// cannot be grown in place, or when a column's type has no corpus evidence
+// backing its on-disk encoding (ErrUnsupportedColumnType). A file without
+// enough free pages is no longer among those refusals: it grows by whole
+// extents to make room, the way the engine does (ddl_grow.go).
 func (db *File) CreateTable(name string, columns []Column) error {
 	if !db.writable {
 		return ErrReadOnly
@@ -237,31 +249,57 @@ func (db *File) openCatalogForAppend(w *pageEdit, name string) (*pageWriteBuf, e
 	return catalogBuf, nil
 }
 
-// newTablePages names the five pages CreateTable allocates for a fresh table:
-// two chained pages for the system internal file, and one each for the
-// column definitions, the counters and the record-page index root.
+// newTablePages names the pages CreateTable allocates for a fresh table: the
+// chain the system internal file needs, and one each for the column
+// definitions, the counters and the record-page index root.
 type newTablePages struct {
-	system [2]int
+	system []int
 	schema int
 	info   int
 	index  int
 }
 
-// allocateTablePages reserves and chains CreateTable's five pages, in the
-// order the engine itself allocates them (see the file comment): the system
-// internal file's two pages first, then schema, then info, then index.
+// systemFilePageCount is how many pages the fresh table's system internal file
+// occupies at this file's page size: the whole file rounded up to the payload a
+// page carries.
+//
+// It is not the constant 2 the 4096-byte fixtures show. The file is
+// systemInternalFileSize+internalFileHeaderSize bytes whatever the geometry, so
+// a 4096-byte page (4056 bytes of payload) needs two of them and a 2048-byte
+// page (2008 bytes) needs three -- which is exactly what the engine allocates
+// in Empty-p2048-e4-grow.abs, where CREATE TABLE T1 takes six pages rather than
+// five and the extra one is a third type-7. Hard-coding 2 got the page count
+// right only at 4096 and, worse, got the allocation *order* wrong everywhere
+// else: writeInternalFilePages' resizeChain would have appended the third page
+// after schema, info and index had already taken the lower numbers.
+func (db *File) systemFilePageCount() int {
+	payload := db.payloadSize()
+	if payload <= 0 {
+		return 1
+	}
+
+	size := systemInternalFileSize + internalFileHeaderSize
+
+	return max((size+payload-1)/payload, 1)
+}
+
+// allocateTablePages reserves and chains CreateTable's pages, in the order the
+// engine itself allocates them (see the file comment): the system internal
+// file's chain first, then schema, then info, then index.
 func (db *File) allocateTablePages(w *pageEdit) (newTablePages, error) {
 	var pages newTablePages
 
-	systemPages, err := db.allocatePages(w, 2, PageTypeSystem, -1)
+	systemPages, err := db.allocatePages(w, db.systemFilePageCount(), PageTypeSystem, -1)
 	if err != nil {
 		return pages, err
 	}
 
-	pages.system[0], pages.system[1] = systemPages[0], systemPages[1]
+	pages.system = systemPages
 
-	if err := db.linkChain(w, pages.system[0], pages.system[1]); err != nil {
-		return pages, err
+	for i := 1; i < len(systemPages); i++ {
+		if err := db.linkChain(w, systemPages[i-1], systemPages[i]); err != nil {
+			return pages, err
+		}
 	}
 
 	schemaPages, err := db.allocatePages(w, 1, PageTypeSchema, -1)
@@ -288,7 +326,7 @@ func (db *File) allocateTablePages(w *pageEdit) (newTablePages, error) {
 	return pages, nil
 }
 
-// writeTableInternalFiles writes the content of all five of CreateTable's new
+// writeTableInternalFiles writes the content of every one of CreateTable's new
 // pages: the all-zero system file, the empty B-tree index root, the
 // column-definition file, and the counters file.
 func (db *File) writeTableInternalFiles(w *pageEdit, pages newTablePages, colDefs []byte, columnCount int) error {
@@ -355,16 +393,11 @@ func (db *File) writeIndexRoot(w *pageEdit, pageNo int) error {
 // mirroring it. decompressInternalFile does not read that field for
 // algorithm 0, so the engine evidently does not populate it here the way it
 // does for the catalog's own internal file.
+//
+// The database's own connection table (ddl_database.go) has exactly the same
+// shape, which is why buildZeroInternalFile is shared rather than duplicated.
 func buildSystemInternalFile() []byte {
-	payload := make([]byte, systemInternalFileSize)
-
-	out := make([]byte, internalFileHeaderSize+len(payload))
-	out[0] = internalFileHeaderSize
-	binary.LittleEndian.PutUint32(out[1:5], uint32(len(payload))) //nolint:gosec // bounded by systemInternalFileSize
-	// out[5:9] (decompressedSize) and out[9] (algorithm 0) are left at zero.
-	copy(out[internalFileHeaderSize:], payload)
-
-	return out
+	return buildZeroInternalFile(systemInternalFileSize)
 }
 
 // buildTableInfoFile builds the 28-byte counters file tableInfoOffsets
@@ -435,11 +468,21 @@ func serializeColumnDefs(columns []Column) ([]byte, error) {
 // Only the two (BaseType, FieldType) combinations knownColumnTypes lists are
 // supported -- everything else is refused with ErrUnsupportedColumnType
 // rather than guessed at, because the padding width and the terminator's
-// middle byte are only pinned by corpus evidence for those two.
+// middle byte are only pinned by corpus evidence for those two. A column
+// carrying a DEFAULT is refused with ErrColumnDefault for the same reason in
+// reverse: the trailing typed value written here is always the absent marker,
+// so a column that had one would come out without it.
 func serializeColumnDef(col Column) ([]byte, error) {
 	want, ok := knownColumnTypes[col.BaseType]
 	if !ok || want != col.FieldType || col.IsBLOB() {
 		return nil, fmt.Errorf("%w: base type %d / field type %s", ErrUnsupportedColumnType, col.BaseType, col.FieldType)
+	}
+
+	// Only a column read off a disk image can have this set, so this refuses
+	// re-serializing a parsed definition whose DEFAULT the output would lose,
+	// never a column a caller built for CreateTable.
+	if col.hasDefault {
+		return nil, fmt.Errorf("%w: column %q", ErrColumnDefault, col.Name)
 	}
 
 	raw, err := charmap.Windows1252.NewEncoder().Bytes([]byte(col.Name))

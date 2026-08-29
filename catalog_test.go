@@ -27,8 +27,16 @@ func TestCatalogAcrossFixtures(t *testing.T) {
 				t.Fatalf("Tables: %v", err)
 			}
 
-			if len(tables) == 0 {
-				t.Fatal("catalog is empty")
+			// An empty catalog is normally a parse that failed vacuously, so
+			// it fails -- except when the file has never handed out an object
+			// id. Tables and their columns draw from that one sequence, so
+			// LastObjectID == 0 is proof that no table has ever existed, which
+			// is exactly what File -> Create Database leaves behind. Keying the
+			// exception on the header rather than on a list of file names keeps
+			// it a statement about the format.
+			if len(tables) == 0 && db.lastObjectID != 0 {
+				t.Fatalf("catalog is empty, but LastObjectID is %d, so a table was allocated at some point",
+					db.lastObjectID)
 			}
 
 			seen := make(map[int]bool, len(tables))

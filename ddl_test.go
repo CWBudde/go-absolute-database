@@ -729,8 +729,23 @@ func TestCreateTableMatchesEngineByteForByte(t *testing.T) {
 func reportByteDifferencesExcept(t *testing.T, got, want []byte, statement string, excluded map[int]bool) {
 	t.Helper()
 
+	reportPageByteDifferences(t, got, want, statement, excluded, 4096)
+}
+
+// reportPageByteDifferences is reportByteDifferencesExcept for a file whose
+// pages are not 4096 bytes, which only the growth fixtures are (2048-byte pages
+// are what Empty-p2048-e4.abs measures the extent step at). The page size is
+// used only to report an offset a human can find; the comparison itself is over
+// the whole file either way.
+func reportPageByteDifferences(t *testing.T, got, want []byte, statement string, excluded map[int]bool, pageSize int) {
+	t.Helper()
+
 	if len(got) != len(want) {
 		t.Fatalf("%s: wrote %d bytes, the engine wrote %d", statement, len(got), len(want))
+	}
+
+	if pageSize <= 0 {
+		t.Fatalf("%s: invalid page size %d", statement, pageSize)
 	}
 
 	differing := 0
@@ -742,7 +757,7 @@ func reportByteDifferencesExcept(t *testing.T, got, want []byte, statement strin
 
 		if differing < 8 {
 			t.Errorf("%s: byte %d (page %d offset 0x%x): wrote %02x, engine wrote %02x",
-				statement, i, i/4096, i%4096, got[i], want[i])
+				statement, i, i/pageSize, i%pageSize, got[i], want[i])
 		}
 
 		differing++
@@ -1088,7 +1103,11 @@ func TestCreateTableRefusals(t *testing.T) {
 		}
 	})
 
-	t.Run("not enough free pages", func(t *testing.T) {
+	// Not having enough free pages used to belong in this list of refusals. It
+	// does not any more: the file grows by whole extents to make room, the way
+	// the engine does (ddl_grow.go), so the case is kept here as the assertion
+	// that it now succeeds rather than being deleted.
+	t.Run("no free page grows the file instead of refusing", func(t *testing.T) {
 		path := writableCopy(t, "MultiTable.abs")
 
 		db, err := OpenForWrite(path)
@@ -1121,8 +1140,18 @@ func TestCreateTableRefusals(t *testing.T) {
 
 		defer db.Close()
 
-		if err := db.CreateTable("Zeta", newColumns()); !errors.Is(err, ErrOutOfSpace) {
-			t.Errorf("CreateTable with no free pages: %v, want ErrOutOfSpace", err)
+		before := db.PageCount()
+
+		if err := db.CreateTable("Zeta", newColumns()); err != nil {
+			t.Fatalf("CreateTable with no free page: %v", err)
+		}
+
+		if db.PageCount() <= before {
+			t.Errorf("CreateTable did not grow the file: %d pages before, %d after", before, db.PageCount())
+		}
+
+		if _, err := db.Table("Zeta"); err != nil {
+			t.Errorf("Table(%q) after CreateTable grew the file: %v", "Zeta", err)
 		}
 	})
 
