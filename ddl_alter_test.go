@@ -613,12 +613,10 @@ func requireFixtureName(t *testing.T, name string) string {
 // --- what the engine's ALTER TABLE actually does, and why this package does
 // --- something else
 //
-// MultiTable-alteradd.abs and MultiTable-alterdrop.abs are the two fixtures
-// PLAN.md long recorded as "never committed and could not be regenerated".
-// They exist now, produced under DBManager against testdata/MultiTable.abs by
-// exactly the statements the tests below name, and they reproduce the byte
-// diffs PLAN.md measured in the round that first implemented ALTER TABLE
-// (248 bytes for the ADD, 234 for the DROP).
+// MultiTable-alteradd.abs and MultiTable-alterdrop.abs were produced under
+// DBManager against testdata/MultiTable.abs by exactly the statements the
+// tests below name, and they carry the byte diffs docs/writing.md records for
+// ALTER TABLE (248 bytes for the ADD, 234 for the DROP).
 //
 // What they show is not a near-miss this package could close by fixing an
 // accounting detail. The engine does not edit a table in place at all. It

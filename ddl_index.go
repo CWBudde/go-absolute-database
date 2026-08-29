@@ -42,7 +42,7 @@ import (
 //
 // Only a single-covered-column, ascending, case-sensitive, int32-keyed index is
 // built by CREATE INDEX and kept in step on write: it is the only leaf entry
-// format PLAN.md's engine measurement covers ([null flag byte] + int32 LE key,
+// format docs/format/indexes.md covers ([null flag byte] + int32 LE key,
 // then PageNo int32 + ItemNo uint16), and a DESC or NOCASE index orders its
 // leaf differently than this package's comparison does.
 
@@ -80,7 +80,7 @@ var (
 	// ErrUnsupportedIndexColumn reports a CREATE INDEX over a column whose type
 	// the leaf-entry format has no corpus evidence for. Every measured index in
 	// the corpus covers an Int32/Integer column, and the engine's own leaf
-	// entry layout (PLAN.md) is "[null flag byte] + int32 LE key", so that is
+	// entry layout (docs/format/indexes.md) is "[null flag byte] + int32 LE key", so that is
 	// the only column type this package builds an index over.
 	ErrUnsupportedIndexColumn = errors.New("absdb: index column type has no corpus evidence for CREATE INDEX")
 

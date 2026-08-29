@@ -98,7 +98,7 @@ type File struct {
 	// object id the engine has handed out. It is not part of the documented
 	// 76-byte header (dbHeaderSize) -- it sits in the header's otherwise
 	// unaccounted tail, 4 bytes ahead of page 0's own ABSP marker at
-	// diskPageHeaderOffset. See PLAN.md Phase 8 for how CREATE TABLE moves it.
+	// diskPageHeaderOffset. See docs/writing.md for how CREATE TABLE moves it.
 	lastObjectID int32
 
 	// Parsed from TABSCryptoHeader (nil if not encrypted).

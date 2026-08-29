@@ -145,7 +145,7 @@ func TestDropIndexReproducesTheEngineStream(t *testing.T) {
 // different State. An untouched page cannot legitimately have a different
 // State, so the engine evidently reseeds the State of every page it rewrites
 // for CREATE INDEX, rather than incrementing it, and it rewrites the whole
-// file to do so. (CREATE TABLE behaves differently: PLAN.md and
+// file to do so. (CREATE TABLE behaves differently: docs/writing.md and
 // TestCreateTableMatchesEngineByteForByte's own comment record existing
 // pages' States incrementing there -- +1 on page 4, +5 on page 0 -- with only
 // the newly allocated pages reseeded. Different operations, different

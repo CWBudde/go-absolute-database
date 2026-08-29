@@ -452,7 +452,7 @@ func seedPageState() uint32 {
 // marker, a random State (newPageState), the page's type and owner, and no
 // chain link. Every fixture's newly allocated pages carry ObjectID 0xFFFFFFFF
 // except data pages, which this package does not allocate yet -- CREATE TABLE
-// writes no data page, matching PLAN.md.
+// writes no data page, matching docs/writing.md.
 //
 // The payload is left zeroed, which is what an unallocated page already is;
 // initPage does not need to clear it, only the caller's later write does.
@@ -540,7 +540,7 @@ type pageLoader interface {
 // pages are cached by the loader and the bump counters are reset only on a
 // page's first touch.
 //
-// PLAN.md records the engine allocating the same way: a table created after a
+// docs/format/pages.md records the engine allocating the same way: a table created after a
 // drop takes the freed pages before any higher one, and CREATE TABLE Delta on
 // MultiTable.abs took pages 24-28, the file's five lowest free pages.
 func (db *File) allocatePages(w pageLoader, n int, pageType uint16, objectID int32) ([]int, error) {

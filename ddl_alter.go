@@ -68,7 +68,8 @@ import (
 //     the column count. A column count crossing a multiple of 8 changes the
 //     null-flag prefix width and shifts every field in every record on every
 //     page, not just the field being added or removed. This is exactly the
-//     shape of the Phase 5c "+2 fudge factor" bug PLAN.md records, so
+//     shape of the null-flag sizing bug docs/format/records.md guards
+//     against, so
 //     TestAlterTableColumnCountBoundary constructs tables that cross a
 //     multiple of 8 deliberately rather than relying on the corpus to happen
 //     to contain one.
