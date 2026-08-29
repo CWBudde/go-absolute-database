@@ -45,8 +45,10 @@ import (
 //     engine would split (ErrIndexTooManyRows, the same error CreateIndex
 //     raises for a table too large to index in the first place);
 //   - a key that is not the 1-null-flag-byte-plus-int32 shape CreateIndex
-//     builds, and a table whose schema tail carries constraint records
-//     parseSchemaTail declines to read (both ErrIndexNotMaintained).
+//     builds, an index over more than one column, a DESC or NOCASE column, an
+//     index enforcing a PRIMARY KEY or UNIQUE constraint, and a table whose
+//     schema tail does not parse at all (all ErrIndexNotMaintained). See
+//     maintainableIndexColumn for what each of those would get wrong.
 
 // maintainedIndex is one user index this writer keeps in step with the records:
 // which page its single leaf is, and which column it keys on.
@@ -136,14 +138,50 @@ func (w *TableWriter) tableIndexRecords() ([]indexRecord, error) {
 		return nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
 	}
 
-	// parseSchemaTail also returns the splice points CREATE INDEX and DROP
-	// INDEX need; maintenance only needs the definitions themselves.
-	_, _, records, _, err := parseSchemaTail(raw) //nolint:dogsled // three of the five results belong to the splicing callers
+	// parseSchemaTail also returns the constraint array and the splice points
+	// CREATE INDEX and DROP INDEX need; maintenance only needs the index
+	// definitions themselves.
+	_, _, records, _, _, err := parseSchemaTail(raw) //nolint:dogsled // four of the six results belong to the splicing callers
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
 	}
 
 	return records, nil
+}
+
+// maintainableIndexColumn returns the one column an index keys on, refusing
+// every index shape whose leaf this package cannot reproduce.
+//
+// Reading the schema tail stopped being the gate here once constraint records
+// were decoded, so these are the refusals that carry the weight now, and each
+// one names a leaf this package would order differently than the engine did:
+//
+//   - a multi-column index concatenates its columns into one key;
+//   - a DESC column sorts the other way, and compareInt32Keys does not;
+//   - a NOCASE column compares case-folded, which no key this package builds
+//     does;
+//   - a UNIQUE or PRIMARY index rejects a duplicate key, and nothing here
+//     checks for one. Letting an insert through would leave the file holding a
+//     duplicate under a constraint that says it cannot, which reads back fine
+//     and is not what the engine would have written.
+func maintainableIndexColumn(rec indexRecord) (indexColumn, error) {
+	if rec.unique || rec.primary {
+		return indexColumn{}, fmt.Errorf("%w: index %q enforces a PRIMARY KEY or UNIQUE constraint this package does not check",
+			ErrIndexNotMaintained, rec.name)
+	}
+
+	col, ok := rec.singleColumn()
+	if !ok {
+		return indexColumn{}, fmt.Errorf("%w: %w: index %q covers %d columns",
+			ErrIndexNotMaintained, ErrMultiColumnIndex, rec.name, len(rec.columns))
+	}
+
+	if col.descending || col.caseInsensitive {
+		return indexColumn{}, fmt.Errorf("%w: index %q keys %q with descending=%t, case-insensitive=%t",
+			ErrIndexNotMaintained, rec.name, col.name, col.descending, col.caseInsensitive)
+	}
+
+	return col, nil
 }
 
 // describeIndex checks one discovered index against its schema record and the
@@ -162,9 +200,14 @@ func (w *TableWriter) describeIndex(info IndexInfo, byRoot map[int]indexRecord) 
 			ErrIndexNotMaintained, rec.name, info.KeySize, indexKeySize)
 	}
 
+	col, err := maintainableIndexColumn(rec)
+	if err != nil {
+		return maintainedIndex{}, err
+	}
+
 	schema := w.r.Schema()
 
-	colIdx, err := findColumnIndex(schema, rec.column)
+	colIdx, err := findColumnIndex(schema, col.name)
 	if err != nil {
 		return maintainedIndex{}, fmt.Errorf("%w: index %q: %w", ErrIndexNotMaintained, rec.name, err)
 	}

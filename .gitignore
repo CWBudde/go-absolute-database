@@ -72,6 +72,16 @@ testdata/*
 !testdata/MultiTable-createdrop.abs
 !testdata/MultiTable-alteradd.abs
 !testdata/MultiTable-alterdrop.abs
+!testdata/MultiTable-createidx.abs
+!testdata/MultiTable-createidxgrow.abs
+!testdata/MultiTable-createidxtab.abs
+!testdata/MultiTable-dropcompact.abs
+!testdata/Constraints.abs
+!testdata/Empty.abs
+!testdata/Empty-encrypted.abs
+!testdata/Empty-p2048-e4.abs
+!testdata/Empty-p2048-e4-grow.abs
+!testdata/Empty-mc100.abs
 !testdata/README.md
 
 legacy/

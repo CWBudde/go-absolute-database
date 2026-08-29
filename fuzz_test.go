@@ -245,6 +245,56 @@ func FuzzParseSchema(f *testing.F) {
 	})
 }
 
+// FuzzParseSchemaTail targets the schema stream's two record arrays: the index
+// definitions (ddl_index.go) and the constraint records (ddl_constraint.go).
+// Both are length-prefixed strings and counts read straight off disk, so this
+// is where a malformed stream would reach a bad slice expression or an
+// unbounded allocation. It seeds from the same corpus as FuzzParseSchema, but
+// feeds the decompressed stream rather than the page payload, because that is
+// what parseSchemaTail is handed in production.
+func FuzzParseSchemaTail(f *testing.F) {
+	for _, spec := range fuzzSpecs() {
+		f.Add(encodeSchemaBlob(spec.columns))
+	}
+
+	seedFromFixtureStreams(f)
+
+	f.Fuzz(func(_ *testing.T, data []byte) {
+		// Nothing is asserted about the results: the target is that no input
+		// panics, allocates unboundedly, or slices out of range.
+		_, _, _, _, _, _ = parseSchemaTail(data)
+	})
+}
+
+// seedFromFixtureStreams adds every fixture's decompressed column-definition
+// stream, which is exactly what parseSchemaTail reads.
+func seedFromFixtureStreams(f *testing.F) {
+	f.Helper()
+
+	matches, err := filepath.Glob(filepath.Join("testdata", "*.abs"))
+	if err != nil {
+		return
+	}
+
+	for _, path := range matches {
+		db, err := Open(path)
+		if err != nil {
+			continue
+		}
+
+		tables, err := db.Tables()
+		if err == nil {
+			for _, info := range tables {
+				if raw, err := db.readSchemaStream(info.SchemaPageNo); err == nil {
+					f.Add(raw)
+				}
+			}
+		}
+
+		db.Close()
+	}
+}
+
 // seedFromFixtureSchemas adds the raw schema page payload of every fixture,
 // which is the exact byte range decompressInternalFile sees in production.
 func seedFromFixtureSchemas(f *testing.F) {

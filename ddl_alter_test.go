@@ -653,12 +653,16 @@ func requireFixtureName(t *testing.T, name string) string {
 // This package's AddColumn and DropColumn splice the schema stream and
 // rewrite the records in place instead: three pages touched, thirty bytes,
 // object ids preserved. The two are not reconcilable, and reproducing the
-// engine's sequence was considered and deliberately rejected: it needs six
-// free pages, and nothing in this package can grow a database. MultiTable.abs
-// is the only file in the whole corpus that has six -- Writes.abs has three,
-// every Employees-*.abs has two, and the customer fixtures have between none
-// and five. An engine-faithful ALTER TABLE would be byte-perfect on one
-// fixture and refuse on every other file this package exists to read.
+// engine's sequence was considered and deliberately rejected -- on a ground
+// that has since expired. It needed six free pages, and at the time nothing
+// in this package could grow a database. MultiTable.abs is the only file in
+// the whole corpus that has six -- Writes.abs has three, every Employees-*.abs
+// has two, and the customer fixtures have between none and five. An
+// engine-faithful ALTER TABLE would have been byte-perfect on one fixture and
+// refused on every other file this package exists to read. ddl_grow.go removed
+// that constraint; the rebuild is now unblocked but still not done, and what
+// it would have to reproduce is the whole four-transaction sequence, not just
+// six pages.
 //
 // So byte identity is out of reach for these two operations, and is recorded
 // as a measured divergence rather than an open question. What the fixtures

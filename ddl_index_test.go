@@ -10,12 +10,12 @@ import (
 // schemaStreamOf returns the decompressed column-definition stream of a
 // table's schema page, for comparing CREATE/DROP INDEX's output against the
 // engine's own stream byte for byte.
-func schemaStreamOf(t *testing.T, db *File) []byte {
+func schemaStreamOf(t *testing.T, db *File, table string) []byte {
 	t.Helper()
 
-	tbl, err := db.Table("Writes")
+	tbl, err := db.Table(table)
 	if err != nil {
-		t.Fatalf("Table(%q): %v", "Writes", err)
+		t.Fatalf("Table(%q): %v", table, err)
 	}
 
 	no, err := tbl.schemaPageNo()
@@ -70,7 +70,7 @@ func TestCreateIndexReproducesTheEngineStream(t *testing.T) {
 	}
 	defer want.Close()
 
-	wantStream := schemaStreamOf(t, want)
+	wantStream := schemaStreamOf(t, want, "Writes")
 	wantPageBytes := schemaPageBytesOf(t, wantPath, want, "Writes")
 
 	path := writableCopy(t, "Writes.abs")
@@ -85,7 +85,7 @@ func TestCreateIndexReproducesTheEngineStream(t *testing.T) {
 		t.Fatalf("CreateIndex: %v", err)
 	}
 
-	gotStream := schemaStreamOf(t, db)
+	gotStream := schemaStreamOf(t, db, "Writes")
 	if !bytes.Equal(gotStream, wantStream) {
 		t.Errorf("decompressed schema stream differs from Writes-idx.abs's:\ngot:  %x\nwant: %x", gotStream, wantStream)
 	}
@@ -108,7 +108,7 @@ func TestDropIndexReproducesTheEngineStream(t *testing.T) {
 	}
 	defer want.Close()
 
-	wantStream := schemaStreamOf(t, want)
+	wantStream := schemaStreamOf(t, want, "Writes")
 
 	path := writableCopy(t, "Writes-idx.abs")
 
@@ -122,7 +122,7 @@ func TestDropIndexReproducesTheEngineStream(t *testing.T) {
 		t.Fatalf("DropIndex: %v", err)
 	}
 
-	gotStream := schemaStreamOf(t, db)
+	gotStream := schemaStreamOf(t, db, "Writes")
 	if !bytes.Equal(gotStream, wantStream) {
 		t.Errorf("decompressed schema stream differs from Writes.abs's:\ngot:  %x\nwant: %x", gotStream, wantStream)
 	}
@@ -376,50 +376,58 @@ func TestIndexRefusals(t *testing.T) {
 	})
 
 	t.Run("CreateIndex on a table whose schema stream carries constraints", func(t *testing.T) {
-		db, err := OpenForWrite(writableCopy(t, "RCFQ0011.abs"))
+		// This used to be an ErrSchemaTailNotUnderstood refusal, and it covered
+		// every indexed customer fixture. Decoding the constraint array
+		// (ddl_constraint.go) retired it: RCFQ0011.abs carries six NOT NULL
+		// records and a PRIMARY KEY, and all of them now parse.
+		//
+		// What refuses this particular table now is its 600 rows, which is a
+		// different and much narrower thing -- and the point of the assertion:
+		// the tail is no longer what stands in the way.
+		// TestCreateIndexPreservesConstraintRecords is where the operation is
+		// carried through on a constrained table and the records checked byte
+		// for byte.
+		db, err := OpenForWrite(writableCopy(t, requireFixtureName(t, "RCFQ0011.abs")))
 		if err != nil {
 			t.Fatalf("OpenForWrite: %v", err)
 		}
 		defer db.Close()
 
-		tables, err := db.Tables()
+		err = db.CreateIndex("RCFQ0011.abs", "IdxScratch", "RecNo")
+		if errors.Is(err, ErrSchemaTailNotUnderstood) {
+			t.Errorf("CreateIndex on a table with constraint records: %v, want the tail to be read", err)
+		}
+
+		if !errors.Is(err, ErrIndexTooManyRows) {
+			t.Errorf("CreateIndex over 600 rows: %v, want ErrIndexTooManyRows", err)
+		}
+
+		_, _, records, constraints, _, err := parseSchemaTail(schemaStreamOf(t, db, "RCFQ0011.abs"))
 		if err != nil {
-			t.Fatalf("Tables: %v", err)
+			t.Fatalf("parseSchemaTail: %v", err)
 		}
 
-		if len(tables) == 0 {
-			t.Fatal("RCFQ0011.abs has no tables")
-		}
-
-		table := tables[0].Name
-
-		err = db.CreateIndex(table, "IdxScratch", "FrqNo")
-		if !errors.Is(err, ErrSchemaTailNotUnderstood) {
-			t.Errorf("CreateIndex on a table with constraint records: %v, want ErrSchemaTailNotUnderstood", err)
+		if len(records) != 1 || len(constraints) != 7 {
+			t.Errorf("got %d index and %d constraint record(s), want 1 and 7", len(records), len(constraints))
 		}
 	})
 
-	t.Run("DropIndex on a table whose schema stream carries constraints", func(t *testing.T) {
-		db, err := OpenForWrite(writableCopy(t, "RCFQ0011.abs"))
+	t.Run("DropIndex of the index behind a PRIMARY KEY", func(t *testing.T) {
+		// RCFQ0011.abs's one index is "p", the index its PRIMARY KEY
+		// constraint is built on. Dropping it would leave the constraint
+		// naming an index the file no longer has.
+		db, err := OpenForWrite(writableCopy(t, requireFixtureName(t, "RCFQ0011.abs")))
 		if err != nil {
 			t.Fatalf("OpenForWrite: %v", err)
 		}
 		defer db.Close()
 
-		tables, err := db.Tables()
-		if err != nil {
-			t.Fatalf("Tables: %v", err)
+		if err := db.DropIndex("RCFQ0011.abs", "p"); !errors.Is(err, ErrIndexBacksConstraint) {
+			t.Errorf("DropIndex of a primary key's index: %v, want ErrIndexBacksConstraint", err)
 		}
 
-		if len(tables) == 0 {
-			t.Fatal("RCFQ0011.abs has no tables")
-		}
-
-		table := tables[0].Name
-
-		err = db.DropIndex(table, "FrqNo")
-		if !errors.Is(err, ErrSchemaTailNotUnderstood) {
-			t.Errorf("DropIndex on a table with constraint records: %v, want ErrSchemaTailNotUnderstood", err)
+		if err := db.DropIndex("RCFQ0011.abs", "FrqNo"); !errors.Is(err, ErrNoSuchIndex) {
+			t.Errorf("DropIndex of a name that is a column, not an index: %v, want ErrNoSuchIndex", err)
 		}
 	})
 
@@ -454,7 +462,7 @@ func TestCreateThenDropIndexRestoresTheStream(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	beforeStream := schemaStreamOf(t, before)
+	beforeStream := schemaStreamOf(t, before, "Writes")
 	before.Close()
 
 	db, err := OpenForWrite(path)
@@ -471,7 +479,7 @@ func TestCreateThenDropIndexRestoresTheStream(t *testing.T) {
 		t.Fatalf("DropIndex: %v", err)
 	}
 
-	afterStream := schemaStreamOf(t, db)
+	afterStream := schemaStreamOf(t, db, "Writes")
 	if !bytes.Equal(afterStream, beforeStream) {
 		t.Errorf("schema stream after create-then-drop differs from the original:\ngot:  %x\nwant: %x", afterStream, beforeStream)
 	}

@@ -91,12 +91,15 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 		}
 	})
 
-	t.Run("schema tail not understood", func(t *testing.T) {
+	t.Run("index shape the leaf writer cannot reproduce", func(t *testing.T) {
 		// Every indexed customer fixture lands here, and this is the case that
-		// matters most in practice: their schema streams carry constraint
-		// records or multi-column indexes that parseSchemaTail declines to
-		// read, so which column an index covers cannot be known, so no write
-		// to the table can be shown to leave it in step.
+		// matters most in practice. It used to be a refusal to read the schema
+		// tail at all; now the tail parses (ddl_constraint.go) and the refusal
+		// is about the indexes themselves. RCON0011.abs has two, and either
+		// one alone is enough: "p" enforces a three-column PRIMARY KEY, and
+		// "RecIdx" covers two columns. Neither has a key this package can build
+		// or compare, so no write to the table can be shown to leave it in
+		// step. See maintainableIndexColumn for the full list.
 		//
 		// RCON0011.abs is not committed, so this skips on a bare checkout. It
 		// is the one case here with no synthetic stand-in: the shape comes from

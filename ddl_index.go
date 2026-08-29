@@ -15,31 +15,37 @@ import (
 // compressed column-definition internal file, which is why it waited for
 // internal/zlib1.Compress the same way CREATE TABLE did.
 //
-// What the two operations write is decoded in
-// docs/... (the index-definition-format analysis this file was built from) and
-// summarised here:
+// What the two operations write is decoded in ddl_constraint.go (the schema
+// stream's second array) and here (its first), and is summarised as:
 //
 //   - the column-definition stream continues past the column array with
-//     int32 indexCount, indexCount index records, then a 12-byte trailer:
-//     a still-unidentified int32 (constant 0 in every clean example), and the
-//     two page numbers systemIndexRoots reads (record-page index root,
-//     BLOB-page index root);
-//   - a single-covered-column index record is a Pascal name, a database-wide
-//     object id, 3 reserved bytes, coveredColumnCount (only 1 is proven),
-//     the index's own B-tree root page number, a Pascal covered-column name,
-//     2 reserved bytes and a constant terminator (0x00000014);
+//     int32 indexCount, indexCount index records, int32 constraintCount,
+//     constraintCount constraint records, and then the two page numbers
+//     systemIndexRoots reads (record-page index root, BLOB-page index root);
+//   - an index record is a Pascal name, a database-wide object id, three flag
+//     bytes (reserved, UNIQUE, PRIMARY), coveredColumnCount, the index's own
+//     B-tree root page number, and then one entry per covered column: a Pascal
+//     name, a DESC flag byte, a NOCASE flag byte and an int32 maximum indexed
+//     size (0x14 in every record in the corpus);
 //   - CREATE INDEX allocates the index's root page before serializing the
 //     stream, because the stream embeds that page's number;
 //   - CREATE INDEX hands out one object id, the next free one, and advances
 //     LastObjectID by it;
-//   - only a table with no constraint records between its index array and the
-//     trailer is understood well enough to edit -- see parseSchemaTail and
-//     ErrSchemaTailNotUnderstood.
+//   - a new index record is spliced in at the end of the index array, before
+//     the constraint array, which is copied through byte for byte.
 //
-// Only a single-covered-column, int32-keyed index is supported: it is the only
-// shape any fixture in the corpus exercises, and it is also the only leaf
-// entry format PLAN.md's engine measurement covers ([null flag byte] + int32
-// LE key, then PageNo int32 + ItemNo uint16).
+// The per-column DESC and NOCASE flags and the multi-column form were decoded
+// from testdata/Constraints.abs: CIdxDesc, CIdxNoCase and CIdxMulti differ from
+// CIdxOne in exactly one of them. Before that file existed, coveredColumnCount
+// was only ever seen as 1 and the two flag bytes read as a reserved field, so a
+// multi-column index -- which every indexed customer fixture has -- was refused.
+//
+// Only a single-covered-column, ascending, case-sensitive, int32-keyed index is
+// built by CREATE INDEX and kept in step on write: it is the only leaf entry
+// format PLAN.md's engine measurement covers ([null flag byte] + int32 LE key,
+// then PageNo int32 + ItemNo uint16), and a DESC or NOCASE index orders its
+// leaf differently than this package's comparison does.
+
 var (
 	// ErrIndexExists reports a CREATE INDEX naming an index that already exists
 	// on the table.
@@ -53,12 +59,23 @@ var (
 	// naming a column the table does not have.
 	ErrNoSuchColumn = errors.New("absdb: no such column")
 
-	// ErrMultiColumnIndex reports a CREATE INDEX over more than one column, or
-	// an existing index record that already covers more than one. Corpus
-	// evidence covers only coveredColumnCount == 1 (see the index-definition
-	// analysis §2.2); a record claiming otherwise is refused rather than
-	// guessed at.
+	// ErrMultiColumnIndex reports a write to a table carrying an index over
+	// more than one column. The records are read now -- Constraints.abs's
+	// CIdxMulti pins their layout -- but a multi-column key concatenates its
+	// columns into one leaf entry, and this package builds and compares only
+	// the single-column, int32-keyed leaf its engine measurement covers. It
+	// accompanies ErrIndexNotMaintained rather than replacing it, so a caller
+	// can tell this refusal apart from the other index shapes
+	// maintainableIndexColumn declines.
 	ErrMultiColumnIndex = errors.New("absdb: multi-column indexes are not supported")
+
+	// ErrIndexBacksConstraint reports a DROP INDEX naming the index a PRIMARY
+	// KEY or UNIQUE constraint record is built on. Dropping it would leave
+	// that record naming an index the file no longer has, and nothing in the
+	// corpus says what the engine does about the constraint when its index
+	// goes away -- DBManager drops the constraint, not the index. Refusing is
+	// the only outcome this package can show to be safe.
+	ErrIndexBacksConstraint = errors.New("absdb: index implements a PRIMARY KEY or UNIQUE constraint")
 
 	// ErrUnsupportedIndexColumn reports a CREATE INDEX over a column whose type
 	// the leaf-entry format has no corpus evidence for. Every measured index in
@@ -67,15 +84,14 @@ var (
 	// the only column type this package builds an index over.
 	ErrUnsupportedIndexColumn = errors.New("absdb: index column type has no corpus evidence for CREATE INDEX")
 
-	// ErrSchemaTailNotUnderstood reports a column-definition stream whose tail,
-	// past the index-record array, is not exactly the 12-byte reserved/root/
-	// blobroot trailer. Every fixture with a NOT NULL, PRIMARY KEY or UNIQUE
-	// constraint carries constraint records in that region (see the
-	// index-definition analysis §4), and neither their format nor their
-	// position relative to a newly inserted index record is confirmed. Settling
-	// it needs a table created with constraints added incrementally so the
-	// diff isolates the constraint-record layout the way Writes.abs/
-	// Writes-idx.abs isolated the index-record layout.
+	// ErrSchemaTailNotUnderstood reports a column-definition stream whose tail
+	// -- the index array, the constraint array and the two trailing page
+	// numbers -- does not parse as the layout ddl_constraint.go documents. It
+	// used to cover every table carrying a constraint record at all, which was
+	// most real tables; testdata/Constraints.abs retired that, and what is left
+	// is the genuinely unknown: a constraint kind the corpus does not show, a
+	// reserved field that is not zero, a size field that disagrees with the
+	// string it introduces, or bytes left over once both arrays are read.
 	ErrSchemaTailNotUnderstood = errors.New("absdb: schema stream tail is not understood")
 
 	// ErrIndexTooManyRows reports a CREATE INDEX over a table with more rows
@@ -85,39 +101,77 @@ var (
 )
 
 const (
-	// indexRecordFlagsSize is the width of the reserved field between an index
-	// record's objectId and its coveredColumnCount. Only 0x000000 is observed
-	// in the corpus (index-definition analysis §2.1).
+	// indexRecordFlagsSize is the width of the flag field between an index
+	// record's objectId and its coveredColumnCount. The first byte is zero in
+	// every record in the corpus; the second marks UNIQUE and the third
+	// PRIMARY, both as 0x00/0xFF booleans. Constraints.abs's CPk and CUnique
+	// isolate them: 00 00 FF for a primary key, 00 FF 00 for a unique index,
+	// both set at once for a customer fixture's "p", all zero for a plain one.
 	indexRecordFlagsSize = 3
 
-	// indexRecordCoveredTrailerSize is the width of the reserved field between
-	// a covered column's name and the record's terminator. Only 0x0000 is
-	// observed.
-	indexRecordCoveredTrailerSize = 2
+	// indexColumnMaxIndexedSize is the int32 closing every covered-column
+	// entry, DBManager's MaxIndexedSize. It is 0x14 in all 41 index records in
+	// the corpus, over Int32 and Varchar columns alike, so a different value is
+	// data this package has no evidence for and refuses.
+	indexColumnMaxIndexedSize = 0x00000014
 
-	// indexRecordTerminator is the constant closing every observed index
-	// record (index-definition analysis §2.1).
-	indexRecordTerminator = 0x00000014
-
-	// schemaTailTrailerSize is the width of what follows the index-record
-	// array in a table with no constraints: a reserved int32 plus the two page
-	// numbers systemIndexRootsSize covers.
-	schemaTailTrailerSize = 4 + systemIndexRootsSize
+	// indexFlagTrue is how the format spells a true ByteBool in an index
+	// record: DESC, NOCASE, UNIQUE and PRIMARY are all 0xFF when set and 0x00
+	// when not.
+	indexFlagTrue = 0xFF
 
 	// indexKeySize is primaryKeySize spelled out for index records this file
 	// builds: one null-flag byte plus an int32 LE key (index.go).
 	indexKeySize = primaryKeySize
 )
 
+// indexColumn is one covered column of an index record: its name and the two
+// per-column flags the CREATE INDEX grammar spells ASC/DESC and CASE/NOCASE.
+// maxIndexedSize is DBManager's fourth per-column property, constant across the
+// corpus and carried here only so a record round-trips through the parse.
+type indexColumn struct {
+	name            string
+	descending      bool
+	caseInsensitive bool
+	maxIndexedSize  uint32
+}
+
 // indexRecord is one parsed entry of the schema stream's index-definition
-// array (index-definition analysis §2). start and end are its byte range
-// within the decompressed schema stream, so a caller can splice around it.
+// array. start and end are its byte range within the decompressed schema
+// stream, so a caller can splice around it.
 type indexRecord struct {
 	name       string
 	objectID   uint32
+	unique     bool
+	primary    bool
 	rootPageNo int32
-	column     string
+	columns    []indexColumn
 	start, end int
+}
+
+// singleColumn returns the one column this index covers, and reports false for
+// a multi-column index. Every write path in this package keys on a single
+// column, so this is where "the index covers exactly one column" is asked
+// rather than assumed.
+func (r indexRecord) singleColumn() (indexColumn, bool) {
+	if len(r.columns) != 1 {
+		return indexColumn{}, false
+	}
+
+	return r.columns[0], true
+}
+
+// coversColumn reports whether this index covers a column of that name,
+// case-insensitively. A multi-column index counts, which is what DropColumn
+// needs: dropping any covered column orphans the whole record.
+func (r indexRecord) coversColumn(name string) bool {
+	for _, c := range r.columns {
+		if strings.EqualFold(c.name, name) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // createIndexPlan holds what validating a CREATE INDEX request produces: the
@@ -167,7 +221,7 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 	// because it is the safety property that matters most: a table this
 	// package cannot safely edit around must be refused before any other
 	// validation gets a chance to look like a green light.
-	colsEnd, indexCount, records, tailStart, err := parseSchemaTail(raw)
+	colsEnd, indexCount, records, _, tailStart, err := parseSchemaTail(raw)
 	if err != nil {
 		return createIndexPlan{}, err
 	}
@@ -200,10 +254,15 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 // refuses rather than guess when: the table does not exist (ErrNoSuchTable),
 // the index name is already used (ErrIndexExists), the column does not exist
 // (ErrNoSuchColumn), the column is not an Int32/Integer column
-// (ErrUnsupportedIndexColumn), the table's schema stream carries constraint
-// records this package cannot place a new index record around
+// (ErrUnsupportedIndexColumn), the table's schema stream tail does not parse
 // (ErrSchemaTailNotUnderstood), or the table has more rows than fit on one
 // index leaf page (ErrIndexTooManyRows).
+//
+// A table carrying NOT NULL, PRIMARY KEY, UNIQUE or MINVALUE/MAXVALUE
+// constraints is no longer refused: its constraint records are parsed, and the
+// new index record is spliced in ahead of them so they come back byte for byte.
+// Note that the new index is a plain one -- CreateIndex neither creates nor
+// enforces a constraint.
 func (db *File) CreateIndex(table, index, column string) error {
 	if !db.writable {
 		return ErrReadOnly
@@ -280,9 +339,9 @@ func (db *File) writeSchemaStream(w *pageEdit, schemaPageNo int, raw []byte) err
 //
 // It fails with ErrReadOnly unless the file was opened with OpenForWrite, and
 // refuses rather than guess when the table does not exist (ErrNoSuchTable),
-// the index does not exist (ErrNoSuchIndex), or the table's schema stream
-// carries constraint records this package cannot safely edit around
-// (ErrSchemaTailNotUnderstood).
+// the index does not exist (ErrNoSuchIndex), the table's schema stream tail
+// does not parse (ErrSchemaTailNotUnderstood), or the index implements a
+// PRIMARY KEY or UNIQUE constraint (ErrIndexBacksConstraint).
 func (db *File) DropIndex(table, index string) error {
 	if !db.writable {
 		return ErrReadOnly
@@ -303,13 +362,17 @@ func (db *File) DropIndex(table, index string) error {
 		return err
 	}
 
-	colsEnd, indexCount, records, tailStart, err := parseSchemaTail(raw)
+	colsEnd, indexCount, records, constraints, tailStart, err := parseSchemaTail(raw)
 	if err != nil {
 		return err
 	}
 
 	rec, err := findIndexRecord(records, index, t.Name())
 	if err != nil {
+		return err
+	}
+
+	if err := refuseConstraintIndex(rec, constraints, t.Name()); err != nil {
 		return err
 	}
 
@@ -357,6 +420,25 @@ func findColumnIndex(schema *TableSchema, name string) (int, error) {
 	return 0, fmt.Errorf("%w: %q", ErrNoSuchColumn, name)
 }
 
+// refuseConstraintIndex reports ErrIndexBacksConstraint when rec is the index a
+// PRIMARY KEY or UNIQUE constraint record is built on. Both halves of the
+// evidence are checked -- the index record's own PRIMARY/UNIQUE flags and a
+// constraint record pointing at its object id -- because either one alone
+// would let the other shape through.
+func refuseConstraintIndex(rec indexRecord, constraints []constraintRecord, table string) error {
+	if rec.primary || rec.unique {
+		return fmt.Errorf("%w: %q on %q", ErrIndexBacksConstraint, rec.name, table)
+	}
+
+	for _, c := range constraints {
+		if c.ownerID == rec.objectID {
+			return fmt.Errorf("%w: %q on %q backs %s %q", ErrIndexBacksConstraint, rec.name, table, c.kind, c.name)
+		}
+	}
+
+	return nil
+}
+
 // findIndexRecord resolves an index by name, case-insensitively.
 func findIndexRecord(records []indexRecord, name, table string) (indexRecord, error) {
 	for _, r := range records {
@@ -385,44 +467,81 @@ func (db *File) readSchemaStream(schemaPageNo int) ([]byte, error) {
 	return decompressInternalFile(data)
 }
 
-// parseSchemaTail parses everything the column array is followed by: indexCount,
-// its index records, and requires exactly schemaTailTrailerSize bytes to remain
-// after the last one. That requirement is the safety property described at
-// ErrSchemaTailNotUnderstood: every fixture with a NOT NULL/PRIMARY KEY/UNIQUE
-// constraint fails it, because their schema streams carry constraint records
-// in this region that this package does not understand (index-definition
-// analysis §4). Refusing here is what stops CREATE/DROP INDEX from corrupting
-// a real customer database.
-func parseSchemaTail(data []byte) (colsEnd int, indexCount int32, records []indexRecord, tailStart int, err error) {
+// parseSchemaTail parses everything the column array is followed by: the index
+// array, the constraint array, and the two trailing page numbers, requiring
+// exactly systemIndexRootsSize bytes to remain once both arrays are read.
+//
+// That final length check is what makes the parse self-validating. Both arrays
+// are variable-length and full of length-prefixed strings, so a record read one
+// field out of step almost never lands on the trailer -- which is why the whole
+// corpus parsing to the byte is evidence the layout in ddl_constraint.go is
+// right, and why a stream that does not is refused rather than half-read.
+//
+// tailStart is the offset of the constraint count, i.e. the first byte past the
+// index array. Everything from there on is copied through verbatim by the
+// splicing callers, so a constrained table's records survive CREATE INDEX and
+// DROP INDEX byte for byte.
+func parseSchemaTail(data []byte) (
+	colsEnd int,
+	indexCount int32,
+	records []indexRecord,
+	constraints []constraintRecord,
+	tailStart int,
+	err error,
+) {
 	colsEnd, err = schemaColumnsEnd(data)
 	if err != nil {
-		return 0, 0, nil, 0, err
+		return 0, 0, nil, nil, 0, err
 	}
 
-	if colsEnd+4 > len(data) {
-		return 0, 0, nil, 0, fmt.Errorf("%w: no room for indexCount after %d bytes of columns", ErrBadSchema, colsEnd)
+	rawCount, pos, err := readArrayCount(data, colsEnd, "indexCount")
+	if err != nil {
+		return 0, 0, nil, nil, 0, err
 	}
-
-	rawCount := int32(binary.LittleEndian.Uint32(data[colsEnd : colsEnd+4]))
-	if rawCount < 0 {
-		return 0, 0, nil, 0, fmt.Errorf("%w: negative indexCount %d", ErrBadSchema, rawCount)
-	}
-
-	pos := colsEnd + 4
 
 	records, pos, err = parseIndexRecords(data, pos, int(rawCount))
 	if err != nil {
-		return 0, 0, nil, 0, fmt.Errorf("%w: index record array: %w", ErrSchemaTailNotUnderstood, err)
+		return 0, 0, nil, nil, 0, fmt.Errorf("%w: index record array: %w", ErrSchemaTailNotUnderstood, err)
 	}
 
-	if remaining := len(data) - pos; remaining != schemaTailTrailerSize {
-		return 0, 0, nil, 0, fmt.Errorf(
-			"%w: %d bytes remain after %d index record(s), want the %d-byte reserved/root/blobroot trailer",
-			ErrSchemaTailNotUnderstood, remaining, rawCount, schemaTailTrailerSize,
+	tailStart = pos
+
+	constraintCount, pos, err := readArrayCount(data, pos, "constraintCount")
+	if err != nil {
+		return 0, 0, nil, nil, 0, err
+	}
+
+	constraints, pos, err = parseConstraintRecords(data, pos, int(constraintCount))
+	if err != nil {
+		return 0, 0, nil, nil, 0, fmt.Errorf("%w: constraint record array: %w", ErrSchemaTailNotUnderstood, err)
+	}
+
+	if remaining := len(data) - pos; remaining != systemIndexRootsSize {
+		return 0, 0, nil, nil, 0, fmt.Errorf(
+			"%w: %d bytes remain after %d index and %d constraint record(s), want the %d-byte root/blobroot trailer",
+			ErrSchemaTailNotUnderstood, remaining, rawCount, constraintCount, systemIndexRootsSize,
 		)
 	}
 
-	return colsEnd, rawCount, records, pos, nil
+	return colsEnd, rawCount, records, constraints, tailStart, nil
+}
+
+// readArrayCount reads one of the schema tail's two int32 record counts and
+// bounds it against the bytes actually left, so a corrupt count cannot ask for
+// a huge slice before a single record has been read.
+func readArrayCount(data []byte, pos int, field string) (int32, int, error) {
+	if pos+4 > len(data) {
+		return 0, 0, fmt.Errorf("%w: no room for %s at offset %d", ErrBadSchema, field, pos)
+	}
+
+	count := int32(binary.LittleEndian.Uint32(data[pos : pos+4]))
+	pos += 4
+
+	if count < 0 || int64(count) > int64(len(data)-pos) {
+		return 0, 0, fmt.Errorf("%w: %s %d exceeds %d remaining bytes", ErrBadSchema, field, count, len(data)-pos)
+	}
+
+	return count, pos, nil
 }
 
 // schemaColumnsEnd walks the column-definition array with the same loop
@@ -470,22 +589,27 @@ func parseIndexRecords(data []byte, pos, count int) ([]indexRecord, int, error) 
 	return records, pos, nil
 }
 
-// parseIndexRecord parses one index record, the layout confirmed by the
-// index-definition analysis §2 for a single covered column. Anything claiming
-// more than one covered column is refused with ErrMultiColumnIndex: no fixture
-// in the corpus proves what that shape looks like.
+// parseIndexRecord parses one index record: the header, then one entry per
+// covered column. The two flag bytes after each column name and the
+// coveredColumnCount above 1 are what Constraints.abs's CIdxDesc, CIdxNoCase
+// and CIdxMulti pin; everything a covered-column entry holds is read, so a
+// multi-column or descending index is now understood rather than refused.
 func parseIndexRecord(data []byte, pos int) (indexRecord, int, error) {
-	name, pos, err := readPascalString(data, pos)
+	rec := indexRecord{}
+
+	var err error
+
+	rec.name, pos, err = readPascalString(data, pos)
 	if err != nil {
 		return indexRecord{}, 0, fmt.Errorf("name: %w", err)
 	}
 
-	objectID, pos, err := readUint32(data, pos, "objectId")
+	rec.objectID, pos, err = readUint32(data, pos, "objectId")
 	if err != nil {
 		return indexRecord{}, 0, err
 	}
 
-	pos, err = skipBytes(data, pos, indexRecordFlagsSize, "flags")
+	pos, err = parseIndexRecordFlags(&rec, data, pos)
 	if err != nil {
 		return indexRecord{}, 0, err
 	}
@@ -495,8 +619,8 @@ func parseIndexRecord(data []byte, pos int) (indexRecord, int, error) {
 		return indexRecord{}, 0, err
 	}
 
-	if coveredCount != 1 {
-		return indexRecord{}, 0, fmt.Errorf("%w: %d covered columns", ErrMultiColumnIndex, coveredCount)
+	if coveredCount == 0 || coveredCount > maxSchemaColumns || int64(coveredCount) > int64(len(data)-pos) {
+		return indexRecord{}, 0, fmt.Errorf("coveredColumnCount %d exceeds %d remaining bytes", coveredCount, len(data)-pos)
 	}
 
 	rootPage, pos, err := readUint32(data, pos, "root page")
@@ -504,31 +628,104 @@ func parseIndexRecord(data []byte, pos int) (indexRecord, int, error) {
 		return indexRecord{}, 0, err
 	}
 
-	column, pos, err := readPascalString(data, pos)
+	rec.rootPageNo = int32(rootPage)
+	rec.columns = make([]indexColumn, 0, coveredCount)
+
+	for i := range int(coveredCount) {
+		var col indexColumn
+
+		col, pos, err = parseIndexColumn(data, pos)
+		if err != nil {
+			return indexRecord{}, 0, fmt.Errorf("covered column %d: %w", i, err)
+		}
+
+		rec.columns = append(rec.columns, col)
+	}
+
+	return rec, pos, nil
+}
+
+// parseIndexRecordFlags reads the three flag bytes between an index record's
+// objectId and its coveredColumnCount. The first is zero everywhere in the
+// corpus and is refused if it is not; the other two are the UNIQUE and PRIMARY
+// booleans.
+func parseIndexRecordFlags(rec *indexRecord, data []byte, pos int) (int, error) {
+	if pos+indexRecordFlagsSize > len(data) {
+		return 0, errors.New("truncated flags")
+	}
+
+	if data[pos] != 0 {
+		return 0, fmt.Errorf("index flag byte 0 = %#x, want 0", data[pos])
+	}
+
+	var err error
+
+	rec.unique, err = indexFlagBool(data[pos+1], "UNIQUE")
 	if err != nil {
-		return indexRecord{}, 0, fmt.Errorf("covered column name: %w", err)
+		return 0, err
 	}
 
-	pos, err = skipBytes(data, pos, indexRecordCoveredTrailerSize, "covered column trailer")
+	rec.primary, err = indexFlagBool(data[pos+2], "PRIMARY")
 	if err != nil {
-		return indexRecord{}, 0, err
+		return 0, err
 	}
 
-	terminator, pos, err := readUint32(data, pos, "terminator")
+	return pos + indexRecordFlagsSize, nil
+}
+
+// parseIndexColumn reads one covered-column entry: the column name, the DESC
+// and NOCASE flags, and the maximum indexed size.
+func parseIndexColumn(data []byte, pos int) (indexColumn, int, error) {
+	name, pos, err := readPascalString(data, pos)
 	if err != nil {
-		return indexRecord{}, 0, err
+		return indexColumn{}, 0, fmt.Errorf("name: %w", err)
 	}
 
-	if terminator != indexRecordTerminator {
-		return indexRecord{}, 0, fmt.Errorf("terminator = %#x, want %#x", terminator, indexRecordTerminator)
+	if pos+2 > len(data) {
+		return indexColumn{}, 0, errors.New("truncated column flags")
 	}
 
-	return indexRecord{
-		name:       name,
-		objectID:   objectID,
-		rootPageNo: int32(rootPage),
-		column:     column,
+	descending, err := indexFlagBool(data[pos], "DESC")
+	if err != nil {
+		return indexColumn{}, 0, err
+	}
+
+	caseInsensitive, err := indexFlagBool(data[pos+1], "NOCASE")
+	if err != nil {
+		return indexColumn{}, 0, err
+	}
+
+	pos += 2
+
+	maxIndexedSize, pos, err := readUint32(data, pos, "maximum indexed size")
+	if err != nil {
+		return indexColumn{}, 0, err
+	}
+
+	if maxIndexedSize != indexColumnMaxIndexedSize {
+		return indexColumn{}, 0, fmt.Errorf("maximum indexed size = %#x, want %#x", maxIndexedSize, indexColumnMaxIndexedSize)
+	}
+
+	return indexColumn{
+		name:            name,
+		descending:      descending,
+		caseInsensitive: caseInsensitive,
+		maxIndexedSize:  maxIndexedSize,
 	}, pos, nil
+}
+
+// indexFlagBool decodes one of the format's 0x00/0xFF ByteBools, naming the
+// flag in its error. Any other value is a byte this package has no evidence
+// for, and reading it as "true" would be a guess.
+func indexFlagBool(b byte, name string) (bool, error) {
+	switch b {
+	case 0:
+		return false, nil
+	case indexFlagTrue:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s flag = %#x, want 0x00 or 0xFF", name, b)
+	}
 }
 
 // readPascalString reads a one-byte-length-prefixed, Windows-1252-encoded
@@ -557,20 +754,17 @@ func readUint32(data []byte, pos int, field string) (uint32, int, error) {
 	return binary.LittleEndian.Uint32(data[pos : pos+4]), pos + 4, nil
 }
 
-// skipBytes advances pos by n, naming the field in its error if there is not
-// enough data.
-func skipBytes(data []byte, pos, n int, field string) (int, error) {
-	if pos+n > len(data) {
-		return 0, fmt.Errorf("truncated %s", field)
-	}
-
-	return pos + n, nil
-}
-
-// serializeIndexRecord builds one index record, the mirror of parseIndexRecord:
-// a Pascal name, the object id, 3 reserved zero bytes, coveredColumnCount=1,
-// the index's own root page, a Pascal covered-column name, 2 reserved zero
-// bytes and the constant terminator.
+// serializeIndexRecord builds one index record, the mirror of parseIndexRecord
+// for the one shape CreateIndex builds: a Pascal name, the object id, three
+// zero flag bytes (not unique, not primary), coveredColumnCount=1, the index's
+// own root page, and a single covered column -- a Pascal name, a zero DESC
+// flag, a zero NOCASE flag and the constant maximum indexed size.
+//
+// These are the same bytes this function wrote before covered-column entries
+// were decoded, which is what keeps TestCreateIndexMatchesEngineByteForByte
+// passing unchanged: what used to be "2 reserved bytes plus a 0x14 terminator"
+// is the ASC/CASE/20 entry the engine writes for an ascending, case-sensitive
+// index.
 func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column string) ([]byte, error) {
 	rawName, err := encodeIndexName(name)
 	if err != nil {
@@ -582,7 +776,7 @@ func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column
 		return nil, err
 	}
 
-	out := make([]byte, 0, 1+len(rawName)+4+indexRecordFlagsSize+4+4+1+len(rawColumn)+indexRecordCoveredTrailerSize+4)
+	out := make([]byte, 0, 1+len(rawName)+4+indexRecordFlagsSize+4+4+1+len(rawColumn)+2+4)
 
 	out = append(out, byte(len(rawName))) //nolint:gosec // checked in encodeIndexName
 	out = append(out, rawName...)
@@ -603,9 +797,9 @@ func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column
 	out = append(out, byte(len(rawColumn))) //nolint:gosec // checked in encodeIndexName
 	out = append(out, rawColumn...)
 
-	out = append(out, make([]byte, indexRecordCoveredTrailerSize)...)
+	out = append(out, 0, 0) // DESC = false, NOCASE = false
 
-	binary.LittleEndian.PutUint32(buf4[:], indexRecordTerminator)
+	binary.LittleEndian.PutUint32(buf4[:], indexColumnMaxIndexedSize)
 	out = append(out, buf4[:]...)
 
 	return out, nil

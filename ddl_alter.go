@@ -23,13 +23,20 @@ import (
 // comment lays out the counter-by-counter evidence, and
 // TestEngineAlterTableRebuildsTheTable pins it.
 //
-// Reproducing that sequence was considered and rejected: it needs six free
-// pages, and nothing here can grow a database. MultiTable.abs is the only
-// file in the corpus that has six. Writes.abs has three, every
-// Employees-*.abs has two, and the customer fixtures have between none and
-// five, so an engine-faithful ALTER TABLE would be byte-perfect on one
-// fixture and refuse on every other file this package exists to read. The
-// splice below works on all of them.
+// Reproducing that sequence was considered and rejected, and the reason has
+// since expired. It needed six free pages, and at the time nothing here could
+// grow a database: MultiTable.abs is the only file in the corpus that has
+// six, Writes.abs has three, every Employees-*.abs has two, and the customer
+// fixtures have between none and five, so an engine-faithful ALTER TABLE
+// would have been byte-perfect on one fixture and refused on every other file
+// this package exists to read. The splice below works on all of them.
+//
+// ddl_grow.go has since removed that constraint -- the file extends by whole
+// extents on demand -- so the rebuild is no longer blocked, merely not done.
+// It would still have to reproduce all four transactions, the three catalog
+// writes and a fresh set of object ids, which is a good deal more than
+// allocating six pages. Recorded as an open question so the reasoning does
+// not outlive the constraint that produced it.
 //
 // So the guarantee here is weaker than DropTable's or CreateTable's, and
 // differently shaped: not byte identity, but semantic identity against the
@@ -76,10 +83,11 @@ import (
 //   - a table with BLOB pages: nothing here can rewrite a record carrying a
 //     live BLOB reference safely, matching DropTable's own
 //     ErrTableHasBlobPages refusal.
-//   - dropping a column an index covers: the index record embeds its
-//     covered column's name (see columnCoveredByIndex), which is precise
-//     enough to check rather than refusing on any indexed table outright,
-//     the way writer.go's ErrIndexNotMaintained does for insert/delete.
+//   - dropping a column an index covers, or one a constraint names: both
+//     records embed their covered columns' names (columnCoveredByIndex,
+//     columnNamedByConstraint), which is precise enough to check rather than
+//     refusing on any indexed or constrained table outright, the way
+//     writer.go's ErrIndexNotMaintained does for insert/delete.
 //   - a record that would not fit its page after the column change: no
 //     page-splitting exists in this package (see writer.go's ErrTableFull),
 //     so a page that cannot hold its own existing rows under the new record
@@ -108,18 +116,18 @@ var (
 	ErrColumnIndexed = errors.New("absdb: column is covered by an index this package cannot repair")
 
 	// ErrColumnConstrained reports a DropColumn naming a column a NOT NULL,
-	// PRIMARY KEY or UNIQUE constraint record refers to by name. The
-	// constraint record format is not decoded by this package -- see
-	// ErrSchemaTailNotUnderstood (ddl_index.go) for the same judgement
-	// applied to CREATE/DROP INDEX -- so this is found by a conservative text
-	// scan of the schema tail (scanConstraintMarkers) rather than by parsing
-	// the record. Dropping a column a constraint still names would leave the
-	// file with a constraint pointing at a column that no longer exists, and
-	// nothing in this package or the corpus says what the engine does with
-	// one, so this is treated as a real corruption risk rather than a gap in
-	// test coverage. What would settle it: a byte-for-byte decode of the
-	// constraint record format (the way the index record was decoded), or an
-	// engine-produced ALTER TABLE fixture run against a constrained table.
+	// PRIMARY KEY, UNIQUE or MINVALUE/MAXVALUE constraint record covers.
+	//
+	// The record format is decoded now (ddl_constraint.go), so this is found
+	// by parsing the constraint array and asking each record which columns it
+	// covers, not by the text scan that used to stand in for it. What has not
+	// changed is the outcome: dropping the column would leave a constraint
+	// naming a column the file no longer has, and nothing in the corpus says
+	// what the engine does with one. Reading the record is not the same as
+	// knowing how to rewrite the array around a removal, and this package will
+	// not guess at the second from the first. What would settle it: an
+	// engine-produced ALTER TABLE ... DROP COLUMN fixture run against a
+	// constrained table.
 	ErrColumnConstrained = errors.New("absdb: column is named by a constraint this package cannot repair")
 
 	// ErrRecordWontFit reports an existing record that would no longer fit
@@ -518,12 +526,16 @@ func (db *File) spliceSchemaColumns(w *pageEdit, schemaPage, dropIndex int, addC
 // The parse itself is ddl_index.go's: parseIndexRecords/parseIndexRecord are
 // shared with CREATE INDEX/DROP INDEX rather than duplicated, so there is one
 // decode of this byte layout in the package, not two independently drifting
-// ones. Unlike ddl_index.go's parseSchemaTail, this does not require the
-// tail to end exactly after the index-record array -- a table with
-// constraint records trailing the index array is fine here, because
-// DropColumn's splice (spliceSchemaColumns) never touches or moves that
-// region; only inserting a new index record, which CreateIndex does, needs
-// to know it is not overwriting a constraint block it cannot parse.
+// ones. Unlike ddl_index.go's parseSchemaTail, this does not require the rest
+// of the tail to parse -- a table whose constraint array this package cannot
+// read is still safe to answer this question about, because DropColumn's
+// splice (spliceSchemaColumns) never touches or moves that region.
+//
+// A multi-column index counts, which is the case this missed while
+// parseIndexRecord refused coveredColumnCount > 1: back then such a table
+// errored out of DropColumn rather than being answered, so nothing was lost;
+// now it is answered, and every covered column of a multi-column index blocks
+// the drop.
 func (db *File) columnCoveredByIndex(schemaPage int, columnName string) (bool, error) {
 	raw, tailStart, err := db.readSchemaTailStart(schemaPage)
 	if err != nil {
@@ -545,7 +557,7 @@ func (db *File) columnCoveredByIndex(schemaPage int, columnName string) (bool, e
 	}
 
 	for _, rec := range records {
-		if strings.EqualFold(rec.column, columnName) {
+		if rec.coversColumn(columnName) {
 			return true, nil
 		}
 	}
@@ -553,19 +565,51 @@ func (db *File) columnCoveredByIndex(schemaPage int, columnName string) (bool, e
 	return false, nil
 }
 
-// columnNamedByConstraint reports whether the schema tail -- the region
-// starting right after the last column definition, which holds the index
-// array and, on any table with a NOT NULL, PRIMARY KEY or UNIQUE constraint,
-// constraint records after it -- names columnName inside a constraint
-// marker. See scanConstraintMarkers for how, and ErrColumnConstrained for
-// why this is a refusal rather than best-effort information.
+// columnNamedByConstraint reports whether a constraint record names columnName,
+// so DropColumn can refuse a column a NOT NULL, PRIMARY KEY, UNIQUE or
+// MINVALUE/MAXVALUE clause still depends on.
+//
+// It prefers the decoded answer: parseSchemaTail reads the constraint array
+// (ddl_constraint.go), and a record is checked against the columns it actually
+// covers. That is a real narrowing -- before the array was decoded, the text
+// scan below flagged any column whose name appeared anywhere in the tail, so a
+// table with six NOT NULL constraints refused a drop of any of the six even
+// when the seventh column was the one being dropped.
+//
+// When the tail does not parse the scan is still used, because a region this
+// package cannot read is exactly where a conservative answer belongs.
 func (db *File) columnNamedByConstraint(schemaPage int, columnName string) (bool, error) {
 	raw, tailStart, err := db.readSchemaTailStart(schemaPage)
 	if err != nil {
 		return false, err
 	}
 
-	return scanConstraintMarkers(raw[tailStart:], columnName), nil
+	constraints, ok := tailConstraints(raw)
+	if !ok {
+		return scanConstraintMarkers(raw[tailStart:], columnName), nil
+	}
+
+	for _, c := range constraints {
+		if c.namesColumn(columnName) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// tailConstraints returns a schema stream's constraint array, and reports false
+// when the tail does not parse.
+//
+// The parse error is deliberately dropped rather than propagated: a tail this
+// package cannot read is a reason for its one caller to fall back to the
+// conservative text scan, not a reason to fail a DropColumn the scan can answer
+// safely on its own.
+func tailConstraints(raw []byte) ([]constraintRecord, bool) {
+	//nolint:dogsled // only the constraint array is wanted here
+	_, _, _, constraints, _, err := parseSchemaTail(raw)
+
+	return constraints, err == nil
 }
 
 // readSchemaTailStart decompresses a table's column-definition internal file
