@@ -40,11 +40,32 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 
 - **One table is a special case, not the shape of the API**: a database can hold several tables, and only data pages record which one they belong to. Reads and writes are scoped through `File.Table(name)`; the no-argument `Schema`, `OpenTable` and `OpenTableWriter` are shorthand for `Table("")` and report `ErrAmbiguousTable` rather than mixing tables. Before this existed, `OpenTable` on a three-table file returned six rows for a two-row table with no error. When adding anything that scans pages by type, ask what happens with three tables in the file — the answer is usually "it silently reads someone else's".
 
-- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete within existing pages; Phase 8 (`ddl.go`) adds `DROP TABLE` and the page allocator it needs. The other schema operations are not implemented, for the reason below.
+- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete within existing pages; Phase 8 adds the schema operations — `DROP TABLE` and the allocation model in `ddl.go`, `CREATE TABLE` in `ddl_create.go`, `CREATE INDEX`/`DROP INDEX` in `ddl_index.go`, and `ALTER TABLE ADD`/`DROP COLUMN` in `ddl_alter.go`. Database compaction is the one Phase 8 step still open.
 
-- **The engine's zlib is the C library at level 1, and Go cannot reproduce it**: every compressed internal file in the corpus — schema (type 8), table info (9), catalog (6) — is byte-identical to `zlib.compress(data, 1)`, all 34 of them, and to no other level. Go's `compress/zlib` matches none of them at any level, because its level 1 is its own fast encoder rather than zlib's `deflate_fast`. This is why `CREATE TABLE`, `ALTER TABLE`, `CREATE INDEX` and `DROP INDEX` are not implemented: each rewrites that stream, and a writer using Go's zlib would produce a file that reads back correctly and is not what the engine writes. Do not "unblock" them by compressing with `compress/zlib` and relaxing the byte-identity test — write a zlib-level-1-compatible deflate first, against the 34 streams as its oracle. `DROP TABLE` is implemented precisely because the catalog it edits is uncompressed.
+- **The engine's zlib is the C library at level 1, and `internal/zlib1` reproduces it**: every compressed internal file in the corpus — schema (type 8), table info (9), catalog (6) — is byte-identical to `zlib.compress(data, 1)`, all 48 of them, and to no other level. Go's `compress/zlib` matches none of them at any level, because its level 1 is its own fast encoder rather than zlib's `deflate_fast`. This blocked every schema operation except `DROP TABLE` until `internal/zlib1` ported zlib's level-1 path; `TestZlib1ReproducesEveryCorpusStream` re-compresses all 48 and requires each to reproduce the engine's bytes, and `testdata/zlib1` holds 37 golden vectors that pin it without any fixture. **Never write a stream the engine will read with `compress/zlib`** — it is for reading only. A writer using it produces a file that reads back correctly and is not what the engine wrote, which is exactly the failure the byte-identity tests exist to catch.
 
-- **Writes are judged byte-for-byte**: `TestWriterMatchesEngineByteForByte` and `TestDropTableMatchesEngineByteForByte` require each operation to reproduce the file DBManager itself produced for the same SQL statement. Reading a write back correctly is not sufficient evidence — the engine keeps counters a naive writer would miss, and this package's own reader would not notice. If you change the write path, those two tests are the ones that matter.
+- **Writes are judged byte-for-byte**: `TestWriterMatchesEngineByteForByte`,
+  `TestDropTableMatchesEngineByteForByte`, `TestCreateTableMatchesEngineByteForByte` and
+  `TestCreateIndexMatchesEngineByteForByte` require each operation to reproduce the file DBManager
+  itself produced for the same SQL statement. Reading a write back correctly is not sufficient
+  evidence — the engine keeps counters a naive writer would miss, and this package's own reader would
+  not notice. If you change the write path, those are the tests that matter.
+
+  Two operations cannot meet that bar, for reasons recorded rather than waved away. `ALTER TABLE ADD`
+  and `DROP COLUMN` have **no engine fixture at all** — none was ever produced — so they rest on
+  round-trip plus the independent B-tree leaf oracle, and `TestAlterTableMatchesEngineByteForByte`
+  skips until `MultiTable-alteradd.abs`/`-alterdrop.abs` exist. And every comparison excludes page
+  `State` words, because of the next point.
+
+- **A page's `State` is seeded randomly, so allocating a page breaks byte identity**: across the
+  corpus's 663 live pages `State` is uniform in `[0, 2^30)`, and 29 groups of byte-identical page
+  payloads carry different `State`s — it is neither a content hash nor a fixed sequence. This is why
+  `DROP TABLE` and the record writer reach full byte identity (they only touch pages that already
+  exist) while `CREATE TABLE` and `CREATE INDEX` cannot. The two operations also differ from each
+  other: `CREATE TABLE` increments existing pages' `State` and reseeds only the five it allocates,
+  whereas `CREATE INDEX` reseeds **every** page it rewrites — pages whose payload is byte-identical
+  before and after still come back with a new `State`. Exclude `State` words explicitly and narrowly;
+  never widen an exclusion to make a test pass.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.
 - **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the eleven `testdata/Writes*.abs` fixtures (the write path's ground truth) and the six `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.

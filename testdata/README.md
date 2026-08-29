@@ -205,3 +205,22 @@ SQL tab.
 Verify those by bytes too: a derived file must actually differ from its parent
 (`cmp -l parent child | wc -l`), because a script that silently failed to run produces a
 file that is byte-identical to its parent and looks like a valid fixture.
+
+## `zlib1/` — golden vectors for the level-1 deflate encoder
+
+`internal/zlib1` must reproduce the C zlib library's level-1 output byte for byte, because
+that is what the engine writes and what every compressed internal file in the corpus is.
+`testdata/zlib1/` holds 37 pairs pinning that: `<case>.in` is the input, `<case>.z` is
+exactly what C zlib 1.2.13 produced for it at level 1.
+
+These are committed, unlike most of this directory, and deliberately so — they let CI check
+the encoder without any `.abs` fixture at all. Nothing here is customer data: every case is
+either synthetic or a column-definition stream taken from one of the committed `Writes*` /
+`MultiTable*` fixtures.
+
+The set covers all three deflate block types, both `BFINAL` states, multi-block streams,
+long and far matches, and inputs that slide the 32 KiB window. Twelve `boundary-*` cases
+sit near zlib's static-versus-dynamic block decision: a mis-transcribed `extra_blbits`
+table once emitted byte-identical Huffman trees and only mis-accounted `opt_len`, so the
+sole symptom was picking the wrong block type, and no other case in the set was close
+enough to that boundary to notice.

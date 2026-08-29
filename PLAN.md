@@ -1512,35 +1512,145 @@ Phase 8.
 
 - [x] Decode the allocation model — the two maps every schema operation has to keep
 - [x] Implement `DROP TABLE` — tombstone its pages, compact the catalog, free the maps
-- [ ] Implement `CREATE TABLE` — allocate pages, write schema; blocked, see below
-- [ ] Implement `ALTER TABLE ADD COLUMN` — update schema, pad existing records; blocked
-- [ ] Implement `ALTER TABLE DROP COLUMN` — update schema, compact records; blocked
-- [ ] Implement `CREATE INDEX` — build B-tree from existing data; blocked
-- [ ] Implement `DROP INDEX` — remove index pages, update schema; blocked
+- [x] Write a deflate encoder bit-compatible with zlib level 1 — `internal/zlib1`; it is
+      what unblocked the five below
+- [x] Implement `CREATE TABLE` — allocate pages, write schema
+- [x] Implement `ALTER TABLE ADD COLUMN` — update schema, re-encode existing records
+- [x] Implement `ALTER TABLE DROP COLUMN` — update schema, re-encode existing records
+- [x] Implement `CREATE INDEX` — build B-tree from existing data
+- [x] Implement `DROP INDEX` — remove index pages, update schema
 - [ ] Implement database compaction (defragment free space)
 
-### What blocks the other five, and it is not the format
+### What blocked the other five, and how it was unblocked
 
 Every schema operation except `DROP TABLE` rewrites the table's internal file of column
 definitions, and that file is **zlib-compressed**. Byte identity with the engine therefore
-requires reproducing the engine's deflate output exactly, and:
+required reproducing the engine's deflate output exactly, and:
 
-- the engine's compressor is the **C zlib library at level 1**. All 34 compressed internal
+- the engine's compressor is the **C zlib library at level 1**. All 48 compressed internal
   files in the corpus are reproduced byte for byte by `zlib.compress(data, 1)`, and by no
   other level;
 - **Go's `compress/zlib` reproduces none of them, at any level.** Go's level 1 is its own
   fast encoder, not zlib's `deflate_fast`; the shortest schema in the corpus is 93 bytes
   from zlib and 105 from Go.
 
-So `CREATE TABLE`, both `ALTER TABLE` forms, `CREATE INDEX` and `DROP INDEX` cannot meet
-the standard the rest of the write path is held to until this package carries a deflate
-encoder that is bit-compatible with zlib level 1. That is a bounded piece of work with an
-unusually good oracle attached: 34 real streams whose exact output is already known, plus
-every BLOB stream. It is the first step of the rest of Phase 8, the way fixtures were the
-first step of Phase 7.
+`internal/zlib1` is that encoder: a port of zlib's level-1 path — the `deflate_fast` state
+machine with the `{good 4, lazy 4, nice 8, chain 4}` configuration, the hash chains and
+`longest_match`, the symbol buffer, and `trees.c`'s tree construction and block emission
+including the stored/static/dynamic choice. `TestZlib1ReproducesEveryCorpusStream`
+re-compresses every compressed internal file in every fixture — 48 streams on a full
+corpus, 31 from committed fixtures alone — and requires each to reproduce the engine's
+bytes. `testdata/zlib1` holds 37 golden input/output pairs that pin it with no fixture at
+all, so CI checks it too.
 
-`DROP TABLE` is the one operation that never touches a compressed stream, because the
-table catalog it edits is stored uncompressed in every fixture.
+`DROP TABLE` was implementable before this because the catalog it edits is stored
+uncompressed in every fixture.
+
+**One lesson worth carrying.** The 25 golden vectors originally chosen all passed on the
+first run; a wider cross-check against C zlib then failed on 5 of 194 cases. The cause was
+a mis-transcribed `extra_blbits` table, which feeds only `gen_bitlen`'s `opt_len`
+accounting: the Huffman trees it emitted were byte-identical to zlib's, and the sole
+symptom was `_tr_flush_block` choosing a static block where zlib chose dynamic. Twelve
+vectors sitting near that decision boundary are now committed, because the obvious test
+set had no case on it.
+
+### What byte-for-byte can and cannot mean here
+
+A page's ABSP `State` is **seeded randomly** when the page is allocated. Across the
+corpus's 663 live pages it is uniform in `[0, 2^30)`, and 29 groups of byte-identical page
+payloads carry different `State`s, so it is neither a content hash nor a fixed sequence.
+
+That is why `DROP TABLE` and the record writer reach full byte identity — they only ever
+touch pages that already exist — and why any operation that allocates one cannot. It also
+separates the two new operations from each other:
+
+- `CREATE TABLE` **increments** existing pages' `State` (page 4 by one, page 0 once per PFS
+  bit set) and reseeds only the five pages it allocates.
+  `TestCreateTableMatchesEngineByteForByte` asserts all 123 260 bytes of
+  `MultiTable-create.abs` except those 20.
+- `CREATE INDEX` **reseeds every page it rewrites**, evidently rewriting the whole file:
+  pages 2, 3, 4, 9 and 10 of `Writes-idx.abs` have byte-identical payloads to `Writes.abs`
+  yet different `State`s, which an untouched page cannot have. Its test therefore masks
+  every page's `State` word and requires **zero** remaining differences — a wider mask but
+  a stronger assertion, since it pins the content of all fourteen pages including the ones
+  the operation never writes.
+
+Never widen a `State` exclusion to make a test pass. Excluding a page that the operation
+should have reproduced is how a real defect would hide here.
+
+### The schema stream's tail, decoded
+
+`PLAN.md` used to record roughly a quarter of the column-definition stream as never read:
+"index definitions, constraints, table name". The index definitions are now decoded, and
+that is what `CREATE INDEX` and `DROP INDEX` edit:
+
+```
+int32 columnCount
+columnCount x column definition
+int32 indexCount
+indexCount x index record
+[constraint records, if the table has any]      located, format still undecoded
+int32 reserved
+int32 recordPageIndexRoot
+int32 blobPageIndexRoot
+```
+
+An index record is a Pascal name, an `int32` object id, three zero bytes, an `int32`
+covered-column count, an `int32` **root page number of the index's own B-tree**, the
+covered column's Pascal name, two zero bytes, and the constant `0x14`.
+
+The root-page field is confirmed on 34 of the corpus's 35 occurrences: the `int32` names a
+page whose `PageType` is 12. The single exception belongs to `RCON0011`'s composite primary
+key, which reuses the covered-column shape without being an index — so it is evidence for
+the reading rather than against it. That field forces an ordering on any implementation:
+the index page must be allocated **before** the stream is serialized, because the stream
+embeds its number.
+
+Two things this does **not** settle, both of which the code refuses on rather than guesses:
+
+- **Constraints.** Every customer fixture carries `$C_NotNull$<file>.abs$<Column>`,
+  `C_PK$Col1$Col2` and `$C_Unique$<Column>` records in that same region, in a format nobody
+  has decoded. `ErrSchemaTailNotUnderstood` refuses `CREATE INDEX`/`DROP INDEX` on any
+  table whose tail is not exactly the index array plus the 12-byte trailer, and
+  `ErrColumnConstrained` refuses `DROP COLUMN` for a column a constraint names — copying
+  the tail through verbatim while deleting that column would leave a constraint pointing at
+  a column that no longer exists.
+- **Multi-column indexes.** No fixture has one, so the record-length formula's extension to
+  `coveredColumnCount > 1` is unverified extrapolation and is refused.
+
+Because so much of the region is undecoded, all four operations edit the stream
+**surgically** — inflate, splice bytes in or out, re-compress — rather than parsing it into
+`TableSchema` and re-serializing. A re-serializer would silently drop what it does not
+understand.
+
+### What `ALTER TABLE` does not have, and what would give it to it
+
+Neither `ALTER TABLE` form has an engine fixture. `PLAN.md` records the diffs below but the
+files were never committed and could not be regenerated in the round that implemented them,
+so unlike every other write in this package neither is checked against bytes the engine
+produced. `TestAlterTableMatchesEngineByteForByte` is written and **skips** on the two
+absent fixtures, naming the SQL that regenerates them; the day either is committed the
+check runs with no code change.
+
+Until then the evidence is round-trip plus the independent B-tree leaf oracle. The case
+most likely to be silently wrong is covered deliberately: the null-flag prefix is sized
+from the column count, so a count crossing a multiple of 8 moves every field in every
+record — the shape of the Phase 5c bug — and `TestAlterTableColumnCountBoundary` drives
+8→9 and 16→17 and back on synthetic fixtures, asserting that `nullFlagBytes` actually
+changed so an implementation that kept the old width cannot pass by coincidence.
+
+What the tests still do not prove:
+
+- no byte-for-byte guarantee against the engine for either `ALTER TABLE` form;
+- the table-info counters file is not touched or validated by them;
+- the B-tree oracle cross-check runs against one indexed table only, since no
+  multi-index or composite-key fixture survives an `ALTER` in this corpus;
+- constrained tables are never run through `ADD COLUMN`, so the claim that the splice is
+  constraint-agnostic rests on its structure rather than a direct test.
+
+To regenerate the two missing fixtures under DBManager, against `MultiTable.abs`:
+`ALTER TABLE Gamma ADD (W INTEGER)` → `MultiTable-alteradd.abs`, and
+`ALTER TABLE Gamma DROP (V)` → `MultiTable-alterdrop.abs`.
 
 ### The allocation model, decoded
 
@@ -1610,17 +1720,18 @@ data pages its leaves point at, which is what `OpenIndex` already does for readi
 - `ErrCatalogNotWritable` — a compressed catalog, or one spanning more than one page.
   Neither occurs in any fixture.
 
-### What the other operations write, recorded for whoever unblocks them
+### What each operation writes, measured
 
 Each of these was produced as a one-statement diff from `MultiTable.abs` under DBManager.
-The files are not committed, because no test uses them yet and a fixture with no test is
-dead weight; the recipe in `testdata/README.md` regenerates them.
+Only the `CREATE TABLE` pair is committed; the others are not, and the two `ALTER TABLE`
+rows are the fixtures this phase still wants — see above. The recipe in
+`testdata/README.md` regenerates them.
 
 | Statement                                 | Bytes | What it does                                                                                                                                                                                                                                                                  |
 | ----------------------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CREATE TABLE Delta (X, Y)`               | 198   | allocates **five** pages — two for the system internal file, one each for the column definitions, the counters and the record-page index — and **no data page**; that arrives with the first insert. Appends a catalog entry and moves `LastObjectID` by 1 + the column count |
 | `DROP TABLE Beta; CREATE TABLE Delta …`   | 128   | the new table takes the freed pages, **lowest first**: `Beta`'s 11–15 of 11–16                                                                                                                                                                                                |
-| `ALTER TABLE Gamma ADD (W INTEGER)`       | 248   | rewrites the column definitions; blocked on zlib                                                                                                                                                                                                                              |
+| `ALTER TABLE Gamma ADD (W INTEGER)`       | 248   | rewrites the column definitions; implemented, but this fixture is missing so it is the one operation with no engine check                                                                                                                                                     |
 | `ALTER TABLE Gamma DROP (V)`              | 234   | as above                                                                                                                                                                                                                                                                      |
 | `CREATE INDEX IdxBetaCode ON Beta (Code)` | 93    | allocates one index page, rewrites `Beta`'s column definitions, moves `LastObjectID` by 1                                                                                                                                                                                     |
 | `DROP INDEX Alpha.IdxAlphaId`             | 25    | frees the index page, rewrites `Alpha`'s column definitions                                                                                                                                                                                                                   |
@@ -1778,28 +1889,32 @@ an independent decoder for every fixture.
    requires it with no `replace`. Re-tag from `main` and bump Aconiq. This is the only
    item left in this list, and it is not something to do from here: it changes what
    `../Aconiq` resolves to.
-5. ~~**Phase 8 — schema operations.**~~ Begun, not finished. `DROP TABLE` is implemented
-   and byte-identical to the engine on four one-statement fixtures, and the allocation
-   model it needed — PFS, EAM, `LastUsedPageNo`, `LastObjectID` — is decoded and asserted
-   against every fixture. The other five operations are **blocked on one thing**: they
-   rewrite a zlib stream, and Go's `compress/zlib` cannot reproduce the C library's
-   level-1 output that the engine writes.
+5. ~~**Phase 8 — schema operations.**~~ Done except database compaction. `internal/zlib1`
+   reproduces the engine's C-zlib-level-1 streams, which unblocked the five operations that
+   rewrite one, and `CREATE TABLE`, `CREATE INDEX`, `DROP INDEX` and both `ALTER TABLE`
+   forms are implemented alongside the existing `DROP TABLE`. `CREATE TABLE` and
+   `CREATE INDEX` are checked against the engine's own bytes; `ALTER TABLE` is not, because
+   no fixture for it exists — see Phase 8 for exactly what that leaves unproven.
 
 **After that**, three pieces of work are ready to start, in rough order of what unblocks
 the most:
 
-- **A deflate encoder bit-compatible with zlib level 1.** It unblocks five of the seven
-  Phase 8 operations at once, and it comes with an unusually good oracle: 34 compressed
-  internal files in the corpus whose exact bytes are already known, so the encoder is
-  either right on all of them or wrong. See Phase 8.
 - **Appending a data page when every existing one is full** (Phase 7, `ErrTableFull`).
-  This is now much closer than it was: the allocator that has to hand out the page is
-  decoded and tested, and `MultiTable-create.abs` shows the engine taking freed pages
-  lowest-first.
+  This is now much closer than it was: the page allocator exists and is exercised by
+  `CREATE TABLE` and `CREATE INDEX`, and `MultiTable-create.abs` shows the engine taking
+  freed pages lowest-first.
 - **Maintaining user indexes**, so insert and delete are not refused on an indexed table.
   Still blocked on fixtures that do not exist yet: an index insert whose key sorts into
   the middle, and one that splits a full leaf. Producing those two files under DBManager
-  is the first step, not an afterthought.
+  is the first step, not an afterthought. `CREATE INDEX` now builds a whole B-tree from
+  existing rows, so the leaf format is written as well as read — but only the append case
+  is evidenced.
+- **Decoding the constraint records** in the schema stream's tail. Their presence is
+  confirmed and their `$C_NotNull$`/`$C_PK$`/`$C_Unique$` markers are readable as text, but
+  the surrounding binary fields are not decoded, and that is what currently forces
+  `CREATE INDEX`, `DROP INDEX` and `DROP COLUMN` to refuse on most real tables. A clean
+  single-statement diff of adding one constraint to an otherwise clean table is what would
+  settle it, the way `Writes.abs`/`Writes-idx.abs` settled the index record.
 
 **The two largest validation gaps** are not phases, and neither can be closed from here:
 
