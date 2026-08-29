@@ -58,13 +58,22 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 - **Writes are judged byte-for-byte**: `TestWriterMatchesEngineByteForByte`,
   `TestDropTableMatchesEngineByteForByte`, `TestCreateTableMatchesEngineByteForByte`,
   `TestCreateIndexMatchesEngineByteForByte`, `TestGrowthMatchesEngineByteForByte`,
-  `TestCreateDatabaseMatchesEngineByteForByte` and `TestCompactDatabaseMatchesEngineByteForByte`
+  `TestCreateDatabaseMatchesEngineByteForByte`, `TestCompactDatabaseMatchesEngineByteForByte`,
+  `TestKeyIndexWritesMatchEngineByteForByte`,
+  `TestCreateTableWithAPrimaryKeyMatchesEngineByteForByte` and
+  `TestCreateUniqueIndexMatchesEngineByteForByte`
   require each operation to reproduce the file DBManager itself produced for the same SQL statement
-  or menu action. That includes index maintenance: four of the
-  `Writes-idx*` pairs pin the B-tree leaf splices an insert, a delete and a key-moving update
-  perform, with **no `State` exclusion**, because maintenance allocates no page. Reading a write back correctly is not sufficient
+  or menu action. That includes index maintenance: four of the `Writes-idx*` pairs and seven
+  `Keys*` pairs pin the B-tree leaf splices an insert, a delete and a key-moving update perform on
+  a plain and on a key-enforcing index, with **no `State` exclusion**, because maintenance
+  allocates no page. Reading a write back correctly is not sufficient
   evidence — the engine keeps counters a naive writer would miss, and this package's own reader would
   not notice. If you change the write path, those are the tests that matter.
+
+  `TestCreateTableWritesTheEngineSchemaStream` is the other kind of oracle and worth knowing about:
+  it replays `Constraints.abs`'s own `CREATE TABLE` statements into a database this package created
+  and requires the schema streams to match **including the engine's object ids**, which is how the
+  id order (table, columns, indexes, constraints) is checked without a whole-file comparison.
 
   Two operations cannot meet that bar, for reasons recorded rather than waved away. `ALTER TABLE ADD`
   and `DROP COLUMN` **diverge from the engine by design**, and the fixtures that prove it are
@@ -104,28 +113,36 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   consequence of reallocation.
 
 - **Index maintenance is deliberately narrow, and its narrowness is load-bearing**: insert, delete
-  and a key-moving update keep a **single-page index over an `Int32` column** in step, which is
-  exactly the shape `CREATE INDEX` builds. Everything else is refused with `ErrIndexNotMaintained`
-  rather than guessed at: a tree deep enough to have split, a key of another shape, and an index
-  whose ordering this package does not reproduce — multi-column, `DESC`, `NOCASE`, or backing a
-  `UNIQUE`/`PRIMARY KEY` constraint. In front of all of
-  that sits the constraint gate (`newConstraintChecks` in `writer_constraint.go`): a `NOT NULL` and a
-  `MINVALUE`/`MAXVALUE` pair are **checked** on every insert and update (`ErrNotNullViolated`,
-  `ErrCheckViolated`), and a table declaring anything else — a key constraint, or a record whose
-  column or bound type does not resolve — refuses every write with `ErrConstraintsNotEnforced`,
-  because a write that ignores a rule leaves the file holding a row the engine would have rejected.
-  **Every constrained private fixture still refuses writes**, indexed or not, because every one of them
-  declares a `PRIMARY KEY`. The reason a key is refused has changed and is worth keeping straight: it is
-  no longer "nothing checks for duplicates" — a duplicate scan is easy — but that the index implementing
-  the key is one nothing here can build or maintain, and no fixture shows the engine inserting into such
-  an index. Checking the constraint while leaving its index stale is the failure the gate exists to
-  prevent, so the two must lift together. Do not lift the `maintainableIndexColumn` refusal on the
-  strength of the duplicate check alone. What the gate replaced is worse than a refusal: `Update` went through and
-  silently left the index describing a key the row no longer had. Two behaviours come from fixtures and must not be
-  "tidied": a removal **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), and a
-  key-moving update is a **removal followed by a sorted insertion**, not an in-place patch
-  (`Writes-idx-upd.abs`). Clearing that tail reads back correctly through this package and is not
-  what the engine wrote.
+  and a key-moving update keep a **single-page index over an `Int32`/`Integer` column** in step,
+  which is exactly the shape `CREATE INDEX` builds. Everything else is refused with
+  `ErrIndexNotMaintained` rather than guessed at: a tree deep enough to have split, a key of another
+  shape, an index whose ordering this package does not reproduce (multi-column, `DESC`, `NOCASE`),
+  and a column of another field type — `AUTOINC` above all, which is what fifteen of the corpus's
+  twenty-five key constraints are keyed on and what now stands between the write path and most
+  private fixtures. Three behaviours come from fixtures and must not be "tidied": a removal
+  **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), a key-moving update is a
+  **removal followed by a sorted insertion** rather than an in-place patch (`Writes-idx-upd.abs`),
+  and a `NULL` key **sorts before every value** (`Keys-uniqnull.abs`, which is the only file
+  anywhere holding one).
+
+  A `UNIQUE`/`PRIMARY KEY` index used to be on that refusal list, and lifting it was gated in this
+  file on "do not do it on the strength of the duplicate check alone". That gate was met the way it
+  asked to be: the `Keys*.abs` family shows the engine splicing a key-enforcing leaf exactly as it
+  splices a plain one, seven pairs byte-identical with no `State` exclusion, and the constraint and
+  its index lifted together. Three of its refusals are engine behaviour that SQL would not predict
+  and that only a file could settle — a `PRIMARY KEY` column refuses a `NULL` though it carries **no
+  `NOT NULL` record**, a `UNIQUE` index admits the first `NULL` and refuses the second as a
+  duplicate, and every refused write leaves the file **byte-identical**, which is why every check
+  runs before a page is touched.
+
+  In front of maintenance sits the constraint gate (`newConstraintChecks` in
+  `writer_constraint.go`): a `NOT NULL` and a `MINVALUE`/`MAXVALUE` pair are **checked** per row,
+  a `PRIMARY KEY` or `UNIQUE` is checked **by its index** and so records no per-row check at all,
+  and anything else — a record whose column or bound type does not resolve, a key whose index is
+  not maintained — refuses every write with `ErrConstraintsNotEnforced`. A write that ignores a
+  rule leaves the file holding a row the engine would have rejected. What the gate replaced is
+  worse than a refusal: `Update` went through and silently left the index describing a key the row
+  no longer had.
 
 - **A page's `State` is seeded randomly, so allocating a page breaks byte identity**: across the
   corpus's 663 live pages `State` is uniform in `[0, 2^30)`, and 29 groups of byte-identical page

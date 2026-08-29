@@ -80,14 +80,52 @@ Two behaviours come from fixtures and must not be tidied:
   in-place patch: keys `[1,2,3]` with `Id 2 → 9` become `[1,3,9]`, not `[1,9,3]`. The table
   info page's record count is untouched and only its change counter moves.
 
-Maintenance allocates no page, so all four splices are byte-identical to the engine's files
-with **no `State` exclusion**.
+Maintenance allocates no page, so every splice is byte-identical to the engine's files with
+**no `State` exclusion** — the four `Writes-idx*` pairs for a plain index and seven `Keys*`
+pairs for a key-enforcing one.
+
+### A `UNIQUE` or `PRIMARY` index
+
+The leaf is spliced exactly as a plain one's is: the `Keys*.abs` family repeats every
+`Writes-idx*` case against a `PRIMARY KEY` index and adds two of its own — an update that
+leaves the key alone, and an insert keeping a primary key and a unique index in step at once.
+What a key index adds is a refusal in front of the splice, and each part of it comes off a
+file rather than off SQL's rules:
+
+| Statement                                   | Engine                                  | Here                 |
+| ------------------------------------------- | --------------------------------------- | -------------------- |
+| a key the leaf already holds                | refused, file byte-identical            | `ErrDuplicateKey`    |
+| a `NULL` into a `PRIMARY` index             | refused, file byte-identical            | `ErrNotNullViolated` |
+| the **first** `NULL` into a `UNIQUE` index  | accepted, stored with the null flag set | accepted             |
+| the **second** `NULL` into a `UNIQUE` index | refused as a duplicate                  | `ErrDuplicateKey`    |
+
+Two of those are not what SQL would say. A `PRIMARY KEY` column carries **no `NOT NULL`
+constraint record** — `Keys.abs` has none — and the engine refuses a `NULL` in it anyway, so a
+writer consulting only the constraint array would let one through. And a `UNIQUE` index
+compares `NULL` keys by value rather than treating them as distinct, so two of them collide.
+
+A `NULL` key also **sorts before every value**, which `Keys-uniqnull.abs` is the only evidence
+for anywhere. Comparing the null flag byte as a number puts it last; that is what
+`compareInt32Keys` did, and no index in the corpus held a `NULL` key to notice.
+
+Every refusal is made before any page is touched, because that is what the engine does: each of
+the refused statements left its file byte-identical to its parent, transaction counter
+included.
 
 Everything else is refused with `ErrIndexNotMaintained` rather than guessed at: a tree deep
-enough to have split, a key of another shape, a multi-column index (`ErrMultiColumnIndex`), and
-a `DESC` or `NOCASE` index, which orders its leaf differently than this package compares. That
-still covers every indexed private fixture — they all carry a multi-column index or a
-uniqueness constraint this package does not check.
+enough to have split, a key of another shape, a multi-column index (`ErrMultiColumnIndex`), a
+`DESC` or `NOCASE` index, which orders its leaf differently than this package compares, and a
+column that is not `Int32`/`Integer`. That last one is what now covers most of the private
+corpus: fifteen of its twenty-five key constraints are backed by a single-column, single-page
+index over an **`AUTOINC`** column, whose record and leaf are the `Int32` shape exactly — see
+[open-questions.md](open-questions.md).
+
+Indexes are resolved from the table's own schema records, with the pages kept as a cross-check
+in the other direction: an index the pages show that the schema does not name stops the write.
+Trusting the pages alone left an index whose leaf is empty invisible, because
+[index attribution](format/indexes.md#attributing-a-user-index-to-a-table) works by which data
+pages an entry points at — and a table whose `PRIMARY KEY` index has no rows yet is exactly
+that case, which is the state every table this package creates starts in.
 
 ## Constraint records
 
@@ -107,25 +145,34 @@ Placing the records is measured separately, because a correct record in the wron
 still a broken stream. `CREATE TABLE` writes the array itself rather than splicing it in
 afterwards, and replaying `Constraints.abs`'s own statements into a database this package
 created reproduces the engine's schema stream byte for byte, **object ids included**
-(`TestCreateTableWritesTheEngineSchemaStream`). Reaching `CMinMax`'s ids means standing in for
-the three tables between it and `CNotNull` that this package cannot create; that it then lands
-on the engine's bytes is what checks the id order — table, columns, indexes, constraints.
+(`TestCreateTableWritesTheEngineSchemaStream`). The replay reaches `CPk` and `CUnique` as well,
+whose ids are only right if an index is handed one between the last column and the constraint;
+that is what checks the id order — table, columns, indexes, constraints. Only the index
+record's root page number is excluded, because the page an index lands on depends on where its
+table was created, and the test separately checks that the number written is the page
+allocated.
+
+A key constraint's index is built alongside it: one page allocated after the record-page index
+(`Constraints.abs` puts `CPk`'s five pages at 15–19 and its index at 20), and an empty leaf
+which is the record-page index's own page with a 5-byte key instead of a 4-byte one.
+`TestCreateTableWithAPrimaryKeyMatchesEngineByteForByte` replays the four statements
+`Keys.abs` was made with into a copy of `Empty.abs` and reproduces the **whole file**, page
+`State` words aside.
 
 **Checking.** A write tests the encoded record before any page is touched:
 
-| Kind                            | Checked                                       | Refused with                |
-| ------------------------------- | --------------------------------------------- | --------------------------- |
-| `NOT NULL` (3)                  | the record's null flag for the covered column | `ErrNotNullViolated`        |
-| `MINVALUE`/`MAXVALUE` (4)       | the value against either bound, inclusive     | `ErrCheckViolated`          |
-| `PRIMARY KEY` (0), `UNIQUE` (2) | not checked                                   | `ErrConstraintsNotEnforced` |
+| Kind                            | Checked                                       | Refused with         |
+| ------------------------------- | --------------------------------------------- | -------------------- |
+| `NOT NULL` (3)                  | the record's null flag for the covered column | `ErrNotNullViolated` |
+| `MINVALUE`/`MAXVALUE` (4)       | the value against either bound, inclusive     | `ErrCheckViolated`   |
+| `PRIMARY KEY` (0), `UNIQUE` (2) | by the index implementing it                  | `ErrDuplicateKey`    |
 
-A key constraint keeps the blanket refusal, and the reason has changed. The duplicate scan it
-needs is straightforward; what it would buy is nothing, because such a constraint always comes
-with an index record implementing it and `maintainableIndexColumn` will not maintain that
-index. Letting the insert through would leave the index describing rows it no longer covers —
-the exact failure Phase 7's unguarded `Update` was. The two have to lift together, and the
-index half needs a fixture of the engine inserting into a `UNIQUE` or `PRIMARY` index; all four
-`Writes-idx*` files carry a plain one.
+A key record carries nothing to test a row against: it names an index, and it is that index
+that refuses the duplicate. So what the checker does for a key is structural — establish that
+the index exists, that it is one this writer maintains and that it is flagged — and record no
+per-row check at all. A key whose index fails any of that keeps `ErrConstraintsNotEnforced`,
+because checking a constraint while leaving its index stale is the exact failure Phase 7's
+unguarded `Update` was.
 
 No fixture can show the engine _rejecting_ a write, because a rejected write leaves no file
 behind, so the checks are held to the narrower standard of never passing a row the constraint's
@@ -204,8 +251,10 @@ pages with none free, `LastUsedPageNo` 23 → 17, the file `State` **reset** fro
 `LastObjectID` 11 → 7 with object ids **reallocated**.
 
 The output is exactly `CreateDatabase` + `CREATE TABLE` + `CREATE INDEX` + copy rows, per table
-in catalog order — and that is how it is implemented. Two details come from the fixture rather
-than the SDK:
+in catalog order — and that is how it is implemented. An index backing a `PRIMARY KEY` or
+`UNIQUE` record is not among the `CREATE INDEX` calls: `CREATE TABLE` builds it along with the
+constraint, so creating it again would give the table the same index twice. Two details come
+from the fixture rather than the SDK:
 
 - The per-table order is **`CREATE TABLE` → `CREATE INDEX` → copy rows**, not rows before
   indexes: a table's index page lands _ahead_ of its data page in the engine's output.
@@ -246,13 +295,14 @@ Each is an error rather than a silent success.
 | `ErrTableHasBlobPages`       | `DROP TABLE` on a table owning BLOB pages                                                                                                                                                |
 | `ErrPageUnattributed`        | The file holds an allocated page belonging to no table                                                                                                                                   |
 | `ErrCatalogNotWritable`      | A compressed catalog, or one spanning more than one page                                                                                                                                 |
-| `ErrConstraintsNotRebuilt`   | Compaction of a table carrying a `PRIMARY KEY` or `UNIQUE` record, whose index a re-created table would not have                                                                         |
-| `ErrConstraintsNotEnforced`  | A write to a table declaring a constraint this package does not check — a key constraint, or a record whose column or bound type does not resolve                                        |
-| `ErrNotNullViolated`         | A write storing `NULL` in a column a `NOT NULL` record covers                                                                                                                            |
+| `ErrConstraintsNotRebuilt`   | Compaction of a table carrying a constraint record `CREATE TABLE` cannot write back — a key over more than one column, or over a column an index leaf is not built for                   |
+| `ErrConstraintsNotEnforced`  | A write to a table declaring a constraint this package does not check — a record whose column or bound type does not resolve, or a key whose index is not maintained                     |
+| `ErrDuplicateKey`            | A write whose key a `UNIQUE` or `PRIMARY` index already holds, or `CreateUniqueIndex` over a column that already holds one twice                                                         |
+| `ErrNotNullViolated`         | A write storing `NULL` in a column a `NOT NULL` record covers, or in one a `PRIMARY` index covers                                                                                        |
 | `ErrCheckViolated`           | A write storing a value outside a column's `MINVALUE`/`MAXVALUE` pair                                                                                                                    |
 | `ErrEncryptionUnsupported`   | `CreateDatabase` with `Encrypted: true`, or compaction of an encrypted database                                                                                                          |
 | `ErrUnsupportedColumnType`   | `CREATE TABLE` with a column type no fixture evidences                                                                                                                                   |
-| `ErrUnsupportedIndexColumn`  | `CREATE INDEX` over a column type no fixture evidences                                                                                                                                   |
+| `ErrUnsupportedIndexColumn`  | `CREATE INDEX` over a column type no fixture evidences, or a `DESC`/`NOCASE` record put through the serializer                                                                           |
 | `ErrBadGeometry`             | A `CreateDatabaseOptions` the format cannot express                                                                                                                                      |
 
 A commit is **not crash-atomic**. Rollback is exact, because nothing is written before

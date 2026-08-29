@@ -8,15 +8,18 @@ because git cannot re-include a path whose parent directory is excluded.
 
 Two populations:
 
-- **Committed** — 42 `.abs` files this project produced under the ComponentAce DB Manager, plus
+- **Committed** — 53 `.abs` files this project produced under the ComponentAce DB Manager, plus
   `testdata/zlib1` golden vectors and `testdata/fuzz` corpora. Eight `Employees-*` (one per
   encryption algorithm, all with rows), fourteen `Writes*` (the record write path's ground
   truth, five of them carrying a user index), twelve `MultiTable*` (the catalog and the schema
   operations over it), five `Empty*` (fresh databases, one setting changed each),
   `Constraints.abs` (twelve tables, each one clause from a control), `Types.abs` (eight
   tables covering every field type, with sentinel columns that make a wrong stored width fail
-  loudly), and `Types2.abs` (the two questions `Types.abs` left open: the TimeStamp layout,
-  from eleven instants, and what a `BYTES` column will take from SQL, which is nothing).
+  loudly), `Types2.abs` (the two questions `Types.abs` left open: the TimeStamp layout,
+  from eleven instants, and what a `BYTES` column will take from SQL, which is nothing), nine
+  `Keys*` (a `PRIMARY KEY` and a `UNIQUE` index, one statement apart, which is what let index
+  maintenance stop refusing them), and two `Auto*` (an `AUTOINC` key, and the negative that an
+  insert into one writes no counter of its own).
 - **Not committed** — 20 real private project files. They are irreplaceable, are not in git, and must
   never be. Nothing in the test suite may write to, move, rename or delete anything under
   `testdata/`; a test that needs to modify a fixture copies it into `t.TempDir()` first.

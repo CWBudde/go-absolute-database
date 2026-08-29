@@ -92,13 +92,19 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
       `MINVALUE`/`MAXVALUE` are written by `CREATE TABLE`, rebuilt by compaction and checked on
       every insert and update (`ErrNotNullViolated`, `ErrCheckViolated`). See
       [docs/writing.md](docs/writing.md#constraint-records).
-- [ ] **Write and check a `PRIMARY KEY` or `UNIQUE` record.** Both halves are blocked by the
-      same missing piece, which is not the record: such a constraint names the index that
-      implements it, nothing here builds a key-enforcing index, and no fixture shows the engine
-      inserting into one. So compaction still refuses the table
-      (`ErrConstraintsNotRebuilt`) and every write to it is still refused
-      (`ErrConstraintsNotEnforced`). Every constrained table in the private corpus declares a
-      key, which is what keeps this the highest-leverage item in this file.
+- [x] **Write and check a `PRIMARY KEY` or `UNIQUE` record.** Closed by the `Keys*.abs`
+      fixtures. `CREATE TABLE` builds the backing index, compaction rebuilds both, the index
+      refuses a duplicate (`ErrDuplicateKey`) and `CreateUniqueIndex` writes the pair the engine
+      writes. See [docs/writing.md](docs/writing.md#a-unique-or-primary-index).
+- [ ] **Index an `AUTOINC` column.** This is what the item above turned out to be blocked
+      behind, and it is worth more than it was: fifteen of the corpus's twenty-five key
+      constraints are backed by a single-column, single-page index over an `AUTOINC` column,
+      whose record and leaf are the `Int32` shape exactly. What is unknown is how the engine
+      picks the next value for a row inserted without one; see
+      [docs/open-questions.md](docs/open-questions.md).
+- [ ] **A multi-column or `VARCHAR` key.** The other two shapes still refused, by index
+      maintenance and by the rebuild alike: `Constraints.abs`'s `CPkMulti` and `CBoth`, and the
+      three private fixtures whose key covers two or three columns.
 - [ ] **Write a `DEFAULT`.** The same problem one level down, refused the same way
       (`ErrColumnDefault`): it lives in the column definition rather than the constraint array,
       and `serializeColumnDef` writes the absent marker unconditionally.
@@ -135,21 +141,22 @@ Deferred until there is a concrete use case.
 
 In rough order of what unblocks the most:
 
-1. **A key-enforcing index**, which is now the whole of what a `PRIMARY KEY` or `UNIQUE`
-   constraint is waiting on — the records themselves are written and the column-shaped kinds
-   are checked. It needs `CREATE INDEX` to write the unique/primary flag bytes
-   (`Constraints.abs` pins them) and a fixture of the engine inserting into such an index, which
-   the corpus does not have and `testdata/README.md`'s recipe can produce. Until then every
-   constrained private table stays unwritable and uncompactable. A `DEFAULT` is a separate gap
-   one level down (`ErrColumnDefault`).
+1. **An `AUTOINC` key column**, which is what a key-enforcing index turned out to be blocked
+   behind rather than the key itself. Fifteen of the corpus's twenty-five key constraints are
+   backed by an index over one, and the index is the shape this package already maintains — the
+   refusal is on the column's field type, because nothing here knows how the engine picks the
+   next value for a row inserted without one. `testdata/Auto.abs` and `Auto-ins.abs` are the
+   start of the evidence and say a counter page is not involved; a parameterised insert against
+   the Delphi engine is what would finish it. A `DEFAULT` is a separate gap one level down
+   (`ErrColumnDefault`).
 2. **The `ALTER TABLE` rebuild**, which would retire the last deliberate divergence from the
    engine's byte output.
 3. **Encrypted writes**, which need the control block decoded first. A guess produces a file the
    engine will not open, so this starts with analysis, not code.
 
 The remaining validation gaps need the Delphi engine driven directly: evidence for a **split
-B-tree leaf** or a **second PFS page**, an **insert into a `UNIQUE` or `PRIMARY` index**, and a
-**`Bytes` value**, which needs a parameterised insert rather than DBManager's SQL tab — every
-literal form the SQL grammar offers has now been tried and refused. The fixture recipe in
-`testdata/README.md` is the route to the first three; it is what produced `Types.abs` and
-`Types2.abs` and closed the field-type gap between them.
+B-tree leaf** or a **second PFS page**, an **`AUTOINC` value the engine assigned**, and a
+**`Bytes` value** — the last two need a parameterised insert rather than DBManager's SQL tab.
+The fixture recipe in `testdata/README.md` is the route to the first two; it is what produced
+`Types.abs`, `Types2.abs` and the `Keys*.abs` family, each of which closed a gap this list used
+to carry.

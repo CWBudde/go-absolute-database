@@ -59,18 +59,34 @@ What the format still hides, and what this package therefore refuses rather than
   carrying a fraction was rejected by the parser.
 - **BZIP and PPM BLOB compression** are named by the format and unimplemented; no fixture uses
   either.
-- **What the engine does with a row a constraint forbids.** A rejected write leaves no file
-  behind, so no fixture can show it, and the two checks in `writer_constraint.go` are therefore
-  held to the narrower standard of never passing a row the constraint's own bytes forbid. Two
-  rules are assumed rather than observed, both of which can only make this package _accept_ a
-  row: a `NULL` passes a `CHECK` constraint (what SQL says, and what would otherwise make a
-  nullable `MINVALUE` column unwritable), and a bound is inclusive, so `MINVALUE 0` admits 0.
-  A parameterised insert against the Delphi engine would settle both.
-- **Whether the engine writes anything else when inserting into a `UNIQUE` or `PRIMARY` index.**
-  All four `Writes-idx*` fixtures carry a plain index, so the leaf splice for a key-enforcing one
-  has no byte identity behind it. This is why a `PRIMARY KEY` or `UNIQUE` constraint still
-  refuses every write (`ErrConstraintsNotEnforced`) even though the duplicate scan it would need
-  is straightforward: the constraint and the index that implements it have to lift together.
+- **What the engine does with a row a `NOT NULL` or `CHECK` constraint forbids.** A rejected
+  write leaves no file behind, so no fixture can show it, and the two checks in
+  `writer_constraint.go` are therefore held to the narrower standard of never passing a row the
+  constraint's own bytes forbid. Two rules are assumed rather than observed, both of which can
+  only make this package _accept_ a row: a `NULL` passes a `CHECK` constraint (what SQL says,
+  and what would otherwise make a nullable `MINVALUE` column unwritable), and a bound is
+  inclusive, so `MINVALUE 0` admits 0. A parameterised insert against the Delphi engine would
+  settle both.
+
+  The same gap for a **key** constraint is closed. Three refused statements against `Keys.abs`
+  each left the file byte-identical to its parent, transaction counter included, and the Log
+  tab named the constraint and the native error; `testdata/README.md` lists them. That is why
+  the checks run before any page is touched.
+
+- ~~**Whether the engine writes anything else when inserting into a `UNIQUE` or `PRIMARY`
+  index.**~~ Closed by the `Keys*.abs` family: it writes nothing else. Seven pairs are
+  byte-identical with no `State` exclusion, and the leaf splice is the plain index's exactly.
+  What the fixtures did change is two things nobody would have guessed — a `NULL` key sorts
+  _before_ every value, and a `UNIQUE` index treats a second `NULL` as a duplicate. See
+  [format/indexes.md](format/indexes.md#key-enforcing-indexes).
+- **Whether an `AUTOINC` column has anything a write must maintain.** This is the gap that now
+  stands between the write path and most of the private corpus: fifteen of its twenty-five key
+  constraints are backed by a single-column, single-page index over an `AUTOINC` column, whose
+  index record and leaf are the `Int32` shape exactly. `Auto-ins.abs` says there is no counter
+  page — an `AUTOINC` insert touches the same page types an `Int32`-keyed one does — but it
+  says nothing about how the engine picks the next value when a row is inserted **without**
+  one, which is the case DBManager's SQL tab exercises and a caller of this package does not.
+  Until that is settled, `describeIndex` refuses the column's field type.
 
 ## Deliberate divergences
 
@@ -81,10 +97,8 @@ Not unknowns — decisions, recorded so they can be revisited on purpose.
   rebuild needs six free pages and nothing could grow a file) has expired now that growth
   exists, and compaction has since shown object-id replay works. What remains is the work of
   reproducing the four-transaction sequence.
-- **Compaction refuses a table carrying a `PRIMARY KEY` or `UNIQUE` record**
-  (`ErrConstraintsNotRebuilt`). The column-shaped kinds are written back now; a key record's
-  `ownerObjectID` names the index implementing it, and nothing here builds a key-enforcing
-  index, so silently returning a copy that no longer enforces its own key is the outcome the
-  refusal avoids. Every constrained table in the private corpus declares a key, so this is
-  still what keeps compaction off most real tables — but the remaining gap is the index, not
-  the record.
+- **Compaction refuses a table whose key covers more than one column**, or whose key column an
+  index leaf is not built for (`ErrConstraintsNotRebuilt`). A single-column `Int32` key is
+  rebuilt now, index and all. What is left is the same two shapes index maintenance refuses,
+  which is not a coincidence: the rows are copied through that writer, so an index it would not
+  maintain could not be filled anyway.

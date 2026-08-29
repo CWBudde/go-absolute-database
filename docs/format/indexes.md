@@ -65,6 +65,34 @@ whose leftmost leaf is empty, and the BLOB-page index, whose keys are BLOB pages
 owner nothing in the file records. Neither arises for a single-table file, where every index is
 returned because there is no other table it could belong to.
 
+## Key-enforcing indexes
+
+A `PRIMARY KEY` or `UNIQUE` index is an ordinary index with two of the record's three flag
+bytes doing the work — `00 00 FF` for a primary key, `00 FF 00` for a unique one. **Its page is
+the same in every other respect**: the same 18-byte header, the same `[null flag byte] + int32`
+key, the same 11-byte stride, and the same splices on insert, delete and a key-moving update.
+An empty one is the record-page index root with `KeyPrefixSize` 5 instead of 4, which pages 20
+and 26 of `Constraints.abs` are byte-identical to page 19 but for.
+
+What differs is what the engine refuses, and it is not what SQL would say:
+
+| Statement                                   | Engine                                      |
+| ------------------------------------------- | ------------------------------------------- |
+| a key the leaf already holds                | refused; the file is left byte-identical    |
+| a `NULL` into a `PRIMARY` index             | refused, though no `NOT NULL` record exists |
+| the **first** `NULL` into a `UNIQUE` index  | accepted, null flag set                     |
+| the **second** `NULL` into a `UNIQUE` index | refused as a duplicate                      |
+
+So a `UNIQUE` index compares `NULL` keys **by value**, where SQL treats them as distinct. And a
+`NULL` key **sorts before every value**: `Keys-uniqnull.abs` stores it ahead of 10, 20 and 30,
+which comparing the flag byte as a number gets backwards. No index in the corpus held a `NULL`
+key before that file, so nothing had contradicted the wrong order.
+
+`CREATE UNIQUE INDEX` writes **two** objects, not one: the index record and a `UNIQUE`
+constraint record naming it, taking consecutive object ids. That record's name is generated
+from the covered column (`C_Unique$Alt`), and its **table name is empty** — the only empty one
+anywhere in the corpus, where a `CREATE TABLE ... UNIQUE` clause names its table.
+
 ## Capacity and splitting
 
 A single-page leaf has room for 367 entries at the measured key shape — `(4056 - 18) / 11` for
