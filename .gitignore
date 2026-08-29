@@ -83,6 +83,7 @@ testdata/*
 !testdata/Empty-p2048-e4-grow.abs
 !testdata/Empty-mc100.abs
 !testdata/Types.abs
+!testdata/Types2.abs
 !testdata/README.md
 # Safety net only, not a location. The ComponentAce SDK is not redistributable
 # and lives OUTSIDE this repository -- by convention ../absolute-database-sdk/.

@@ -3,18 +3,18 @@
 Almost everything in this directory is **deliberately not committed**. The `.abs`
 fixtures the parser is developed against are real private project data, and
 `.gitignore` excludes `testdata/*` for that reason. A fresh clone therefore has only the
-`Employees-*`, `Writes*`, `MultiTable*`, `Empty*`, `Constraints` and `Types` fixtures below, and every
+`Employees-*`, `Writes*`, `MultiTable*`, `Empty*`, `Constraints` and `Types*` fixtures below, and every
 test that needs one of the others skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
 validated against real private project files — run `just test` locally for that.
 
 ## The committed fixtures
 
-Six sets are committed, forty-one files in all: the eight `Employees-*.abs` files, one per
+Six sets are committed, forty-two files in all: the eight `Employees-*.abs` files, one per
 encryption algorithm, the fourteen `Writes*.abs` files that pin the write path, the twelve
 `MultiTable*.abs` files that pin the table catalog and the schema operations over it, the five
 `Empty*.abs` files that pin what the engine writes for a brand-new database,
-`Constraints.abs`, which isolates one column constraint or index variation per table, and
-`Types.abs`, which holds every field type the format supports.
+`Constraints.abs`, which isolates one column constraint or index variation per table, and the
+two `Types*.abs` files, which between them hold every field type the format supports.
 
 ### `Employees-*.abs` — one per encryption algorithm
 
@@ -338,6 +338,45 @@ fixtures: scanning finds only `ABS0LUTEDATABASE`, `ABSP`, the eight invented tab
 invented column names and the invented values. Unlike the `MultiTable*` files it **does** contain
 UTF-16 strings, on purpose — `TChr`'s `WIDECHAR` and `WIDESTRING` values — so that file's "no
 UTF-16 strings at all" check does not apply here.
+
+### `Types2.abs` — the two questions `Types.abs` left open
+
+`Types.abs` holds one instant in its `TIMESTAMP` column, and one instant cannot settle a layout.
+It also holds no `BYTES` value at all, because the engine rejected every literal offered for one.
+This file was written for exactly those two questions.
+
+| Table    | Holds                                                      | Settles                                  |
+| -------- | ---------------------------------------------------------- | ---------------------------------------- |
+| `TStamp` | eleven instants, each beside a `DATETIME` holding the same | that **a TimeStamp keeps only the hour** |
+| `TBin2`  | six ways of writing a `BYTES(8)` value, plus a control row | that none of them is accepted            |
+| `TVar2`  | five of the same for `VARBYTES(8)`                         | the same, and the width again            |
+| `TBlob2` | the payload `TBin2` refused, in a `BLOB` column            | that `MIMETOBIN` builds a **BLOB** value |
+
+**The TimeStamp.** Rows 1, 2 and 3 hold `01:02:03`, `01:02:04` and `01:03:03` and store
+byte-identical TimeStamps, while the `DATETIME` beside them differs in all three — so the engine
+keeps no minutes and no seconds. Rows 4 to 7 each move one of the four fields it does keep, and
+row 9's `23:59:58` stores the hour and drops the rest. The eight bytes are year, month, day and
+hour as little-endian words: the first four fields of dbExpress's `TSQLTimeStamp`, whose
+`Minute`, `Second` and `Fractions` do not fit into the eight bytes the `BftDateTime` base type
+gets. A twelfth row was meant to carry `01:02:03.456`; the engine rejected the literal, which is
+all this file says about fractional seconds.
+
+**The binary columns.** Every `B` column here is NULL, and that is the result rather than a
+failure to produce one: `MIMETOBIN` of 8, 9, 7 and 4 bytes, a plain string and a `CAST` were all
+rejected for both `BYTES(8)` and `VARBYTES(8)`. Two rows keep that from being a story about the
+statements instead of the values. `TBin2`'s row 8 was inserted as row 7 and renumbered by an
+`UPDATE`, so `UPDATE` reaches the table; and `TBlob2` holds the very payload the `BYTES` columns
+refused, which says `MIMETOBIN` yields a **BLOB** value — the parser builds it as
+`TABSExprNodeBlob` — assignable to a BLOB column and not to a fixed one. A `BYTES` value needs a
+parameterised insert, which means driving the Delphi engine rather than DBManager's SQL tab.
+
+Every column of an unknown width is followed by a `LARGEINT` sentinel, as in `Types.abs`, so the
+`BYTES(8)`/`VARBYTES(8)` widths are pinned a second time at a different column position even
+though their contents are unreachable.
+
+It contains no private data and no vendor material, checked the same way as the others: scanning
+finds only `ABS0LUTEDATABASE`, `ABSP`, the four invented table names and the invented values, and
+no UTF-16 strings at all.
 
 ## Regenerating them
 

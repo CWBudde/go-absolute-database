@@ -111,8 +111,10 @@ var unindexedFixtures = map[string]bool{
 	"Empty-p2048-e4-grow.abs": true,
 
 	// Types.abs declares no key and no index on any of its eight tables: it
-	// exists to pin field storage, and an index would only add noise.
-	"Types.abs": true,
+	// exists to pin field storage, and an index would only add noise. The
+	// same goes for Types2.abs's four.
+	"Types.abs":  true,
+	"Types2.abs": true,
 }
 
 // fixtureNames returns every testdata/*.abs in sorted order. It skips the test
