@@ -40,14 +40,16 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 
 - **One table is a special case, not the shape of the API**: a database can hold several tables, and only data pages record which one they belong to. Reads and writes are scoped through `File.Table(name)`; the no-argument `Schema`, `OpenTable` and `OpenTableWriter` are shorthand for `Table("")` and report `ErrAmbiguousTable` rather than mixing tables. Before this existed, `OpenTable` on a three-table file returned six rows for a two-row table with no error. When adding anything that scans pages by type, ask what happens with three tables in the file — the answer is usually "it silently reads someone else's".
 
-- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete within existing pages; Phase 8 adds the schema operations — `DROP TABLE` and the allocation model in `ddl.go`, `CREATE TABLE` in `ddl_create.go`, `CREATE INDEX`/`DROP INDEX` in `ddl_index.go`, and `ALTER TABLE ADD`/`DROP COLUMN` in `ddl_alter.go`. Database compaction is the one Phase 8 step still open.
+- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete, growing a table by a free page when every existing one is full, and keeping the table's user indexes in step (`writer_index.go`); Phase 8 adds the schema operations — `DROP TABLE` and the allocation model in `ddl.go`, `CREATE TABLE` in `ddl_create.go`, `CREATE INDEX`/`DROP INDEX` in `ddl_index.go`, and `ALTER TABLE ADD`/`DROP COLUMN` in `ddl_alter.go`. Database compaction is the one Phase 8 step still open.
 
 - **The engine's zlib is the C library at level 1, and `internal/zlib1` reproduces it**: every compressed internal file in the corpus — schema (type 8), table info (9), catalog (6) — is byte-identical to `zlib.compress(data, 1)`, all 48 of them, and to no other level. Go's `compress/zlib` matches none of them at any level, because its level 1 is its own fast encoder rather than zlib's `deflate_fast`. This blocked every schema operation except `DROP TABLE` until `internal/zlib1` ported zlib's level-1 path; `TestZlib1ReproducesEveryCorpusStream` re-compresses all 48 and requires each to reproduce the engine's bytes, and `testdata/zlib1` holds 37 golden vectors that pin it without any fixture. **Never write a stream the engine will read with `compress/zlib`** — it is for reading only. A writer using it produces a file that reads back correctly and is not what the engine wrote, which is exactly the failure the byte-identity tests exist to catch.
 
 - **Writes are judged byte-for-byte**: `TestWriterMatchesEngineByteForByte`,
   `TestDropTableMatchesEngineByteForByte`, `TestCreateTableMatchesEngineByteForByte` and
   `TestCreateIndexMatchesEngineByteForByte` require each operation to reproduce the file DBManager
-  itself produced for the same SQL statement. Reading a write back correctly is not sufficient
+  itself produced for the same SQL statement. That includes index maintenance: four of the
+  `Writes-idx*` pairs pin the B-tree leaf splices an insert, a delete and a key-moving update
+  perform, with **no `State` exclusion**, because maintenance allocates no page. Reading a write back correctly is not sufficient
   evidence — the engine keeps counters a naive writer would miss, and this package's own reader would
   not notice. If you change the write path, those are the tests that matter.
 
@@ -63,6 +65,19 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   stale. **Do not "fix" this into a rebuild without solving file growth first.** And every byte
   comparison excludes page `State` words, because of the next point.
 
+- **Index maintenance is deliberately narrow, and its narrowness is load-bearing**: insert, delete
+  and a key-moving update keep a **single-page index over an `Int32` column** in step, which is
+  exactly the shape `CREATE INDEX` builds. Everything else is refused with `ErrIndexNotMaintained`
+  rather than guessed at: a tree deep enough to have split, a key of another shape, and a table
+  whose schema tail `parseSchemaTail` declines to read. That last one covers **every indexed
+  customer fixture** — they all carry constraint records or multi-column indexes — so writes to
+  those tables are refused, where `Update` previously went through and silently left the index
+  describing a key the row no longer had. Two behaviours come from fixtures and must not be
+  "tidied": a removal **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), and a
+  key-moving update is a **removal followed by a sorted insertion**, not an in-place patch
+  (`Writes-idx-upd.abs`). Clearing that tail reads back correctly through this package and is not
+  what the engine wrote.
+
 - **A page's `State` is seeded randomly, so allocating a page breaks byte identity**: across the
   corpus's 663 live pages `State` is uniform in `[0, 2^30)`, and 29 groups of byte-identical page
   payloads carry different `State`s — it is neither a content hash nor a fixed sequence. This is why
@@ -74,7 +89,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   never widen an exclusion to make a test pass.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.
-- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the eleven `testdata/Writes*.abs` fixtures (the write path's ground truth) and the six `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
+- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real customer project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the fourteen `testdata/Writes*.abs` fixtures (the write path's ground truth, four of them carrying a user index) and the eight `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the customer files; run `just test` locally for that.
 - **Windows-1252 aware**: String fields use Windows-1252 encoding by default. Always decode to UTF-8.
 
 ## Formatting and Linting

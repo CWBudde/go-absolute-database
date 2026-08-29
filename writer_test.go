@@ -299,45 +299,6 @@ func TestWriterRejectsUnknownRecord(t *testing.T) {
 	}
 }
 
-// TestWriterRefusesToStrandAnIndex pins the safety rule: both fixtures carry the
-// IdxId index, and inserting or deleting a record would leave it describing a
-// different set of rows than the table holds.
-//
-// Writes-idx.abs is the unencrypted half of the pair, so the refusal is shown
-// not to depend on the file being encrypted. Its sibling Writes-idx-ins.abs is
-// what the engine produced for the insert this test refuses, and is the ground
-// truth for implementing index maintenance later.
-func TestWriterRefusesToStrandAnIndex(t *testing.T) {
-	for _, fixture := range []string{"Employees-Rijndael_128.abs", "Writes-idx.abs"} {
-		t.Run(fixture, func(t *testing.T) {
-			path := writableCopy(t, fixture)
-
-			db, err := OpenForWriteWithPassword(path, testPassword)
-			if err != nil {
-				t.Fatalf("OpenForWriteWithPassword: %v", err)
-			}
-
-			defer db.Close()
-
-			w, err := db.OpenTableWriter()
-			if err != nil {
-				t.Fatalf("OpenTableWriter: %v", err)
-			}
-
-			id, _ := firstRecord(t, db)
-
-			if err := w.Delete(id); !errors.Is(err, ErrIndexNotMaintained) {
-				t.Errorf("Delete on an indexed table: got %v, want ErrIndexNotMaintained", err)
-			}
-
-			_, err = w.Insert([]any{int32(9), "Nine", 9.0, true})
-			if !errors.Is(err, ErrIndexNotMaintained) {
-				t.Errorf("Insert on an indexed table: got %v, want ErrIndexNotMaintained", err)
-			}
-		})
-	}
-}
-
 func TestSetAndClearBit(t *testing.T) {
 	data := make([]byte, 4)
 
@@ -515,6 +476,78 @@ func TestWriterMatchesEngineByteForByte(t *testing.T) {
 					if err != nil {
 						t.Fatalf("Delete(Id=%d): %v", key, err)
 					}
+				}
+			},
+		},
+		{
+			// The four indexed cases below are the same statements against
+			// Writes-idx.abs, which carries IdxId over Id. Each pins one of the
+			// leaf splices in writer_index.go against the engine's own bytes.
+			//
+			// Byte identity is the right bar here, with no State exclusion:
+			// maintenance allocates nothing, so every page it writes already
+			// existed and carries a counter rather than a fresh random seed.
+			name:      "insert with an index, key sorts last",
+			base:      "Writes-idx.abs",
+			want:      "Writes-idx-ins.abs",
+			statement: "INSERT INTO Writes VALUES (4, 'Alan', 555.5, True) -- indexed",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				_, err := w.Insert([]any{int32(4), "Alan", 555.5, true})
+				if err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			// Id=0 sorts before every stored key, so the whole entry array
+			// shifts up by one stride. Writes-idx-ins.abs only ever appends,
+			// and so cannot tell a sorted insert from an append.
+			name:      "insert with an index, key sorts first",
+			base:      "Writes-idx.abs",
+			want:      "Writes-idx-ins0.abs",
+			statement: "INSERT INTO Writes VALUES (0, 'Zero', 1.0, True) -- indexed",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				_, err := w.Insert([]any{int32(0), "Zero", 1.0, true})
+				if err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			// Removing the middle of three entries: the tail shifts down and
+			// the slot it vacates keeps its old bytes. This is the case that
+			// proves the leaf tail is not cleared.
+			name:      "delete with an index",
+			base:      "Writes-idx.abs",
+			want:      "Writes-idx-del.abs",
+			statement: "DELETE FROM Writes WHERE Id = 2 -- indexed",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				err := w.Delete(recordWithKey(t, db, 2))
+				if err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+			},
+		},
+		{
+			// Moving an indexed column's value. The engine removes the entry
+			// and reinserts it in sorted position, leaving EntryCount alone --
+			// keys [1,2,3] become [1,3,9], not [1,9,3].
+			name:      "update an indexed column",
+			base:      "Writes-idx.abs",
+			want:      "Writes-idx-upd.abs",
+			statement: "UPDATE Writes SET Id = 9 WHERE Id = 2",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				err := w.UpdateColumn(recordWithKey(t, db, 2), 0, int32(9))
+				if err != nil {
+					t.Fatalf("UpdateColumn: %v", err)
 				}
 			},
 		},

@@ -39,16 +39,17 @@ var (
 	// ErrSlotOccupied reports an insert into a slot that already holds a record.
 	ErrSlotOccupied = errors.New("absdb: record slot is occupied")
 
-	// ErrTableFull reports that every slot of every existing data page is
-	// occupied. Growing the table by allocating a further data page is not
-	// implemented yet, so this is a hard limit rather than a transient state.
+	// ErrTableFull reports that no record slot could be found or made: every
+	// slot of every existing data page is occupied and no free page is left in
+	// the file to grow the table with. Growing a table within the file's free
+	// pages is implemented (see growTable); extending the file itself is not.
 	ErrTableFull = errors.New("absdb: no free record slot in any data page")
 
-	// ErrIndexNotMaintained reports a write that would leave one of the table's
-	// indexes out of step with its records. Inserting or deleting a record
-	// changes the set of keys an index must hold, and this package cannot
-	// update a B-tree yet, so it refuses the write instead of silently leaving
-	// a lookup structure that no longer describes the data.
+	// ErrIndexNotMaintained reports a write against an index this package will
+	// not edit, rather than one it silently leaves stale. Single-page indexes
+	// over an Int32 column are maintained (see writer_index.go); a tree deep
+	// enough to have split, a key of another shape, and a schema whose index
+	// definitions cannot be read are all refused here.
 	ErrIndexNotMaintained = errors.New("absdb: table has an index this package cannot maintain")
 
 	// ErrBlobReferenceLost reports an update that would overwrite a column
@@ -217,6 +218,12 @@ type TableWriter struct {
 	// delta counts records added (positive) or removed (negative) per data
 	// page, so that Commit can bring the engine's counters back in step.
 	delta map[int]int
+	// indexes are the table's user indexes this writer keeps in step with the
+	// records; indexesResolved and indexesErr memoise resolveIndexes, so a
+	// table this package will not index is refused identically on every write.
+	indexes         []maintainedIndex
+	indexesResolved bool
+	indexesErr      error
 	// touched counts records modified in any way — inserted, updated or
 	// deleted. The engine's change counter advances by the number of records a
 	// statement affected, not by one per transaction: a two-row UPDATE moves it
@@ -265,12 +272,15 @@ func (w *TableWriter) Schema() *TableSchema {
 // Update overwrites the record at id with values, one per column. A nil value
 // writes a NULL. The record must exist; Update never creates one.
 //
-// Unlike Insert and Delete, Update does not refuse a table that has an index:
-// an update changes no key as long as it leaves the indexed columns alone, and
-// the index format does not record which columns it covers, so this package
-// cannot tell the two cases apart. Changing an indexed column through Update
-// leaves that index pointing at the old key. Until index maintenance exists,
-// avoiding that is the caller's responsibility.
+// An update that moves an indexed column's value moves that index entry with
+// it, as a removal followed by a sorted insertion — what Writes-idx-upd.abs
+// shows the engine doing. An update that leaves every indexed column alone
+// writes no index page at all, so it does not advance a State counter for a
+// page whose contents did not change.
+//
+// This is what the index caveat here used to warn about: before the covered
+// column could be read out of the schema stream, Update went through and left
+// the index describing a key the row no longer had.
 func (w *TableWriter) Update(id RecordID, values []any) error {
 	rec, err := w.r.encodeRecord(values)
 	if err != nil {
@@ -282,14 +292,15 @@ func (w *TableWriter) Update(id RecordID, values []any) error {
 		return err
 	}
 
-	return w.storeRecord(buf, start, rec)
+	return w.storeRecordReindexing(id, buf, start, rec)
 }
 
 // UpdateColumn overwrites a single column of an existing record, leaving every
 // other column byte-for-byte as it was. It is the narrowest write this package
 // offers, and the only one that cannot disturb a column it was not asked about.
 //
-// It carries the same index caveat as Update.
+// It maintains indexes exactly as Update does, so updating an indexed column
+// through it moves that index entry too.
 func (w *TableWriter) UpdateColumn(id RecordID, col int, value any) error {
 	buf, start, err := w.slot(id, true)
 	if err != nil {
@@ -304,7 +315,7 @@ func (w *TableWriter) UpdateColumn(id RecordID, col int, value any) error {
 		return err
 	}
 
-	return w.storeRecord(buf, start, rec)
+	return w.storeRecordReindexing(id, buf, start, rec)
 }
 
 // Insert stores a new record in the first free slot of the first data page that
@@ -316,7 +327,14 @@ func (w *TableWriter) Insert(values []any) (RecordID, error) {
 		return RecordID{}, err
 	}
 
-	err = w.checkIndexes()
+	indexes, err := w.maintainedIndexes()
+	if err != nil {
+		return RecordID{}, err
+	}
+
+	// Both refusals happen before the record is written, so an insert that
+	// cannot be indexed leaves no row behind that no index describes.
+	err = w.indexRoom(indexes)
 	if err != nil {
 		return RecordID{}, err
 	}
@@ -342,6 +360,11 @@ func (w *TableWriter) Insert(values []any) (RecordID, error) {
 	w.delta[id.PageNo]++
 	w.touched++
 
+	err = w.indexInsert(indexes, id)
+	if err != nil {
+		return RecordID{}, err
+	}
+
 	return id, nil
 }
 
@@ -349,12 +372,17 @@ func (w *TableWriter) Insert(values []any) (RecordID, error) {
 // bytes are left in place, which is what the engine itself does: the slot is
 // free, and the next insert overwrites as much of it as the new record needs.
 func (w *TableWriter) Delete(id RecordID) error {
-	err := w.checkIndexes()
+	indexes, err := w.maintainedIndexes()
 	if err != nil {
 		return err
 	}
 
 	buf, _, err := w.slot(id, true)
+	if err != nil {
+		return err
+	}
+
+	err = w.indexRemove(indexes, id)
 	if err != nil {
 		return err
 	}
@@ -456,21 +484,31 @@ func (w *TableWriter) modified() bool {
 	return false
 }
 
-// storeRecord writes an encoded record over an existing one, after checking
-// that doing so does not strand a BLOB.
-func (w *TableWriter) storeRecord(buf *pageWriteBuf, start int, rec []byte) error {
+// validateStore is the half of storeRecord that can refuse: the record is the
+// right size and overwriting it strands no BLOB.
+//
+// It is split out so that storeRecordReindexing can run it before it resolves
+// the table's indexes. Both are refusals, and the record-level one is the more
+// specific: a table whose index this package will not maintain and whose update
+// would also drop a BLOB reference should report the BLOB, which names the
+// column at fault.
+func (w *TableWriter) validateStore(buf *pageWriteBuf, start int, rec []byte) error {
 	if len(rec) != w.r.recordSize {
 		return fmt.Errorf("%w: record is %d bytes, want %d", ErrRecordSize, len(rec), w.r.recordSize)
 	}
 
-	old := buf.payload[start : start+w.r.recordSize]
+	return w.checkBlobReferences(buf.payload[start:start+w.r.recordSize], rec)
+}
 
-	err := w.checkBlobReferences(old, rec)
+// storeRecord writes an encoded record over an existing one, after checking
+// that doing so does not strand a BLOB.
+func (w *TableWriter) storeRecord(buf *pageWriteBuf, start int, rec []byte) error {
+	err := w.validateStore(buf, start, rec)
 	if err != nil {
 		return err
 	}
 
-	copy(old, rec)
+	copy(buf.payload[start:start+w.r.recordSize], rec)
 
 	buf.dirty = true
 	w.touched++
@@ -766,26 +804,6 @@ func (w *TableWriter) appendRecordPageEntry(pageNo int) error {
 	// bumped along with every other page this transaction touched; this write
 	// is otherwise identical and costs one redundant page write.
 	return w.db.writePageBuf(buf)
-}
-
-// checkIndexes refuses writes that would change the set of keys an index has to
-// hold. An update leaves that set alone as long as it does not change an
-// indexed column, which is why Update and UpdateColumn do not call this.
-func (w *TableWriter) checkIndexes() error {
-	ir, err := w.r.table.OpenIndex()
-	if err != nil {
-		if errors.Is(err, ErrNoIndex) {
-			return nil
-		}
-
-		return err
-	}
-
-	if len(ir.UserIndexes()) > 0 {
-		return ErrIndexNotMaintained
-	}
-
-	return nil
 }
 
 // updateTableInfo brings the engine's own counters back in step with what this

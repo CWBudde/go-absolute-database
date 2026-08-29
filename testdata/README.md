@@ -10,7 +10,7 @@ validated against real customer files — run `just test` locally for that.
 ## The committed fixtures
 
 Three sets are committed: the eight `Employees-*.abs` files, one per encryption algorithm,
-the eleven `Writes*.abs` files that pin the write path, and the eight `MultiTable*.abs` files
+the fourteen `Writes*.abs` files that pin the write path, and the eight `MultiTable*.abs` files
 that pin the table catalog and the schema operations over it.
 
 ### `Employees-*.abs` — one per encryption algorithm
@@ -74,29 +74,33 @@ against the B-tree leaf scan in `oracle_test.go`.
 
 ### `Writes*.abs` — the write path's ground truth
 
-Eleven unencrypted files that differ from one another by exactly one SQL statement. Each was
+Fourteen unencrypted files that differ from one another by exactly one SQL statement. Each was
 made by copying its predecessor and running that single statement in the Absolute Database
 Manager, so a byte diff between a file and its parent shows precisely what the engine
 changes for that operation — and nothing else.
 
-| File                 | Made from         | Statement                                         | Rows |
-| -------------------- | ----------------- | ------------------------------------------------- | ---- |
-| `Writes.abs`         | created fresh     | `CREATE TABLE` + three `INSERT`s, **no index**    | 3    |
-| `Writes-ins1.abs`    | `Writes.abs`      | `INSERT INTO Writes VALUES (4,'Alan',555.5,True)` | 4    |
-| `Writes-ins2.abs`    | `Writes-ins1.abs` | `INSERT ... (5,'Emmy',777.25,False)`              | 5    |
-| `Writes-upd.abs`     | `Writes.abs`      | `UPDATE Writes SET Salary = 1.5 WHERE Id = 2`     | 3    |
-| `Writes-updname.abs` | `Writes.abs`      | `UPDATE Writes SET Name = 'Grazia' WHERE Id = 2`  | 3    |
-| `Writes-upd2.abs`    | `Writes.abs`      | `UPDATE Writes SET Salary = 3.25 WHERE Id < 3`    | 3    |
-| `Writes-del.abs`     | `Writes.abs`      | `DELETE FROM Writes WHERE Id = 2`                 | 2    |
-| `Writes-del2.abs`    | `Writes.abs`      | `DELETE FROM Writes WHERE Id < 3`                 | 1    |
-| `Writes-delins.abs`  | `Writes-del.abs`  | `INSERT ... (6,'Rosa',42.0,True)`                 | 3    |
-| `Writes-idx.abs`     | created fresh     | as `Writes.abs` **plus** `CREATE INDEX IdxId`     | 3    |
-| `Writes-idx-ins.abs` | `Writes-idx.abs`  | `INSERT ... (4,'Alan',555.5,True)` **with** index | 4    |
+| File                  | Made from         | Statement                                         | Rows |
+| --------------------- | ----------------- | ------------------------------------------------- | ---- |
+| `Writes.abs`          | created fresh     | `CREATE TABLE` + three `INSERT`s, **no index**    | 3    |
+| `Writes-ins1.abs`     | `Writes.abs`      | `INSERT INTO Writes VALUES (4,'Alan',555.5,True)` | 4    |
+| `Writes-ins2.abs`     | `Writes-ins1.abs` | `INSERT ... (5,'Emmy',777.25,False)`              | 5    |
+| `Writes-upd.abs`      | `Writes.abs`      | `UPDATE Writes SET Salary = 1.5 WHERE Id = 2`     | 3    |
+| `Writes-updname.abs`  | `Writes.abs`      | `UPDATE Writes SET Name = 'Grazia' WHERE Id = 2`  | 3    |
+| `Writes-upd2.abs`     | `Writes.abs`      | `UPDATE Writes SET Salary = 3.25 WHERE Id < 3`    | 3    |
+| `Writes-del.abs`      | `Writes.abs`      | `DELETE FROM Writes WHERE Id = 2`                 | 2    |
+| `Writes-del2.abs`     | `Writes.abs`      | `DELETE FROM Writes WHERE Id < 3`                 | 1    |
+| `Writes-delins.abs`   | `Writes-del.abs`  | `INSERT ... (6,'Rosa',42.0,True)`                 | 3    |
+| `Writes-idx.abs`      | created fresh     | as `Writes.abs` **plus** `CREATE INDEX IdxId`     | 3    |
+| `Writes-idx-ins.abs`  | `Writes-idx.abs`  | `INSERT ... (4,'Alan',555.5,True)` **with** index | 4    |
+| `Writes-idx-ins0.abs` | `Writes-idx.abs`  | `INSERT ... (0,'Zero',1.0,True)` **with** index   | 4    |
+| `Writes-idx-del.abs`  | `Writes-idx.abs`  | `DELETE FROM Writes WHERE Id = 2` **with** index  | 2    |
+| `Writes-idx-upd.abs`  | `Writes-idx.abs`  | `UPDATE Writes SET Id = 9 WHERE Id = 2`           | 3    |
 
 The table is `Writes` — `Id` INTEGER, `Name` VARCHAR(20), `Salary` FLOAT, `Active`
-BOOLEAN — with the same three rows as `Employees`, no password and, deliberately, **no
-index**: this package refuses to insert into or delete from an indexed table, because it
-cannot yet maintain a B-tree. `oracle_test.go` names them in `unindexedFixtures` so its
+BOOLEAN — with the same three rows as `Employees` and no password. The first nine files
+deliberately carry **no index**, dating from when this package refused to write to an
+indexed table at all; the five `Writes-idx*` files do, and are what hold index maintenance
+to the engine's bytes. `oracle_test.go` names them in `unindexedFixtures` so its
 leaf-scan cross-check skips them by name rather than falling back to a silent skip for any
 index-less file.
 
@@ -107,11 +111,13 @@ single-row case moves the table's change counter by one, which cannot distinguis
 transactions from counting records. The two-row cases move it by two, and without them the
 writer would have been wrong for every multi-row transaction.
 
-The last two are the odd pair out: they _do_ carry a user index, so this package refuses
-to insert into them (`TestWriterRefusesToStrandAnIndex` pins that). They are committed
-because `Writes-idx-ins.abs` is exactly what the engine produces for the insert that is
-currently refused, and so is the ground truth for implementing index maintenance — see
-PLAN.md, Phase 7.
+The last four all carry the `IdxId` user index, and together they are the ground truth for
+index maintenance (`writer_index.go`). Each pins one splice of the B-tree leaf against the
+engine's own bytes: `-idx-ins` a key that sorts last, `-idx-ins0` one that sorts first,
+`-idx-del` the removal of the middle entry, and `-idx-upd` an update that moves an indexed
+column's value. `-idx-del` is the one that changed an implementation: it shows the engine
+leaving the vacated entry's bytes in place rather than clearing them, which no amount of
+reading would have suggested.
 
 They contain no customer data and no vendor material, checked the same way as the
 `Employees-*` files: scanning each one finds only `ABS0LUTEDATABASE`, `ABSP`, the table
@@ -172,7 +178,7 @@ in the catalog reads the wrong pages, and these numbers make that fail loudly.
 They earned their place immediately. Before them, `OpenTable()` on `MultiTable.abs`
 returned **six rows for a two-row table** — four of them other tables' bytes decoded
 through Alpha's schema — with no error. They also exposed a bug in the _write_ path that
-the eleven `Writes*` fixtures structurally could not: the table info counters were read at
+the `Writes*` fixtures structurally could not: the table info counters were read at
 fixed offsets that are correct only for a four-column table, and every write fixture has
 four columns. See PLAN.md, Phase 7.
 

@@ -1442,10 +1442,13 @@ than overwritten.
       transaction that changed nothing does not advance any `State` counter
 - [x] Test: insert, update, delete records; verify with read-back **and** against the
       engine's own bytes
-- [ ] Append a new data page when every existing one is full — currently `ErrTableFull`
-- [ ] Maintain user indexes, so that insert and delete are not refused on an indexed table
+- [x] Append a new data page when every existing one is full — done by `growTable`
+      (`writer.go`), which takes a free page through the same allocator the schema
+      operations use. `ErrTableFull` now means the file has no free page left either;
+      extending the file itself is the separate growth box in Phase 8.
+- [x] Maintain user indexes, so that insert and delete are not refused on an indexed table
 
-### What a user index insert costs — measured, not yet implemented
+### What a user index write costs — measured, and implemented
 
 `Writes-idx.abs` → `Writes-idx-ins.abs` is the same `INSERT` run against a table that also
 carries `CREATE INDEX IdxId ON Writes (Id)`. It changes the eight bytes an unindexed insert
@@ -1461,11 +1464,43 @@ The leaf entry stride is `KeyPrefixSize + 6` = 11 for this `primaryKeySize` inde
 _i_ starts at `btreeHeaderSize + 11i`; the new entry is number 3, at 51. Only three of its
 eleven bytes differ from the file because the rest of the slot was already zero.
 
-The inserted key sorted last, so nothing had to move. That is the easy case and the only
-one there is evidence for: **an insert whose key sorts into the middle, and one into a full
-leaf that has to split, are not covered by any fixture**, which is why index maintenance is
-still refused rather than half-implemented. Producing those two fixtures is the first step
-of the work, not an afterthought to it.
+The inserted key sorted last, so nothing had to move — the easy case, and for a long time
+the only one there was evidence for. Three more fixtures were made under DBManager against
+the same `Writes-idx.abs` and close that gap:
+
+| Fixture               | Statement                        | What it pins                                        |
+| --------------------- | -------------------------------- | --------------------------------------------------- |
+| `Writes-idx-ins0.abs` | `INSERT ... (0,'Zero',1.0,T)`    | a key sorting **first**: the whole array shifts up  |
+| `Writes-idx-del.abs`  | `DELETE WHERE Id = 2`            | removing the **middle** entry: the tail shifts down |
+| `Writes-idx-upd.abs`  | `UPDATE SET Id = 9 WHERE Id = 2` | moving an indexed column's value                    |
+
+Each costs the same eight bytes its unindexed twin costs, plus a handful on the index page,
+and each settled something that could not have been derived:
+
+- **A removal does not clear the slot it vacates.** `Writes-idx-del.abs` changes exactly
+  four bytes of the index page: `State`, `EntryCount` 3 → 2, and entry 1's key and
+  `ItemNo`, which take entry 2's values. Entry 2's own eleven bytes at offsets 40–50 are
+  **left exactly as they were**, a stale copy sitting past the new end. Clearing that tail
+  is the obvious implementation and misses byte identity by eleven bytes. It is the same
+  never-tidy-up habit `DROP TABLE` shows in the catalog, and the same one the engine shows
+  by leaving a deleted record's bytes in its slot.
+- **An update of an indexed column is a removal followed by a sorted insertion.**
+  `Writes-idx-upd.abs` leaves `EntryCount` at 3 and turns the keys `[1,2,3]` into
+  `[1,3,9]` — not `[1,9,3]`, which is what patching the key in place would have given.
+  The table info page's record count is untouched and only its change counter moves, so an
+  update is still an update as far as the counters are concerned.
+
+`writer_index.go` implements all four splices, and all four are byte-identical to the
+engine's files with **no `State` exclusion at all**: maintenance allocates no page, so
+every page it writes already existed and carries a counter rather than a fresh random seed.
+
+What is still refused, because nothing pins it: a tree deep enough to have **split**
+(no fixture reaches a second level — the leaf holds 367 entries and no corpus table is
+close), a key that is not the 1-null-flag-byte-plus-`int32` shape, and a table whose schema
+tail `parseSchemaTail` declines to read. That last one is not a corner case: **every**
+indexed customer fixture lands there, because they all carry constraint records or
+multi-column indexes. Writes to those tables are now refused where `Update` previously went
+through and silently left the index describing a key the row no longer had.
 
 Also worth recording, and **a correction to what this section used to say**: an index's
 name _is_ stored. `Writes-idx.abs` holds `IdxId`, and `MultiTable.abs` holds `IdxAlphaId`,

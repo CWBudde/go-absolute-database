@@ -63,6 +63,9 @@ var oracleRowCounts = map[string]int{
 	"Writes-updname.abs":         3,
 	"Writes-idx.abs":             3,
 	"Writes-idx-ins.abs":         4,
+	"Writes-idx-ins0.abs":        4,
+	"Writes-idx-del.abs":         2,
+	"Writes-idx-upd.abs":         3,
 	"Writes-upd2.abs":            3,
 	"Writes-del2.abs":            1,
 	"Writes-del.abs":             2,
@@ -70,9 +73,11 @@ var oracleRowCounts = map[string]int{
 }
 
 // unindexedFixtures are the fixtures with no user index to cross-check
-// against. Most were deliberately created without one, because this package
-// refuses to insert into or delete from an indexed table (see
-// ErrIndexNotMaintained) and the write tests need a table it will accept.
+// against. Most were deliberately created without one, from a time when this
+// package refused to insert into or delete from an indexed table at all and the
+// write tests needed a table it would accept. Single-page Int32 indexes are
+// maintained now (writer_index.go), and the Writes-idx* files are the pairs
+// that pin it, so they are deliberately absent from this list.
 // MultiTable-dropfirst.abs is the exception: its index was dropped along with
 // Alpha, the only table that carried one. They are named here rather than
 // detected, so that an index silently disappearing from any other fixture still

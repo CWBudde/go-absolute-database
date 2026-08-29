@@ -57,6 +57,9 @@ testdata/*
 !testdata/Writes-updname.abs
 !testdata/Writes-idx.abs
 !testdata/Writes-idx-ins.abs
+!testdata/Writes-idx-ins0.abs
+!testdata/Writes-idx-del.abs
+!testdata/Writes-idx-upd.abs
 !testdata/Writes-upd2.abs
 !testdata/Writes-del2.abs
 !testdata/Writes-del.abs
