@@ -39,10 +39,10 @@ func synthUint32(v uint32) []byte {
 	return b
 }
 
-// synthCurrency encodes a Currency column, which stores a Delphi Currency:
-// an int64 scaled by 10000, not a float.
+// synthCurrency encodes a Currency column, which the engine stores as an
+// 8-byte IEEE-754 double rather than as a scaled int64.
 func synthCurrency(v float64) []byte {
-	return synthInt64(int64(math.Round(v * currencyScale)))
+	return synthDouble(v)
 }
 
 // synthDate encodes a Date column: an int32 count of days with 0001-01-01 as
@@ -101,10 +101,7 @@ type typeCase struct {
 func TestSyntheticEveryReadableType(t *testing.T) {
 	date := time.Date(2026, 8, 29, 0, 0, 0, 0, time.UTC)
 	stamp := time.Date(2019, 3, 7, 1, 2, 3, 0, time.UTC)
-	guid := []byte{
-		0x40, 0xfc, 0x29, 0x6b, 0x47, 0xca, 0x67, 0x10,
-		0xb3, 0x1d, 0x00, 0xdd, 0x01, 0x06, 0x62, 0xda,
-	}
+	guid := synthString(t, "{6B29FC40-CA47-1067-B31D-00DD010662DA}", guidTextSize)
 
 	cases := []typeCase{
 		{
@@ -143,19 +140,19 @@ func TestSyntheticEveryReadableType(t *testing.T) {
 			check:  wantInt64(math.MaxInt64),
 		},
 		{
-			// Currency reads two ways: Int64 gives the raw scaled value and
-			// Float divides it, which is the contract Record.Int64 documents.
+			// Currency stores a double, so Float reads it and Int64 -- which
+			// only handles integer columns -- reports 0.
 			column: synthColumn{"FCurrency", BftCurrency, FieldCurrency, 0},
 			stored: synthCurrency(8765.4321),
 			check: func(t *testing.T, rec Record, col int) {
 				t.Helper()
 
-				if got, want := rec.Int64(col), int64(87654321); got != want {
-					t.Errorf("Int64() = %d, want %d", got, want)
+				if got, want := rec.Float(col), 8765.4321; got != want {
+					t.Errorf("Float() = %v, want %v", got, want)
 				}
 
-				if got, want := rec.Float(col), 8765.4321; math.Abs(got-want) > 1e-9 {
-					t.Errorf("Float() = %v, want %v", got, want)
+				if got := rec.Int64(col); got != 0 {
+					t.Errorf("Int64() on a Currency column = %d, want 0", got)
 				}
 			},
 		},
@@ -216,21 +213,23 @@ func TestSyntheticEveryReadableType(t *testing.T) {
 			check:  wantTime(stamp),
 		},
 		{
+			// A Bytes column stores one byte more than its declared size, so
+			// the accessor hands back nine bytes for a BYTES(8).
 			column: synthColumn{"FBytes", BftBytes, FieldBytes, 8},
-			stored: synthBytes([]byte{0xDE, 0xAD, 0xC0, 0xDE, 0, 0x11, 0x22, 0x33}, 8),
+			stored: synthBytes([]byte{0xDE, 0xAD, 0xC0, 0xDE, 0, 0x11, 0x22, 0x33}, 9),
 			check: func(t *testing.T, rec Record, col int) {
 				t.Helper()
 
-				want := []byte{0xDE, 0xAD, 0xC0, 0xDE, 0, 0x11, 0x22, 0x33}
+				want := []byte{0xDE, 0xAD, 0xC0, 0xDE, 0, 0x11, 0x22, 0x33, 0}
 				if got := rec.Bytes(col); !bytes.Equal(got, want) {
 					t.Errorf("Bytes() = % x, want % x", got, want)
 				}
 			},
 		},
 		{
-			// A GUID column and the Bytes column above share a base type, so
-			// this only reads as a GUID because of its FieldType.
-			column: synthColumn{"FGUID", BftBytes, FieldGUID, guidSize},
+			// A GUID column stores Char text, so this only reads as a GUID
+			// rather than as a plain string because of its FieldType.
+			column: synthColumn{"FGUID", BftChar, FieldGUID, guidTextSize},
 			stored: guid,
 			check: func(t *testing.T, rec Record, col int) {
 				t.Helper()

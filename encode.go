@@ -72,11 +72,11 @@ var (
 
 	// ErrColumnNotWritable is returned for a column whose storage this package
 	// can read but not write: Extended (80-bit float, which Go has no type
-	// for), VarBytes (no fixture contains one, so its length prefix is
-	// unverified and writing it would be guesswork) and GUID (read-only for
-	// the same reason -- no fixture pins the stored width, and a GUID column
-	// shares its base type with a byte array, so writing one through the
-	// BftBytes path would store whatever length it was handed).
+	// for) and TimeStamp, which shares BftDateTime's base type but stores some
+	// other layout that no fixture has decoded -- writing it as a DateTime
+	// would silently record a different instant. A GUID column is writable:
+	// it stores Char, and its text goes through the string path like any
+	// other fixed string.
 	ErrColumnNotWritable = errors.New("absdb: column type cannot be written yet")
 )
 
@@ -226,11 +226,10 @@ func setNullFlag(flags []byte, col int, null bool) {
 // encodeField writes a non-nil value into the column's field bytes. field is
 // exactly fieldStoreSize(c) bytes and is fully overwritten.
 func encodeField(c Column, field []byte, v any) error {
-	// A GUID is stored under a byte-array base type, so without this it would
-	// fall into the BftBytes arm and be written as raw bytes of whatever
-	// length the caller passed. Refusing is the read-only position the
-	// accessor takes, made explicit on the way out.
-	if c.FieldType == FieldGUID {
+	// A TimeStamp shares BftDateTime's base type and not its layout, so the
+	// BftDateTime arm below would write a value the engine reads as some
+	// other instant. Its own layout is undecoded; see docs/format/records.md.
+	if c.FieldType == FieldTimeStamp {
 		return fmt.Errorf("%w: %s", ErrColumnNotWritable, c.FieldType)
 	}
 
@@ -248,7 +247,9 @@ func encodeField(c Column, field []byte, v any) error {
 	case BftDate, BftTime, BftDateTime:
 		return encodeTime(c.BaseType, field, v)
 	case BftBytes:
-		return encodeBytes(field, v)
+		// The field is one byte wider than the column's declared size, so the
+		// bound is the size rather than the storage.
+		return encodeBytes(field, v, int(c.Size))
 	}
 
 	width, signed, ok := integerStorage(c)
@@ -286,34 +287,23 @@ func encodeInteger(field []byte, v any, width int, signed bool) error {
 	return nil
 }
 
-// encodeCurrency writes a Delphi Currency, an int64 scaled by 10000. An
-// integer value is the raw scaled value, matching Record.Int64; a float value
-// is the decimal amount, matching Record.Float, and must be an exact multiple
-// of 1/10000.
+// encodeCurrency writes a Currency column, which the engine stores as an
+// 8-byte IEEE-754 double rather than as the scaled int64 a Delphi Currency is
+// in memory (Types.abs's TReal.R4; ABSTypes.hpp typedefs TABSCurrency to
+// double). An integer value is taken as the amount, not as a scaled one.
 func encodeCurrency(field []byte, v any) error {
-	if _, isInt, _ := integerValue(v); isInt {
-		return encodeInteger(field, v, 8, true)
-	}
-
 	f, ok := floatValue(v)
 	if !ok {
-		return fmt.Errorf("%w: %T is neither an integer nor a float", ErrValueType, v)
+		if n, isInt, _ := integerValue(v); isInt {
+			f = float64(n)
+		} else {
+			return fmt.Errorf("%w: %T is neither an integer nor a float", ErrValueType, v)
+		}
 	}
 
-	scaled := f * currencyScale
+	binary.LittleEndian.PutUint64(field[:8], math.Float64bits(f))
 
-	rounded := math.Round(scaled)
-	if math.IsNaN(scaled) || math.Abs(scaled) >= math.MaxInt64 {
-		return fmt.Errorf("%w: %v outside the Currency range", ErrValueRange, f)
-	}
-
-	// Rounding only absorbs the error of the multiplication itself; a value
-	// with a fifth decimal is refused rather than quietly rounded away.
-	if math.Abs(scaled-rounded) > 1e-6 {
-		return fmt.Errorf("%w: %v is not a multiple of 0.0001", ErrValueRange, f)
-	}
-
-	return encodeInteger(field, int64(rounded), 8, true)
+	return nil
 }
 
 // encodeFloat writes a Single (4 bytes) or Double (8 bytes) IEEE-754 value. A
@@ -475,14 +465,14 @@ func encodeTime(base BaseFieldType, field []byte, v any) error {
 
 // encodeBytes writes a fixed-width Bytes column: the value is copied in and the
 // rest of the field is zeroed, so Record.Bytes reads the same field back.
-func encodeBytes(field []byte, v any) error {
+func encodeBytes(field []byte, v any, size int) error {
 	b, ok := v.([]byte)
 	if !ok {
 		return fmt.Errorf("%w: %T is not a []byte", ErrValueType, v)
 	}
 
-	if len(b) > len(field) {
-		return fmt.Errorf("%w: %d bytes in a %d-byte column", ErrValueRange, len(b), len(field))
+	if len(b) > size {
+		return fmt.Errorf("%w: %d bytes in a %d-byte column", ErrValueRange, len(b), size)
 	}
 
 	clear(field)

@@ -835,18 +835,20 @@ func decodeRowValues(cols []Column, rec Record) ([]any, error) {
 // before rewriteDataPages runs; anything else unlisted (Extended, VarBytes)
 // is exactly what writer.go's ErrColumnNotWritable already names.
 func decodeColumnValue(c Column, rec Record, col int) (any, error) {
-	// Mirrors encodeField's refusal: a GUID would otherwise decode through
-	// the BftBytes arm and re-encode as plain bytes, so an ALTER on a table
-	// carrying one has to stop here rather than rewrite the column.
-	if c.FieldType == FieldGUID {
+	// A TimeStamp shares BftDateTime's base type but not its layout, so
+	// Record.Time reads it wrongly and re-encoding what it returns would
+	// rewrite the column with a different value.
+	if c.FieldType == FieldTimeStamp {
 		return nil, fmt.Errorf("%w: column %q (%s)", ErrColumnNotWritable, c.Name, c.FieldType)
 	}
 
 	switch c.BaseType {
-	case BftInt8, BftUint8, BftInt16, BftUint16, BftInt32, BftUint32, BftInt64, BftCurrency:
-		// Record.Int64 sign-extends per column width and reads the Currency
-		// column's raw scaled value, which encodeCurrency's integer branch
-		// writes back byte for byte.
+	case BftCurrency:
+		// Currency stores a double, so it round-trips through Float rather
+		// than through the integer arm below.
+		return rec.Float(col), nil
+	case BftInt8, BftUint8, BftInt16, BftUint16, BftInt32, BftUint32, BftInt64:
+		// Record.Int64 sign-extends per column width.
 		return rec.Int64(col), nil
 	case BftSingle, BftDouble:
 		return rec.Float(col), nil

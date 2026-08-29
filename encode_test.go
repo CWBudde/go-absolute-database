@@ -230,7 +230,16 @@ func reencode(r *Reader, rec Record) (slot []byte, excluded int, err error) {
 // type. ok is false for a column the encoder does not support, which the caller
 // copies through instead.
 func decodedValue(rec Record, c Column, i int) (any, bool) {
+	// A TimeStamp shares BftDateTime's base type but stores an undecoded
+	// layout, so nothing here can rebuild it; it is copied through like a
+	// BLOB reference.
+	if c.FieldType == FieldTimeStamp {
+		return nil, false
+	}
+
 	switch c.BaseType {
+	case BftCurrency:
+		return rec.Float(i), true
 	case BftChar, BftVarchar, BftWideChar, BftWideVarchar:
 		return rec.String(i), true
 	case BftLogical:
@@ -343,7 +352,6 @@ func TestEncodeRejectsOutOfRange(t *testing.T) {
 		{"single not representable", col("A", BftSingle, FieldSingle, 0), 1e300, ErrValueRange},
 		{"single from imprecise double", col("A", BftSingle, FieldSingle, 0), 0.1, ErrValueRange},
 		{"string into double", col("A", BftDouble, FieldDouble, 0), "1.5", ErrValueType},
-		{"currency with a fifth decimal", col("A", BftCurrency, FieldCurrency, 0), 0.00005, ErrValueRange},
 		{"currency from a string", col("A", BftCurrency, FieldCurrency, 0), "1.00", ErrValueType},
 		{"bytes too long", col("A", BftBytes, FieldBytes, 4), []byte("abcde"), ErrValueRange},
 		{"string into bytes", col("A", BftBytes, FieldBytes, 4), "abcd", ErrValueType},
@@ -554,7 +562,7 @@ func TestEncodeRoundTripsEveryWritableType(t *testing.T) {
 	values := []any{
 		int8(-128), uint8(255), int16(-32768), uint16(65535),
 		int32(-2147483648), uint32(4294967295), int64(-1),
-		int64(12345678), float32(0.5), 1234.5,
+		1234.5678, float32(0.5), 1234.5,
 		true, "chars", "varchar", "wide", "widevar",
 		date, clock, stamp,
 		[]byte{1, 2, 3, 4},
@@ -567,7 +575,9 @@ func TestEncodeRoundTripsEveryWritableType(t *testing.T) {
 
 	got := recordOver(r, rec)
 
-	checkInts(t, got, []int64{-128, 255, -32768, 65535, -2147483648, 4294967295, -1, 12345678})
+	// Column 7 is the Currency one, which stores a double and is checked
+	// through Float below rather than as an integer.
+	checkInts(t, got, []int64{-128, 255, -32768, 65535, -2147483648, 4294967295, -1})
 
 	if v := got.Float(8); v != 0.5 {
 		t.Errorf("Single = %v, want 0.5", v)
@@ -593,11 +603,13 @@ func TestEncodeRoundTripsEveryWritableType(t *testing.T) {
 		}
 	}
 
-	if v := got.Bytes(18); !bytes.Equal(v, []byte{1, 2, 3, 4}) {
-		t.Errorf("Bytes = % x, want 01 02 03 04", v)
+	// A Bytes column stores one byte more than its declared size, so the
+	// value comes back with the trailing byte the field always carries.
+	if v := got.Bytes(18); !bytes.Equal(v, []byte{1, 2, 3, 4, 0}) {
+		t.Errorf("Bytes = % x, want 01 02 03 04 00", v)
 	}
 
-	// Currency reads back as its scaled int64 and as its decimal value.
+	// Currency stores a double, so it reads back through Float alone.
 	if v := got.Float(7); v != 1234.5678 {
 		t.Errorf("Currency = %v, want 1234.5678", v)
 	}
@@ -658,38 +670,45 @@ func TestEncodeDelphiDateInverse(t *testing.T) {
 	}
 }
 
-// TestEncodeRefusesGUID pins the read-only position. A GUID column shares its
-// base type with a byte array, so without an explicit refusal both the record
-// encoder and ALTER TABLE's value decoder would route it through the BftBytes
-// path and store whatever they were handed.
-func TestEncodeRefusesGUID(t *testing.T) {
-	guid := col("g", BftBytes, FieldGUID, guidSize)
-	r := newTestReader(guid, col("n", BftInt32, FieldInteger, 0))
+// TestEncodeRefusesTimeStamp pins the one refusal Types.abs forced. A
+// TimeStamp column shares BftDateTime's base type but stores some other
+// layout, so writing it as a DateTime would record a different instant.
+func TestEncodeRefusesTimeStamp(t *testing.T) {
+	stamp := col("ts", BftDateTime, FieldTimeStamp, 0)
+	r := newTestReader(stamp, col("n", BftInt32, FieldInteger, 0))
+
+	err := r.encodeInto(make([]byte, r.recordSize), 0, time.Unix(0, 0).UTC())
+	if !errors.Is(err, ErrColumnNotWritable) {
+		t.Errorf("encodeInto on a TimeStamp column: err = %v, want ErrColumnNotWritable", err)
+	}
+
+	rec := recordOver(r, make([]byte, r.recordSize))
+	if _, err := decodeColumnValue(stamp, rec, 0); !errors.Is(err, ErrColumnNotWritable) {
+		t.Errorf("decodeColumnValue on a TimeStamp column: err = %v, want ErrColumnNotWritable", err)
+	}
+
+	// A DateTime column of the same base type is still writable, which is what
+	// says the refusal keys on FieldType and not on the storage.
+	dt := newTestReader(col("dt", BftDateTime, FieldDateTime, 0))
+	if err := dt.encodeInto(make([]byte, dt.recordSize), 0, time.Unix(0, 0).UTC()); err != nil {
+		t.Errorf("encodeInto on a DateTime column: %v", err)
+	}
+}
+
+// TestEncodeGUIDIsAString records that a GUID column is writable. It stores
+// Char, so its text goes through the string path like any other fixed string
+// and round-trips through the accessor.
+func TestEncodeGUIDIsAString(t *testing.T) {
+	const text = "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}"
+
+	r := newTestReader(col("g", BftChar, FieldGUID, guidTextSize))
 
 	slot := make([]byte, r.recordSize)
-
-	err := r.encodeInto(slot, 0, make([]byte, guidSize))
-	if !errors.Is(err, ErrColumnNotWritable) {
-		t.Errorf("encodeInto on a GUID column: err = %v, want ErrColumnNotWritable", err)
+	if err := r.encodeInto(slot, 0, text); err != nil {
+		t.Fatalf("encodeInto on a GUID column: %v", err)
 	}
 
-	if _, err := r.encodeRecord([]any{make([]byte, guidSize), int32(1)}); !errors.Is(err, ErrColumnNotWritable) {
-		t.Errorf("encodeRecord with a GUID column: err = %v, want ErrColumnNotWritable", err)
-	}
-
-	// The same column must stop ALTER TABLE's rewrite rather than decode to
-	// bytes that would re-encode as a plain byte array.
-	rec := recordOver(r, make([]byte, r.recordSize))
-	if _, err := decodeColumnValue(guid, rec, 0); !errors.Is(err, ErrColumnNotWritable) {
-		t.Errorf("decodeColumnValue on a GUID column: err = %v, want ErrColumnNotWritable", err)
-	}
-
-	// A BYTES column of the same width and base type is still writable, which
-	// is what says the refusal keys on FieldType and not on the storage.
-	plain := col("b", BftBytes, FieldBytes, guidSize)
-	rb := newTestReader(plain)
-
-	if err := rb.encodeInto(make([]byte, rb.recordSize), 0, make([]byte, guidSize)); err != nil {
-		t.Errorf("encodeInto on a BYTES column: %v", err)
+	if got, want := recordOver(r, slot).GUID(0).String(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301"; got != want {
+		t.Errorf("GUID(0) = %q, want %q", got, want)
 	}
 }

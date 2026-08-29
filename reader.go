@@ -2,9 +2,11 @@ package absdb
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 	"unicode/utf16"
 
@@ -16,10 +18,6 @@ var (
 	ErrNoMoreRows = errors.New("absdb: no more rows")
 	ErrBadLayout  = errors.New("absdb: record layout does not match the data")
 )
-
-// currencyScale is the implied divisor of a Delphi Currency value, which is
-// stored as an int64 with four decimal places.
-const currencyScale = 10000
 
 // Reader iterates over data records in a table.
 //
@@ -181,8 +179,8 @@ func (rec Record) IsNull(col int) bool {
 // Int returns the value of an integer column widened to int32. Narrower
 // columns (Int8, Uint8, Int16, Uint16) are widened keeping their own sign.
 // Columns that do not store a plain integer return 0, and so do values that do
-// not fit an int32 — an Int64 or Currency column, or a Uint32 column above
-// MaxInt32. Use Int64 to read those without loss.
+// not fit an int32 — an Int64 column, or a Uint32 column above MaxInt32. Use
+// Int64 to read those without loss.
 func (rec Record) Int(col int) int32 {
 	v := rec.intValue(col)
 	if v < math.MinInt32 || v > math.MaxInt32 {
@@ -204,9 +202,9 @@ func (rec Record) Int16(col int) int16 {
 	return int16(v)
 }
 
-// Int64 returns the value of an integer column widened to int64. For a
-// Currency column this is the raw value, scaled by 10000; use Float for the
-// decimal value.
+// Int64 returns the value of an integer column widened to int64. A Currency
+// column is not an integer column -- it stores a double -- and reads 0 here;
+// use Float.
 func (rec Record) Int64(col int) int64 {
 	return rec.intValue(col)
 }
@@ -238,8 +236,8 @@ func (rec Record) Uint32(col int) uint32 {
 }
 
 // Float returns the floating-point value of the column: Single is read as a
-// 4-byte IEEE-754 value, Double as an 8-byte one and Currency as its scaled
-// int64. Extended (80-bit) and all other columns return 0.
+// 4-byte IEEE-754 value, Double and Currency as 8-byte ones. Extended
+// (80-bit) and all other columns return 0.
 func (rec Record) Float(col int) float64 {
 	c, ok := rec.column(col)
 	if !ok {
@@ -256,7 +254,14 @@ func (rec Record) Float(col int) float64 {
 			return math.Float64frombits(binary.LittleEndian.Uint64(raw))
 		}
 	case BftCurrency:
-		return float64(rec.intValue(col)) / currencyScale
+		// Currency is an IEEE-754 double on disk, not the scaled int64 a
+		// Delphi Currency is in memory. Types.abs settles it: TReal.R4 holds
+		// 8765.4321 as 4d 84 0d 4f b7 1e c1 40, which is that double exactly
+		// and is nothing like the scaled 87654321. ABSTypes.hpp agrees --
+		// TABSCurrency is a typedef of double.
+		if raw := rec.fieldPrefix(col, 8); raw != nil {
+			return math.Float64frombits(binary.LittleEndian.Uint64(raw))
+		}
 	}
 
 	return 0
@@ -300,9 +305,15 @@ func (rec Record) Bool(col int) bool {
 
 // Time returns the time.Time value of a Date, Time, or DateTime column.
 // Any other column, and any truncated field, yields the zero time.
+//
+// A TimeStamp column reads as the zero time even though it shares
+// BftDateTime's base type: Types.abs shows it stores some other layout --
+// "2019-03-07 01:02:03" is e3 07 03 00 07 00 01 00, which reads as the
+// numbers 2019, 3, 7, 1 rather than as a day count and a millisecond count --
+// and returning a confidently wrong instant is worse than returning none.
 func (rec Record) Time(col int) time.Time {
 	c, ok := rec.column(col)
-	if !ok {
+	if !ok || c.FieldType == FieldTimeStamp {
 		return time.Time{}
 	}
 
@@ -344,54 +355,83 @@ func (rec Record) Bytes(col int) []byte {
 	return result
 }
 
-// guidSize is the stored width of a GUID column: the Win32 GUID struct.
-const guidSize = 16
+// guidTextSize is the declared Size of a GUID column: the braced text form
+// "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" is 38 characters.
+const guidTextSize = 38
 
-// GUID is a Windows GUID as the engine stores it. TABSGuid is a typedef of the
-// Win32 GUID struct, so the sixteen bytes are not a flat array: the first
-// three groups are a little-endian uint32 and two little-endian uint16s, and
-// only the last eight bytes are in the order they are printed. A hex dump of
-// the stored bytes is therefore not the canonical text form -- see String.
-type GUID [guidSize]byte
+// GUID is a 128-bit globally unique identifier, held in the order it is
+// printed: g[0] is the first hex pair of the first group.
+//
+// The engine does not store the Win32 GUID struct, whatever TABSGuid's
+// typedef suggests. A GUID column is a fixed 38-character Char column and
+// holds the value as text -- Types.abs's TGuid stores the bytes
+// "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}" followed by a NUL -- so there is
+// no endianness to reverse and no struct to unpack.
+type GUID [16]byte
 
-// String formats the GUID canonically, as 8-4-4-4-12 lowercase hex digits.
-// The first three groups are byte-swapped out of their little-endian storage;
-// the last two are printed in stored order.
+// String formats the GUID canonically, as 8-4-4-4-12 lowercase hex digits
+// with no braces. The zero GUID formats as all zeros.
 func (g GUID) String() string {
-	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x",
-		g[3], g[2], g[1], g[0],
-		g[5], g[4],
-		g[7], g[6],
-		g[8], g[9],
-		g[10:16])
+	return fmt.Sprintf("%x-%x-%x-%x-%x", g[0:4], g[4:6], g[6:8], g[8:10], g[10:16])
 }
 
-// GUID returns the value of a GUID column. Any other column, a NULL, and a
-// field that does not hold the full sixteen bytes all yield the zero GUID,
-// which is what every other typed accessor here does for a column it cannot
-// read; use IsNull to tell a NULL apart from a zero value.
+// ParseGUID reads the engine's stored text. Both forms the engine accepts are
+// taken -- braced as DBManager writes it, and bare as it stores a bare literal
+// -- and anything else reports false rather than a partly filled value.
+func ParseGUID(s string) (GUID, bool) {
+	var g GUID
+
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "{"), "}")
+
+	// 32 hex digits and the four dashes.
+	if len(s) != 36 {
+		return GUID{}, false
+	}
+
+	n := 0
+
+	for i, group := range [5]int{4, 2, 2, 2, 6} {
+		if i > 0 {
+			if s[0] != '-' {
+				return GUID{}, false
+			}
+
+			s = s[1:]
+		}
+
+		raw, err := hex.DecodeString(s[:group*2])
+		if err != nil {
+			return GUID{}, false
+		}
+
+		n += copy(g[n:], raw)
+		s = s[group*2:]
+	}
+
+	return g, true
+}
+
+// GUID returns the value of a GUID column. Any other column, a NULL, and text
+// that is not a GUID all yield the zero GUID, which is what every other typed
+// accessor here does for a column it cannot read; use IsNull to tell a NULL
+// apart from a zero value.
 //
 // This is the one accessor that dispatches on FieldType rather than BaseType,
-// because it has to. There is no bftGuid: the engine stores a GUID under a
-// byte-array base type, so BaseType alone cannot tell a GUID from a BYTES(16)
-// column, and formatting an arbitrary byte array as a GUID is exactly the
-// silent wrongness this package refuses elsewhere.
+// because it has to: a GUID column stores Char, so BaseType alone cannot tell
+// it from any other fixed string. String reads the same column as its raw
+// text, braces and all.
 func (rec Record) GUID(col int) GUID {
-	var out GUID
-
 	c, ok := rec.column(col)
 	if !ok || c.FieldType != FieldGUID {
-		return out
+		return GUID{}
 	}
 
-	raw := rec.fieldPrefix(col, guidSize)
-	if raw == nil {
-		return out
+	g, ok := ParseGUID(rec.String(col))
+	if !ok {
+		return GUID{}
 	}
 
-	copy(out[:], raw)
-
-	return out
+	return g
 }
 
 // --- record field access ---
@@ -484,7 +524,7 @@ func integerStorage(c Column) (width int, signed, ok bool) {
 		return 4, true, true
 	case BftUint32:
 		return 4, false, true
-	case BftInt64, BftCurrency:
+	case BftInt64:
 		return 8, true, true
 	default:
 		return 0, false, false
@@ -613,10 +653,14 @@ func fieldStoreSize(c Column) int {
 		return int(c.Size) + 1
 	case BftWideVarchar, BftWideChar:
 		return (int(c.Size) + 1) * 2
-	case BftVarBytes:
-		return int(c.Size) + 2
-	case BftBytes:
-		return int(c.Size)
+	// Both byte types store one byte more than their declared size, exactly
+	// as Char and Varchar do. Types.abs pins it with sentinels: in TBin a
+	// BYTES(8) and a VARBYTES(8) each occupy nine bytes, and in TGuid a
+	// BYTES(16) occupies seventeen, which is what puts the LargeInt sentinel
+	// after them where the raw page shows it. What the extra byte holds is not
+	// established -- every byte column in the corpus is NULL.
+	case BftVarBytes, BftBytes:
+		return int(c.Size) + 1
 	default:
 		return int(c.Size)
 	}

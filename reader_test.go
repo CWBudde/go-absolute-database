@@ -1,7 +1,6 @@
 package absdb
 
 import (
-	"bytes"
 	"encoding/binary"
 	"math"
 	"testing"
@@ -453,10 +452,10 @@ func TestNarrowAndWideAccessors(t *testing.T) {
 
 	data := make([]byte, reader.fieldDataSize)
 	binary.LittleEndian.PutUint32(data[0:4], math.Float32bits(1.5))
-	binary.LittleEndian.PutUint16(data[4:6], uint16(0xfffe))       // int16 -2
-	binary.LittleEndian.PutUint16(data[6:8], 65535)                // word
-	binary.LittleEndian.PutUint64(data[8:16], ^uint64(4))          // int64 -5
-	binary.LittleEndian.PutUint64(data[16:24], uint64(12_345_678)) // currency 1234.5678
+	binary.LittleEndian.PutUint16(data[4:6], uint16(0xfffe))                // int16 -2
+	binary.LittleEndian.PutUint16(data[6:8], 65535)                         // word
+	binary.LittleEndian.PutUint64(data[8:16], ^uint64(4))                   // int64 -5
+	binary.LittleEndian.PutUint64(data[16:24], math.Float64bits(1234.5678)) // currency, a double
 
 	for i, u := range []uint16{'H', 'a', 'l', 'l', 'o', 0} {
 		binary.LittleEndian.PutUint16(data[24+2*i:26+2*i], u)
@@ -643,13 +642,11 @@ func TestNarrowAccessorsRejectOutOfRange(t *testing.T) {
 	}
 }
 
-// TestGUIDString pins the canonical text form against RFC 4122's own example.
-// The stored bytes are not in printed order -- the first three groups are a
-// little-endian uint32 and two little-endian uint16s -- so a straight hex dump
-// of them reads "40fc296b-47ca-6710-...", and getting that wrong is the whole
-// risk this type exists to remove.
+// TestGUIDString pins the canonical text form. A GUID column stores text, so
+// the bytes are in printed order and String is a straight hex rendering --
+// there is no Win32 struct to byte-swap, whatever TABSGuid's typedef suggests.
 func TestGUIDString(t *testing.T) {
-	tests := []struct {
+	for _, tt := range []struct {
 		name  string
 		bytes []byte
 		want  string
@@ -657,27 +654,17 @@ func TestGUIDString(t *testing.T) {
 		{
 			name: "RFC 4122 example",
 			bytes: []byte{
-				0x40, 0xfc, 0x29, 0x6b, 0x47, 0xca, 0x67, 0x10,
+				0x6b, 0x29, 0xfc, 0x40, 0xca, 0x47, 0x10, 0x67,
 				0xb3, 0x1d, 0x00, 0xdd, 0x01, 0x06, 0x62, 0xda,
 			},
 			want: "6b29fc40-ca47-1067-b31d-00dd010662da",
 		},
 		{
 			name:  "zero",
-			bytes: make([]byte, guidSize),
+			bytes: make([]byte, 16),
 			want:  "00000000-0000-0000-0000-000000000000",
 		},
-		{
-			name: "every byte distinct, so a swapped group is visible",
-			bytes: []byte{
-				0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-				0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-			},
-			want: "04030201-0605-0807-090a-0b0c0d0e0f10",
-		},
-	}
-
-	for _, tt := range tests {
+	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var g GUID
 
@@ -690,55 +677,81 @@ func TestGUIDString(t *testing.T) {
 	}
 }
 
-// TestRecordGUID covers the accessor's four outcomes without a fixture: the
-// value, a NULL, a column of another type, and a field too short to hold one.
-func TestRecordGUID(t *testing.T) {
-	stored := []byte{
-		0x40, 0xfc, 0x29, 0x6b, 0x47, 0xca, 0x67, 0x10,
-		0xb3, 0x1d, 0x00, 0xdd, 0x01, 0x06, 0x62, 0xda,
-	}
+// TestParseGUID covers both forms the engine stores -- braced, as DBManager
+// writes it, and bare -- and the rejections.
+func TestParseGUID(t *testing.T) {
+	const want = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
 
-	// A GUID column beside a BYTES(16) one: they share a base type and a
-	// width, so only the FieldType tells them apart.
+	for _, tt := range []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"{3F2504E0-4F89-11D3-9A0C-0305E82C3301}", want, true},
+		{"3F2504E0-4F89-11D3-9A0C-0305E82C3301", want, true},
+		{"3f2504e0-4f89-11d3-9a0c-0305e82c3301", want, true},
+		{"", "", false},
+		{"not-a-guid", "", false},
+		{"3F2504E0-4F89-11D3-9A0C-0305E82C33", "", false},
+		{"3F2504E04F8911D39A0C0305E82C3301", "", false},
+		{"ZZ2504E0-4F89-11D3-9A0C-0305E82C3301", "", false},
+	} {
+		t.Run(tt.in, func(t *testing.T) {
+			g, ok := ParseGUID(tt.in)
+			if ok != tt.ok {
+				t.Fatalf("ParseGUID(%q) ok = %v, want %v", tt.in, ok, tt.ok)
+			}
+
+			if ok && g.String() != tt.want {
+				t.Errorf("ParseGUID(%q) = %q, want %q", tt.in, g, tt.want)
+			}
+		})
+	}
+}
+
+// TestRecordGUID covers the accessor's outcomes without a fixture. A GUID
+// column stores Char text, so the neighbouring plain string column is what
+// says the accessor keys on FieldType rather than on the storage.
+func TestRecordGUID(t *testing.T) {
+	const text = "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}"
+
 	r := newTestReader(
-		col("g", BftBytes, FieldGUID, guidSize),
-		col("b", BftBytes, FieldBytes, guidSize),
+		col("g", BftChar, FieldGUID, guidTextSize),
+		col("s", BftChar, FieldString, guidTextSize),
+		col("junk", BftChar, FieldGUID, guidTextSize),
 	)
 
 	slot := make([]byte, r.recordSize)
-	copy(slot[r.nullFlagBytes:], stored)
-	copy(slot[r.nullFlagBytes+guidSize:], stored)
+	copy(slot[r.nullFlagBytes:], text)
+	copy(slot[r.nullFlagBytes+guidTextSize+1:], text)
+	copy(slot[r.nullFlagBytes+2*(guidTextSize+1):], "definitely not a guid")
 
 	rec := recordOver(r, slot)
 
-	if got, want := rec.GUID(0).String(), "6b29fc40-ca47-1067-b31d-00dd010662da"; got != want {
+	if got, want := rec.GUID(0).String(), "3f2504e0-4f89-11d3-9a0c-0305e82c3301"; got != want {
 		t.Errorf("GUID(0) = %q, want %q", got, want)
 	}
 
-	// The BYTES column holds the identical sixteen bytes and must still read
-	// as the zero GUID: it is not a GUID, whatever it contains.
+	// String reads the same column as its raw stored text, braces and all.
+	if got := rec.String(0); got != text {
+		t.Errorf("String(0) = %q, want %q", got, text)
+	}
+
+	// The plain string column holds an identical GUID and must still read as
+	// the zero GUID: it is not a GUID column, whatever it contains.
 	if got := rec.GUID(1); got != (GUID{}) {
-		t.Errorf("GUID(1) on a BYTES column = %q, want the zero GUID", got)
+		t.Errorf("GUID(1) on a String column = %q, want the zero GUID", got)
 	}
 
-	// Bytes still returns the raw storage for both, which is the escape hatch
-	// for a caller that wants the bytes rather than the type.
-	if got := rec.Bytes(0); !bytes.Equal(got, stored) {
-		t.Errorf("Bytes(0) = % x, want % x", got, stored)
+	// A GUID column whose text does not parse reads as zero rather than as a
+	// partly filled value.
+	if got := rec.GUID(2); got != (GUID{}) {
+		t.Errorf("GUID(2) on unparseable text = %q, want the zero GUID", got)
 	}
 
-	for _, col := range []int{-1, 2, 99} {
-		if got := rec.GUID(col); got != (GUID{}) {
-			t.Errorf("GUID(%d) out of range = %q, want the zero GUID", col, got)
+	for _, c := range []int{-1, 3, 99} {
+		if got := rec.GUID(c); got != (GUID{}) {
+			t.Errorf("GUID(%d) out of range = %q, want the zero GUID", c, got)
 		}
-	}
-
-	// A field narrower than sixteen bytes reads as zero rather than as a
-	// partially copied value.
-	short := newTestReader(col("g", BftBytes, FieldGUID, 8))
-
-	shortRec := recordOver(short, make([]byte, short.recordSize))
-	if got := shortRec.GUID(0); got != (GUID{}) {
-		t.Errorf("GUID(0) on an 8-byte field = %q, want the zero GUID", got)
 	}
 }
