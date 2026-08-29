@@ -546,6 +546,32 @@ func synthSingle(v float32) []byte {
 	return b
 }
 
+// synthExtended builds the x87 80-bit representation of a float64. Every
+// float64 is exactly representable, so this is the inverse of
+// extendedToFloat for the values it is given.
+func synthExtended(v float64) []byte {
+	b := make([]byte, 10)
+	if v == 0 {
+		return b
+	}
+
+	significand, exponent := math.Frexp(v)
+
+	signExp := uint16(exponent - 1 + extendedExponentBias)
+
+	if significand < 0 {
+		significand = -significand
+		signExp |= extendedSignBit
+	}
+
+	// Frexp yields a significand in [0.5, 1); scaling it by 2^64 puts its
+	// leading bit in the explicit integer bit the format wants.
+	binary.LittleEndian.PutUint64(b[0:8], uint64(math.Ldexp(significand, 64)))
+	binary.LittleEndian.PutUint16(b[8:10], signExp)
+
+	return b
+}
+
 func synthBool(v bool) []byte {
 	if v {
 		return []byte{1, 0}

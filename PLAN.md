@@ -53,7 +53,9 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 - [ ] Decode a **TimeStamp**. It shares `BftDateTime`'s base type and not its layout, so
       `Record.Time` returns the zero time for one and both write paths refuse it. Needs a fixture
       holding several distinct instants.
-- [ ] `Extended`, read as 10 bytes and decoded as nothing — Go has no 80-bit float.
+- [x] `Extended`, decoded from the x87 80-bit format and rounded to `float64` by
+      `Record.Float`. That rounding is why it stays unwritable; see
+      [docs/format/records.md](docs/format/records.md#extended).
 - [ ] What a `Bytes` or `VarBytes` column's **extra byte** holds. Both store `Size + 1`; every
       such column in the corpus is NULL, because the engine takes no SQL literal for one.
 

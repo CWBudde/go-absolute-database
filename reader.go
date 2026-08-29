@@ -236,8 +236,13 @@ func (rec Record) Uint32(col int) uint32 {
 }
 
 // Float returns the floating-point value of the column: Single is read as a
-// 4-byte IEEE-754 value, Double and Currency as 8-byte ones. Extended
-// (80-bit) and all other columns return 0.
+// 4-byte IEEE-754 value, Double and Currency as 8-byte ones, and Extended as
+// an x87 80-bit one rounded to float64. All other columns return 0.
+//
+// Extended is the one lossy conversion here. It carries a 64-bit significand
+// against float64's 53, so a value the engine wrote can round on the way out
+// and cannot be written back unchanged -- which is why an Extended column
+// stays refused by the write path with ErrColumnNotWritable.
 func (rec Record) Float(col int) float64 {
 	c, ok := rec.column(col)
 	if !ok {
@@ -253,6 +258,10 @@ func (rec Record) Float(col int) float64 {
 		if raw := rec.fieldPrefix(col, 8); raw != nil {
 			return math.Float64frombits(binary.LittleEndian.Uint64(raw))
 		}
+	case BftExtended:
+		if raw := rec.fieldPrefix(col, 10); raw != nil {
+			return extendedToFloat(raw)
+		}
 	case BftCurrency:
 		// Currency is an IEEE-754 double on disk, not the scaled int64 a
 		// Delphi Currency is in memory. Types.abs settles it: TReal.R4 holds
@@ -265,6 +274,57 @@ func (rec Record) Float(col int) float64 {
 	}
 
 	return 0
+}
+
+// extendedExponentBias is the x87 80-bit format's exponent bias, and
+// extendedSignificandBits the width of its significand. Unlike every IEEE
+// binary format, that significand carries its leading bit explicitly rather
+// than implying it, so the value is simply the 64-bit integer scaled by
+// 2^(exponent-bias-63) with no hidden bit to restore.
+const (
+	extendedExponentBias           = 16383
+	extendedSignificandBits        = 63
+	extendedExponentAll            = 0x7FFF
+	extendedSignBit         uint16 = 0x8000
+	extendedIntegerBit      uint64 = 1 << 63
+)
+
+// extendedToFloat converts the ten bytes of an x87 80-bit extended value to
+// the nearest float64. raw is little-endian: the 64-bit significand first,
+// then a word holding the sign in its top bit and the biased exponent in the
+// remaining fifteen.
+//
+// Types.abs pins it: TReal.R3 holds 1.6180339887498949 as
+// 00 40 a5 bf dc bc 1b cf ff 3f, which is significand 0xCF1BBCDCBFA54000 at
+// exponent 0x3FFF -- an unbiased exponent of zero, so the value is that
+// integer over 2^63.
+//
+// The result is rounded once, when the significand is converted, and then
+// scaled exactly; only a result in float64's subnormal range can round twice.
+// A value too large for float64 becomes an infinity rather than an error,
+// matching what a float64 arithmetic overflow does.
+func extendedToFloat(raw []byte) float64 {
+	significand := binary.LittleEndian.Uint64(raw[0:8])
+	signExp := binary.LittleEndian.Uint16(raw[8:10])
+
+	sign := 1.0
+	if signExp&extendedSignBit != 0 {
+		sign = -1
+	}
+
+	exponent := int(signExp &^ extendedSignBit)
+	if exponent == extendedExponentAll {
+		// The x87 format spells an infinity with the integer bit set and
+		// nothing else; every other significand is some flavour of NaN.
+		if significand == extendedIntegerBit {
+			return sign * math.Inf(1)
+		}
+
+		return math.NaN()
+	}
+
+	return sign * math.Ldexp(float64(significand),
+		exponent-extendedExponentBias-extendedSignificandBits)
 }
 
 // String returns the string value of the column. Char and Varchar columns are

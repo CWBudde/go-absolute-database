@@ -71,8 +71,10 @@ var (
 	ErrBlobWrite = errors.New("absdb: BLOB and CLOB columns cannot be written yet")
 
 	// ErrColumnNotWritable is returned for a column whose storage this package
-	// can read but not write: Extended (80-bit float, which Go has no type
-	// for) and TimeStamp, which shares BftDateTime's base type but stores some
+	// can read but not write: Extended, whose 64-bit significand does not
+	// survive the round trip through the float64 Record.Float returns, so
+	// rewriting a row would quietly truncate a column nobody touched; and
+	// TimeStamp, which shares BftDateTime's base type but stores some
 	// other layout that no fixture has decoded -- writing it as a DateTime
 	// would silently record a different instant. A GUID column is writable:
 	// it stores Char, and its text goes through the string path like any

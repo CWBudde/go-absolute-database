@@ -54,7 +54,7 @@ slots than rows, leaving most of the bitmap zero.
 | Currency   | ftCurrency       | 8 bytes, IEEE-754 double — _not_ a scaled int64 | CURRENCY, MONEY                |
 | Date       | ftDate           | 4 bytes, int32 LE — days, 0001-01-01 = 1        | DATE                           |
 | DateTime   | ftDateTime       | 8 bytes, `TABSDateTime{int32 Date; int32 Time}` | DATETIME                       |
-| Extended   | ftExtended       | 10 bytes (80-bit extended)                      | EXTENDED                       |
+| Extended   | ftExtended       | 10 bytes, x87 80-bit — explicit integer bit     | EXTENDED                       |
 | Float      | ftFloat          | 8 bytes (float64)                               | FLOAT, DOUBLE, REAL, NUMERIC   |
 | FmtMemo    | ftFmtMemo        | BLOB pointer                                    | FMTMEMO                        |
 | Graphic    | ftGraphic        | BLOB pointer                                    | GRAPHIC                        |
@@ -129,9 +129,26 @@ wrote for exactly this purpose and which now covers every type in the table abov
 [../testing.md](../testing.md).
 
 That is engine-written evidence rather than field data, so it says what the engine stores, not
-what any application stores. Two gaps remain: **Extended** is read as 10 bytes and decoded as
-nothing, because Go has no 80-bit float, and **TimeStamp**'s layout is undecoded. Both are in
+what any application stores. One gap remains: **TimeStamp**'s layout is undecoded, and it is in
 [../open-questions.md](../open-questions.md).
+
+### Extended
+
+An `EXTENDED` column holds the x87 80-bit format the Delphi `Extended` type compiles to on
+32-bit Windows: little-endian, a 64-bit significand first, then a word carrying the sign in its
+top bit and a 15-bit exponent biased by 16383 in the rest. Unlike every IEEE binary format the
+significand's leading bit is **explicit** rather than implied, so the value is that 64-bit
+integer scaled by `2^(exponent - 16383 - 63)` with no hidden bit to restore. An exponent of all
+ones is an infinity when the significand is exactly the integer bit and a NaN otherwise.
+
+`Types.abs` pins it: `TReal.R3` holds `1.6180339887498949` as
+`00 40 a5 bf dc bc 1b cf ff 3f` — significand `0xCF1BBCDCBFA54000`, exponent `0x3FFF`, so an
+unbiased exponent of zero and a value of that integer over 2^63.
+
+`Record.Float` rounds it to `float64`, which is the one lossy read in this package: 64 bits of
+significand do not fit in 53. That is also why an Extended column stays refused by the write
+path (`ErrColumnNotWritable`) — a rewrite of some other column in the row would silently
+truncate this one.
 
 ## Capacity limits
 

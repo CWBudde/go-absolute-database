@@ -836,8 +836,8 @@ func decodeRowValues(cols []Column, rec Record) ([]any, error) {
 // is exactly what writer.go's ErrColumnNotWritable already names.
 func decodeColumnValue(c Column, rec Record, col int) (any, error) {
 	// A TimeStamp shares BftDateTime's base type but not its layout, so
-	// Record.Time reads it wrongly and re-encoding what it returns would
-	// rewrite the column with a different value.
+	// Record.Time deliberately returns the zero time for it, and re-encoding
+	// that would rewrite the column with a different value.
 	if c.FieldType == FieldTimeStamp {
 		return nil, fmt.Errorf("%w: column %q (%s)", ErrColumnNotWritable, c.Name, c.FieldType)
 	}

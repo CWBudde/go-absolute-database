@@ -54,8 +54,6 @@ What the format still hides, and what this package therefore refuses rather than
   such column in the corpus is NULL: the engine rejects an SQL literal for one, `MIMETOBIN` and a
   plain string alike, with `Invalid variant type or size`. Writing a value needs a parameterised
   insert, which means driving the Delphi engine rather than DBManager's SQL tab.
-- **Extended.** Read as 10 bytes and decoded as nothing, because Go has no 80-bit float.
-  `Types.abs` stores `1.6180339887498949` as `00 40 a5 bf dc bc 1b cf ff 3f` if it is ever wanted.
 - **BZIP and PPM BLOB compression** are named by the format and unimplemented; no fixture uses
   either.
 

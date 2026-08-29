@@ -755,3 +755,58 @@ func TestRecordGUID(t *testing.T) {
 		}
 	}
 }
+
+// TestExtendedToFloat pins the x87 80-bit conversion against hand-built bit
+// patterns, so the arithmetic is checked without a fixture. The fixture check
+// is TestTypesFixtureValues, which reads the golden ratio out of TReal.R3.
+func TestExtendedToFloat(t *testing.T) {
+	ext := func(significand uint64, signExp uint16) []byte {
+		raw := make([]byte, 10)
+		binary.LittleEndian.PutUint64(raw[0:8], significand)
+		binary.LittleEndian.PutUint16(raw[8:10], signExp)
+
+		return raw
+	}
+
+	for _, tt := range []struct {
+		name string
+		raw  []byte
+		want float64
+	}{
+		// The integer bit is explicit in this format, so 1.0 is the
+		// significand 0x8000…0 at the bias itself.
+		{"one", ext(0x8000000000000000, 0x3FFF), 1},
+		{"minus one", ext(0x8000000000000000, 0xBFFF), -1},
+		{"one and a half", ext(0xC000000000000000, 0x3FFF), 1.5},
+		{"two", ext(0x8000000000000000, 0x4000), 2},
+		{"zero", ext(0, 0), 0},
+		// The golden ratio as the engine wrote it into Types.abs.
+		{"golden ratio", ext(0xCF1BBCDCBFA54000, 0x3FFF), 1.6180339887498949},
+		{"infinity", ext(1<<63, 0x7FFF), math.Inf(1)},
+		{"negative infinity", ext(1<<63, 0xFFFF), math.Inf(-1)},
+		// A finite Extended larger than float64 can hold saturates rather
+		// than erroring, which is what float64 arithmetic itself does.
+		{"overflow", ext(math.MaxUint64, 0x7FFE), math.Inf(1)},
+		// A subnormal Extended: exponent zero means no implicit bias step,
+		// and the value stays far inside float64's range.
+		{"subnormal", ext(1, 0), math.Ldexp(1, -16446)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extendedToFloat(tt.raw); got != tt.want {
+				t.Errorf("extendedToFloat = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("negative zero", func(t *testing.T) {
+		if got := extendedToFloat(ext(0, 0x8000)); !math.Signbit(got) || got != 0 {
+			t.Errorf("extendedToFloat = %v, want -0", got)
+		}
+	})
+
+	t.Run("NaN", func(t *testing.T) {
+		if got := extendedToFloat(ext(0xC000000000000000, 0x7FFF)); !math.IsNaN(got) {
+			t.Errorf("extendedToFloat = %v, want NaN", got)
+		}
+	})
+}

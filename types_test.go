@@ -229,11 +229,12 @@ func TestTypesFixtureValues(t *testing.T) {
 			t.Errorf("Currency = %v, want 8765.4321", got)
 		}
 
-		// Extended is 80-bit and Go has no type for it, so it reads as 0 --
-		// but it must still occupy ten bytes, which the sentinel after it
-		// proves in TestTypesFixtureSentinels.
-		if got := rec.Float(4); got != 0 {
-			t.Errorf("Extended = %v, want 0 (unsupported)", got)
+		// Extended is the engine's x87 80-bit float, rounded to float64 on
+		// the way out. The stored bytes are 00 40 a5 bf dc bc 1b cf ff 3f,
+		// and the ten they occupy are what the sentinel after them proves in
+		// TestTypesFixtureSentinels.
+		if got := rec.Float(4); got != 1.6180339887498949 {
+			t.Errorf("Extended = %v, want 1.6180339887498949", got)
 		}
 	})
 

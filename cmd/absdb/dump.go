@@ -147,7 +147,7 @@ func formatField(rec absdb.Record, col int, c absdb.Column) string {
 		return strconv.FormatInt(rec.Int64(col), 10)
 	case absdb.BftUint8, absdb.BftUint16, absdb.BftUint32:
 		return strconv.FormatUint(uint64(rec.Uint32(col)), 10)
-	case absdb.BftSingle, absdb.BftDouble, absdb.BftCurrency:
+	case absdb.BftSingle, absdb.BftDouble, absdb.BftCurrency, absdb.BftExtended:
 		return fmt.Sprintf("%g", rec.Float(col))
 	case absdb.BftLogical:
 		return strconv.FormatBool(rec.Bool(col))
@@ -175,7 +175,7 @@ func fieldValue(rec absdb.Record, col int, c absdb.Column) any {
 		return rec.Int64(col)
 	case absdb.BftUint8, absdb.BftUint16, absdb.BftUint32:
 		return rec.Uint32(col)
-	case absdb.BftSingle, absdb.BftDouble, absdb.BftCurrency:
+	case absdb.BftSingle, absdb.BftDouble, absdb.BftCurrency, absdb.BftExtended:
 		return rec.Float(col)
 	case absdb.BftLogical:
 		return rec.Bool(col)

@@ -167,6 +167,14 @@ func TestSyntheticEveryReadableType(t *testing.T) {
 			check:  wantFloat(2.718281828459045),
 		},
 		{
+			// Extended is ten bytes of x87 80-bit float. Every float64 fits
+			// exactly, so this round-trips; what does not round-trip is the
+			// other direction, which is why the write path refuses it.
+			column: synthColumn{"FExtended", BftExtended, FieldExtended, 0},
+			stored: synthExtended(1.6180339887498949),
+			check:  wantFloat(1.6180339887498949),
+		},
+		{
 			column: synthColumn{"FBoolean", BftLogical, FieldBoolean, 0},
 			stored: synthBool(true),
 			check: func(t *testing.T, rec Record, col int) {
