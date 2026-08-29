@@ -657,3 +657,39 @@ func TestEncodeDelphiDateInverse(t *testing.T) {
 		}
 	}
 }
+
+// TestEncodeRefusesGUID pins the read-only position. A GUID column shares its
+// base type with a byte array, so without an explicit refusal both the record
+// encoder and ALTER TABLE's value decoder would route it through the BftBytes
+// path and store whatever they were handed.
+func TestEncodeRefusesGUID(t *testing.T) {
+	guid := col("g", BftBytes, FieldGUID, guidSize)
+	r := newTestReader(guid, col("n", BftInt32, FieldInteger, 0))
+
+	slot := make([]byte, r.recordSize)
+
+	err := r.encodeInto(slot, 0, make([]byte, guidSize))
+	if !errors.Is(err, ErrColumnNotWritable) {
+		t.Errorf("encodeInto on a GUID column: err = %v, want ErrColumnNotWritable", err)
+	}
+
+	if _, err := r.encodeRecord([]any{make([]byte, guidSize), int32(1)}); !errors.Is(err, ErrColumnNotWritable) {
+		t.Errorf("encodeRecord with a GUID column: err = %v, want ErrColumnNotWritable", err)
+	}
+
+	// The same column must stop ALTER TABLE's rewrite rather than decode to
+	// bytes that would re-encode as a plain byte array.
+	rec := recordOver(r, make([]byte, r.recordSize))
+	if _, err := decodeColumnValue(guid, rec, 0); !errors.Is(err, ErrColumnNotWritable) {
+		t.Errorf("decodeColumnValue on a GUID column: err = %v, want ErrColumnNotWritable", err)
+	}
+
+	// A BYTES column of the same width and base type is still writable, which
+	// is what says the refusal keys on FieldType and not on the storage.
+	plain := col("b", BftBytes, FieldBytes, guidSize)
+	rb := newTestReader(plain)
+
+	if err := rb.encodeInto(make([]byte, rb.recordSize), 0, make([]byte, guidSize)); err != nil {
+		t.Errorf("encodeInto on a BYTES column: %v", err)
+	}
+}

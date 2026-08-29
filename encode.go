@@ -72,8 +72,11 @@ var (
 
 	// ErrColumnNotWritable is returned for a column whose storage this package
 	// can read but not write: Extended (80-bit float, which Go has no type
-	// for) and VarBytes (no fixture contains one, so its length prefix is
-	// unverified and writing it would be guesswork).
+	// for), VarBytes (no fixture contains one, so its length prefix is
+	// unverified and writing it would be guesswork) and GUID (read-only for
+	// the same reason -- no fixture pins the stored width, and a GUID column
+	// shares its base type with a byte array, so writing one through the
+	// BftBytes path would store whatever length it was handed).
 	ErrColumnNotWritable = errors.New("absdb: column type cannot be written yet")
 )
 
@@ -223,6 +226,14 @@ func setNullFlag(flags []byte, col int, null bool) {
 // encodeField writes a non-nil value into the column's field bytes. field is
 // exactly fieldStoreSize(c) bytes and is fully overwritten.
 func encodeField(c Column, field []byte, v any) error {
+	// A GUID is stored under a byte-array base type, so without this it would
+	// fall into the BftBytes arm and be written as raw bytes of whatever
+	// length the caller passed. Refusing is the read-only position the
+	// accessor takes, made explicit on the way out.
+	if c.FieldType == FieldGUID {
+		return fmt.Errorf("%w: %s", ErrColumnNotWritable, c.FieldType)
+	}
+
 	switch c.BaseType {
 	case BftCurrency:
 		return encodeCurrency(field, v)

@@ -344,6 +344,56 @@ func (rec Record) Bytes(col int) []byte {
 	return result
 }
 
+// guidSize is the stored width of a GUID column: the Win32 GUID struct.
+const guidSize = 16
+
+// GUID is a Windows GUID as the engine stores it. TABSGuid is a typedef of the
+// Win32 GUID struct, so the sixteen bytes are not a flat array: the first
+// three groups are a little-endian uint32 and two little-endian uint16s, and
+// only the last eight bytes are in the order they are printed. A hex dump of
+// the stored bytes is therefore not the canonical text form -- see String.
+type GUID [guidSize]byte
+
+// String formats the GUID canonically, as 8-4-4-4-12 lowercase hex digits.
+// The first three groups are byte-swapped out of their little-endian storage;
+// the last two are printed in stored order.
+func (g GUID) String() string {
+	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x",
+		g[3], g[2], g[1], g[0],
+		g[5], g[4],
+		g[7], g[6],
+		g[8], g[9],
+		g[10:16])
+}
+
+// GUID returns the value of a GUID column. Any other column, a NULL, and a
+// field that does not hold the full sixteen bytes all yield the zero GUID,
+// which is what every other typed accessor here does for a column it cannot
+// read; use IsNull to tell a NULL apart from a zero value.
+//
+// This is the one accessor that dispatches on FieldType rather than BaseType,
+// because it has to. There is no bftGuid: the engine stores a GUID under a
+// byte-array base type, so BaseType alone cannot tell a GUID from a BYTES(16)
+// column, and formatting an arbitrary byte array as a GUID is exactly the
+// silent wrongness this package refuses elsewhere.
+func (rec Record) GUID(col int) GUID {
+	var out GUID
+
+	c, ok := rec.column(col)
+	if !ok || c.FieldType != FieldGUID {
+		return out
+	}
+
+	raw := rec.fieldPrefix(col, guidSize)
+	if raw == nil {
+		return out
+	}
+
+	copy(out[:], raw)
+
+	return out
+}
+
 // --- record field access ---
 
 // column returns the schema column at col, or false if col is out of range.

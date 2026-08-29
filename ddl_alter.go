@@ -835,6 +835,13 @@ func decodeRowValues(cols []Column, rec Record) ([]any, error) {
 // before rewriteDataPages runs; anything else unlisted (Extended, VarBytes)
 // is exactly what writer.go's ErrColumnNotWritable already names.
 func decodeColumnValue(c Column, rec Record, col int) (any, error) {
+	// Mirrors encodeField's refusal: a GUID would otherwise decode through
+	// the BftBytes arm and re-encode as plain bytes, so an ALTER on a table
+	// carrying one has to stop here rather than rewrite the column.
+	if c.FieldType == FieldGUID {
+		return nil, fmt.Errorf("%w: column %q (%s)", ErrColumnNotWritable, c.Name, c.FieldType)
+	}
+
 	switch c.BaseType {
 	case BftInt8, BftUint8, BftInt16, BftUint16, BftInt32, BftUint32, BftInt64, BftCurrency:
 		// Record.Int64 sign-extends per column width and reads the Currency
