@@ -127,6 +127,12 @@ Trusting the pages alone left an index whose leaf is empty invisible, because
 pages an entry points at — and a table whose `PRIMARY KEY` index has no rows yet is exactly
 that case, which is the state every table this package creates starts in.
 
+That closed a hole as well as opening the door. Four rowless tables carrying an index this
+package cannot maintain — `Constraints.abs`'s `CIdxDesc`, `CIdxNoCase` and `CIdxMulti`, and
+`MultiTable-createidxgrow.abs`'s `Delta` with its string-keyed index — used to **accept**
+writes, because the index nobody could see was the index nobody refused. The first insert into
+any of them would have left it describing nothing.
+
 ## Constraint records
 
 Read since the schema tail was decoded, written and checked since. The two halves landed
