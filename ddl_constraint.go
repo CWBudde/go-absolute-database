@@ -147,6 +147,13 @@ const (
 	// typedValuePresent marks a typed value whose int32 size and payload
 	// follow.
 	typedValuePresent = 0x00
+
+	// maxTypedValueSize bounds what the write path will put behind a present
+	// marker. The read path needs no such bound -- it clamps against the bytes
+	// actually left in the stream -- but the writer has to turn a slice length
+	// into the int32 size field, and no observed value is longer than the
+	// eight bytes a LargeInt bound occupies.
+	maxTypedValueSize = 65535
 )
 
 // constraintColumn is one column a constraint covers. objectID is carried only

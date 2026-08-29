@@ -766,19 +766,19 @@ func readUint32(data []byte, pos int, field string) (uint32, int, error) {
 // is the ASC/CASE/20 entry the engine writes for an ascending, case-sensitive
 // index.
 func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column string) ([]byte, error) {
-	rawName, err := encodeIndexName(name)
+	rawName, err := encodePascalName(name)
 	if err != nil {
 		return nil, err
 	}
 
-	rawColumn, err := encodeIndexName(column)
+	rawColumn, err := encodePascalName(column)
 	if err != nil {
 		return nil, err
 	}
 
 	out := make([]byte, 0, 1+len(rawName)+4+indexRecordFlagsSize+4+4+1+len(rawColumn)+2+4)
 
-	out = append(out, byte(len(rawName))) //nolint:gosec // checked in encodeIndexName
+	out = append(out, byte(len(rawName))) //nolint:gosec // checked in encodePascalName
 	out = append(out, rawName...)
 
 	var buf4 [4]byte
@@ -794,7 +794,7 @@ func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column
 	binary.LittleEndian.PutUint32(buf4[:], uint32(rootPageNo))
 	out = append(out, buf4[:]...)
 
-	out = append(out, byte(len(rawColumn))) //nolint:gosec // checked in encodeIndexName
+	out = append(out, byte(len(rawColumn))) //nolint:gosec // checked in encodePascalName
 	out = append(out, rawColumn...)
 
 	out = append(out, 0, 0) // DESC = false, NOCASE = false
@@ -805,9 +805,11 @@ func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column
 	return out, nil
 }
 
-// encodeIndexName Windows-1252 encodes a name for a Pascal string field, the
-// same encoding column and table names use.
-func encodeIndexName(name string) ([]byte, error) {
+// encodePascalName Windows-1252 encodes a name for a Pascal string field, the
+// same encoding column, index, table and constraint names all use. It is the
+// one place a name a caller chose is checked against what a length byte can
+// describe, which is why every serializer here goes through it.
+func encodePascalName(name string) ([]byte, error) {
 	raw, err := charmap.Windows1252.NewEncoder().Bytes([]byte(name))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %q: %w", ErrStringEncoding, name, err)
