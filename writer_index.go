@@ -48,7 +48,10 @@ import (
 //     builds, an index over more than one column, a DESC or NOCASE column, an
 //     index enforcing a PRIMARY KEY or UNIQUE constraint, and a table whose
 //     schema tail does not parse at all (all ErrIndexNotMaintained). See
-//     maintainableIndexColumn for what each of those would get wrong.
+//     maintainableIndexColumn for what each of those would get wrong;
+//   - a table declaring any constraint at all, indexed or not
+//     (ErrConstraintsNotEnforced), since no write here checks a NOT NULL, a
+//     MINVALUE/MAXVALUE pair or a uniqueness rule. See refuseConstraints.
 
 // maintainedIndex is one user index this writer keeps in step with the records:
 // which page its single leaf is, and which column it keys on.
@@ -85,6 +88,20 @@ func (w *TableWriter) maintainedIndexes() ([]maintainedIndex, error) {
 // pages show to be named in the schema means an index this package cannot
 // account for stops the write instead of being silently left stale.
 func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
+	// The schema tail is read first because the constraint array gates the
+	// write whether or not the table has an index, while the index records
+	// only matter if it has one. A tail that does not parse says nothing
+	// either way, so it is carried and only raised below, where an index makes
+	// it decisive -- refusing every unparsed tail here would newly refuse
+	// writes to the unindexed customer files that have always accepted them.
+	records, constraints, tailErr := w.tableSchemaTail()
+	if tailErr == nil {
+		err := refuseConstraints(constraints, w.r.table.Name())
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	ir, err := w.r.table.OpenIndex()
 	if err != nil {
 		if errors.Is(err, ErrNoIndex) {
@@ -99,9 +116,8 @@ func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
 		return nil, nil
 	}
 
-	records, err := w.tableIndexRecords()
-	if err != nil {
-		return nil, err
+	if tailErr != nil {
+		return nil, tailErr
 	}
 
 	byRoot := make(map[int]indexRecord, len(records))
@@ -123,30 +139,54 @@ func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
 	return indexes, nil
 }
 
-// tableIndexRecords reads this table's index definitions out of its
-// column-definition stream, mapping every failure to ErrIndexNotMaintained: a
-// schema this package cannot read is a reason to refuse the write, not to fail
-// it with an error about schemas.
-func (w *TableWriter) tableIndexRecords() ([]indexRecord, error) {
+// tableSchemaTail reads this table's index and constraint definitions out of
+// its column-definition stream, mapping every failure to ErrIndexNotMaintained:
+// a schema this package cannot read is a reason to refuse the write, not to
+// fail it with an error about schemas.
+func (w *TableWriter) tableSchemaTail() ([]indexRecord, []constraintRecord, error) {
 	schemaPageNo, err := w.r.table.schemaPageNo()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
 	}
 
 	raw, err := w.db.readSchemaStream(schemaPageNo)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
 	}
 
-	// parseSchemaTail also returns the constraint array and the splice points
-	// CREATE INDEX and DROP INDEX need; maintenance only needs the index
-	// definitions themselves.
-	_, _, records, _, _, err := parseSchemaTail(raw) //nolint:dogsled // four of the six results belong to the splicing callers
+	// parseSchemaTail also returns the splice points CREATE INDEX and DROP
+	// INDEX need; a write needs only the two record arrays.
+	_, _, records, constraints, _, err := parseSchemaTail(raw) //nolint:dogsled // three of the six results belong to the splicing callers
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrIndexNotMaintained, err)
 	}
 
-	return records, nil
+	return records, constraints, nil
+}
+
+// refuseConstraints refuses a write against a table that declares any
+// constraint, naming the first one so the caller learns which clause stopped it.
+//
+// Every kind in the array is refused, because none of them is checked anywhere
+// in this package: a PRIMARY KEY or UNIQUE clause needs a duplicate check, a
+// NOT NULL clause needs the record's null flags read, and a CHECK record needs
+// its MINVALUE/MAXVALUE pair compared against the encoded value. Until a write
+// does that work, a constrained table is one this package can only leave alone.
+//
+// Before parseSchemaTail decoded the constraint array, such a table was refused
+// by accident -- its tail did not parse, and tableSchemaTail turned that into
+// ErrIndexNotMaintained -- but only when the table also carried an index, since
+// nothing read the tail otherwise. Decoding the array turned that accident into
+// a hole; this is the stated rule that replaces it.
+func refuseConstraints(constraints []constraintRecord, table string) error {
+	if len(constraints) == 0 {
+		return nil
+	}
+
+	first := constraints[0]
+
+	return fmt.Errorf("%w: table %q declares %d, starting with the %s constraint %q",
+		ErrConstraintsNotEnforced, table, len(constraints), first.kind, first.name)
 }
 
 // maintainableIndexColumn returns the one column an index keys on, refusing

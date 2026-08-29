@@ -92,22 +92,98 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 	})
 
 	t.Run("index shape the leaf writer cannot reproduce", func(t *testing.T) {
-		// Every indexed customer fixture lands here, and this is the case that
-		// matters most in practice. It used to be a refusal to read the schema
-		// tail at all; now the tail parses (ddl_constraint.go) and the refusal
-		// is about the indexes themselves. RCON0011.abs has two, and either
-		// one alone is enough: "p" enforces a three-column PRIMARY KEY, and
-		// "RecIdx" covers two columns. Neither has a key this package can build
-		// or compare, so no write to the table can be shown to leave it in
-		// step. See maintainableIndexColumn for the full list.
-		//
-		// RCON0011.abs is not committed, so this skips on a bare checkout. It
-		// is the one case here with no synthetic stand-in: the shape comes from
-		// a real database, not from poking a fixture.
-		path := writableCopy(t, "RCON0011.abs")
-
-		requireWriteRefusal(t, path, ErrIndexNotMaintained)
+		// The three refusals maintainableIndexColumn adds on top of the leaf
+		// shape, checked against hand-built records because no committed
+		// fixture reaches them: the customer files that carry these index
+		// shapes all declare constraints too, and refuseConstraints stops
+		// their writes first (see TestWriterRefusesAConstrainedTable).
+		for _, c := range []struct {
+			name string
+			rec  indexRecord
+			want error
+		}{
+			{
+				name: "PRIMARY KEY or UNIQUE",
+				rec:  indexRecord{name: "p", primary: true, columns: []indexColumn{{name: "A"}}},
+				want: ErrIndexNotMaintained,
+			},
+			{
+				name: "more than one column",
+				rec:  indexRecord{name: "RecIdx", columns: []indexColumn{{name: "A"}, {name: "B"}}},
+				want: ErrMultiColumnIndex,
+			},
+			{
+				name: "DESC or NOCASE column",
+				rec:  indexRecord{name: "d", columns: []indexColumn{{name: "A", descending: true}}},
+				want: ErrIndexNotMaintained,
+			},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				if _, err := maintainableIndexColumn(c.rec); !errors.Is(err, c.want) {
+					t.Errorf("maintainableIndexColumn(%q) = %v, want %v", c.rec.name, err, c.want)
+				}
+			})
+		}
 	})
+}
+
+// TestWriterRefusesAConstrainedTable pins the gate that sits in front of index
+// maintenance: a table declaring any constraint refuses every write, because
+// nothing here checks a NOT NULL, a MINVALUE/MAXVALUE pair or a uniqueness
+// rule, and a write that ignores them leaves the file holding a row the engine
+// would have rejected.
+//
+// Constraints.abs isolates one clause per table, so each case names exactly
+// which one stopped the write. CNone is the control: the same file, the same
+// writer, no constraint, and the write is not refused. Every constrained
+// customer fixture lands here too -- which is most of them -- and that is the
+// intended outcome, not a side effect: before parseSchemaTail decoded the
+// constraint array these tables were refused only when they also carried an
+// index, and only because their tail did not parse.
+func TestWriterRefusesAConstrainedTable(t *testing.T) {
+	for _, c := range []struct {
+		table string
+		want  error
+	}{
+		{"CNone", nil},
+		{"CDefault", nil},
+		{"CNotNull", ErrConstraintsNotEnforced},
+		{"CPk", ErrConstraintsNotEnforced},
+		{"CUnique", ErrConstraintsNotEnforced},
+		{"CMinMax", ErrConstraintsNotEnforced},
+		{"CBoth", ErrConstraintsNotEnforced},
+		{"CPkMulti", ErrConstraintsNotEnforced},
+	} {
+		t.Run(c.table, func(t *testing.T) {
+			path := writableCopy(t, "Constraints.abs")
+
+			db, err := OpenForWrite(path)
+			if err != nil {
+				t.Fatalf("OpenForWrite: %v", err)
+			}
+
+			defer db.Close()
+
+			tbl, err := db.Table(c.table)
+			if err != nil {
+				t.Fatalf("Table(%q): %v", c.table, err)
+			}
+
+			w, err := tbl.OpenWriter()
+			if err != nil {
+				t.Fatalf("OpenWriter(%q): %v", c.table, err)
+			}
+
+			_, err = w.maintainedIndexes()
+
+			switch {
+			case c.want == nil && err != nil:
+				t.Errorf("writing %q = %v, want it to be allowed", c.table, err)
+			case c.want != nil && !errors.Is(err, c.want):
+				t.Errorf("writing %q = %v, want %v", c.table, err, c.want)
+			}
+		})
+	}
 }
 
 // requireWriteRefusal fails unless insert, delete and an update of the first

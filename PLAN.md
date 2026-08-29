@@ -2206,11 +2206,16 @@ done, and each is worth recording for what it cost rather than for the tick:
 
 **Next**, in rough order of what unblocks the most:
 
-- **Widening what compaction accepts.** It refuses a table carrying constraint records
-  (`ErrConstraintsNotRebuilt`), because `CREATE TABLE` cannot write them back and a silent
-  drop of a `NOT NULL` or a `PRIMARY KEY` is worse than a refusal. Writing constraint records
-  is the missing half of the constraint work: `ddl_constraint.go` reads them, nothing writes
-  them. That one gap is what keeps compaction off most real tables.
+- **Writing constraints, which now blocks two things.** `ddl_constraint.go` reads constraint
+  records and nothing writes or checks them, and that one gap shows up twice. Compaction
+  refuses a table carrying them (`ErrConstraintsNotRebuilt`), because `CREATE TABLE` cannot
+  write them back and a silent drop of a `NOT NULL` or a `PRIMARY KEY` is worse than a
+  refusal. The record writer refuses one too (`ErrConstraintsNotEnforced`), because no write
+  here checks a `NOT NULL`, a `MINVALUE`/`MAXVALUE` pair or a uniqueness rule, and a row the
+  engine would have rejected is not a row this package may write. Between them that keeps both
+  operations off most real tables. A `DEFAULT` is the same problem one level down and is
+  refused the same way (`ErrColumnDefault`): it lives in the column definition, not in the
+  constraint array, and `serializeColumnDef` writes the absent marker unconditionally.
 - **Revisiting the `ALTER TABLE` rebuild**, now that file growth exists and the reason for
   splicing in place has expired. Compaction has since shown the object-id replay works, which
   was the other half of the objection.

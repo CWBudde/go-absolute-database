@@ -473,8 +473,8 @@ func buildSystemDirectory(connectionsPageNo, catalogPageNo int) []byte {
 	return out
 }
 
-// buildZeroInternalFile builds an uncompressed internal file of size zero
-// bytes, with DecompressedSize left at 0 rather than mirroring Size.
+// buildZeroInternalFile builds an uncompressed internal file of size bytes,
+// all of them zero, with DecompressedSize left at 0 rather than mirroring Size.
 //
 // That asymmetry is measured twice and in two places: page 3 of Empty.abs, the
 // connection table, and page 24 of MultiTable-create.abs, the system internal

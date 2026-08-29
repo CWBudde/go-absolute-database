@@ -56,6 +56,17 @@ var (
 	// definitions cannot be read are all refused here.
 	ErrIndexNotMaintained = errors.New("absdb: table has an index this package cannot maintain")
 
+	// ErrConstraintsNotEnforced reports a write against a table whose schema
+	// declares constraints, none of which this package checks: nothing here
+	// rejects a NULL in a NOT NULL column, a value outside a MINVALUE/MAXVALUE
+	// pair, or a duplicate under a PRIMARY KEY or UNIQUE clause. Letting the
+	// write through would leave the file holding a row the engine would have
+	// refused, which reads back fine here and is not what the engine wrote --
+	// the same reason maintainableIndexColumn refuses an index it would order
+	// differently. Refusing is the only outcome that cannot corrupt the
+	// table's own rules.
+	ErrConstraintsNotEnforced = errors.New("absdb: table carries constraints this package does not check")
+
 	// ErrBlobReferenceLost reports an update that would overwrite a column
 	// still holding a BLOB reference. The BLOB pages it points at would stay
 	// allocated with nothing referring to them, and this package cannot free

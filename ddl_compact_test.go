@@ -546,6 +546,11 @@ func TestCompactDatabaseRefusesAnExistingDestination(t *testing.T) {
 // refusal is the right one; this is the matrix that shows it, one variation per
 // table, and it is also what says the two tables the rebuild *can* handle are
 // not refused by accident.
+//
+// CDefault is the one refusal that does not come from the constraint array:
+// a DEFAULT lives in the column definition, and serializeColumnDef writes the
+// absent marker unconditionally, so rebuilding that table would drop the
+// clause instead of failing on it.
 func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 	db := openTestFile(t, "Constraints.abs")
 
@@ -554,8 +559,8 @@ func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 		want  error
 	}{
 		{"CNone", nil},
-		{"CDefault", nil},
 		{"CIdxOne", nil},
+		{"CDefault", ErrColumnDefault},
 		{"CNotNull", ErrConstraintsNotRebuilt},
 		{"CPk", ErrConstraintsNotRebuilt},
 		{"CUnique", ErrConstraintsNotRebuilt},

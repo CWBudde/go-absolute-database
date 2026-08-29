@@ -61,6 +61,15 @@ var (
 	// does not build (a fresh table's is empty), so it must be edited
 	// surgically rather than through a general re-serializer.
 	ErrUnsupportedColumnType = errors.New("absdb: column type has no corpus evidence for CREATE TABLE")
+
+	// ErrColumnDefault reports a column whose definition carries a DEFAULT
+	// clause. serializeColumnDef always writes the no-default marker, because
+	// Column has no field for a default and CREATE TABLE has no syntax here to
+	// declare one. Re-serializing a parsed column that has one would therefore
+	// drop it silently -- the table would read back fine and would no longer
+	// fill the column in on an insert that omits it -- so the column is
+	// refused instead. testdata/Constraints.abs's CDefault is the fixture.
+	ErrColumnDefault = errors.New("absdb: column carries a DEFAULT clause this package cannot write")
 )
 
 const (
@@ -459,11 +468,21 @@ func serializeColumnDefs(columns []Column) ([]byte, error) {
 // Only the two (BaseType, FieldType) combinations knownColumnTypes lists are
 // supported -- everything else is refused with ErrUnsupportedColumnType
 // rather than guessed at, because the padding width and the terminator's
-// middle byte are only pinned by corpus evidence for those two.
+// middle byte are only pinned by corpus evidence for those two. A column
+// carrying a DEFAULT is refused with ErrColumnDefault for the same reason in
+// reverse: the trailing typed value written here is always the absent marker,
+// so a column that had one would come out without it.
 func serializeColumnDef(col Column) ([]byte, error) {
 	want, ok := knownColumnTypes[col.BaseType]
 	if !ok || want != col.FieldType || col.IsBLOB() {
 		return nil, fmt.Errorf("%w: base type %d / field type %s", ErrUnsupportedColumnType, col.BaseType, col.FieldType)
+	}
+
+	// Only a column read off a disk image can have this set, so this refuses
+	// re-serializing a parsed definition whose DEFAULT the output would lose,
+	// never a column a caller built for CreateTable.
+	if col.hasDefault {
+		return nil, fmt.Errorf("%w: column %q", ErrColumnDefault, col.Name)
 	}
 
 	raw, err := charmap.Windows1252.NewEncoder().Bytes([]byte(col.Name))

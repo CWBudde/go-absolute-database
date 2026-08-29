@@ -97,11 +97,17 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   exactly the shape `CREATE INDEX` builds. Everything else is refused with `ErrIndexNotMaintained`
   rather than guessed at: a tree deep enough to have split, a key of another shape, and an index
   whose ordering this package does not reproduce — multi-column, `DESC`, `NOCASE`, or backing a
-  `UNIQUE`/`PRIMARY KEY` constraint, since nothing here checks for duplicates. **Every indexed
-  customer fixture still refuses writes**, and it is worth knowing why the reason changed: it used
-  to be that `parseSchemaTail` could not read their schema tail at all, and since `ddl_constraint.go`
-  it is the index shapes themselves. The outcome is the same and the refusal is now a stated fact
-  rather than an unread one. What it replaced is worse than a refusal: `Update` went through and
+  `UNIQUE`/`PRIMARY KEY` constraint, since nothing here checks for duplicates. In front of all of
+  that sits a broader gate: a table declaring **any** constraint refuses every write with
+  `ErrConstraintsNotEnforced` (`refuseConstraints` in `writer_index.go`), because nothing here checks
+  a `NOT NULL`, a `MINVALUE`/`MAXVALUE` pair or a uniqueness rule, and a write that ignores them
+  leaves the file holding a row the engine would have rejected. **Every constrained customer fixture
+  refuses writes**, indexed or not, and the reason has now changed twice: it used to be that
+  `parseSchemaTail` could not read their schema tail at all; `ddl_constraint.go` made that tail
+  readable and turned an accidental refusal into a hole — a constrained table with a maintainable
+  index would have accepted an insert violating its own `NOT NULL` — and the constraint gate is the
+  stated rule that closed it. Widening the refusal to unindexed constrained tables, which did accept
+  writes before, is deliberate: they were never checked either. What it replaced is worse than a refusal: `Update` went through and
   silently left the index describing a key the row no longer had. Two behaviours come from fixtures and must not be
   "tidied": a removal **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), and a
   key-moving update is a **removal followed by a sorted insertion**, not an in-place patch

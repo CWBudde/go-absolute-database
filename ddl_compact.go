@@ -86,9 +86,10 @@ import (
 // destination file is created rather than silently dropped from it: an
 // encrypted source (ErrEncryptionUnsupported, since CreateDatabase cannot write
 // the key material), a column type CREATE TABLE has no corpus evidence for
-// (ErrUnsupportedColumnType), a schema tail that does not parse
-// (ErrSchemaTailNotUnderstood), constraint records, which a re-created table
-// would lose (ErrConstraintsNotRebuilt), and an index that is not the plain,
+// (ErrUnsupportedColumnType), a column carrying a DEFAULT clause, which the
+// serializer cannot write back (ErrColumnDefault), a schema tail that does not
+// parse (ErrSchemaTailNotUnderstood), constraint records, which a re-created
+// table would lose (ErrConstraintsNotRebuilt), and an index that is not the plain,
 // ascending, case-sensitive, single-column Int32 index CreateIndex builds
 // (ErrIndexNotMaintained, ErrMultiColumnIndex or ErrUnsupportedIndexColumn).
 // Losing an index is not an acceptable outcome of a compaction, so a
@@ -262,11 +263,20 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 	}
 
 	for _, c := range schema.Columns {
-		// The same check CreateTable's serializer makes, made here so that a
+		// The same checks CreateTable's serializer makes, made here so that a
 		// column it cannot write refuses the compaction before any file exists.
 		if want, ok := knownColumnTypes[c.BaseType]; !ok || want != c.FieldType || c.IsBLOB() {
 			return compactTable{}, fmt.Errorf("%w: column %q is base type %d / field type %s",
 				ErrUnsupportedColumnType, c.Name, c.BaseType, c.FieldType)
+		}
+
+		// A DEFAULT lives in the column definition, not in the constraint
+		// array, so the ErrConstraintsNotRebuilt check below does not see it:
+		// testdata/Constraints.abs's CDefault carries no constraint record at
+		// all. Rebuilding such a table would succeed and quietly return a
+		// schema that no longer fills the column in.
+		if c.hasDefault {
+			return compactTable{}, fmt.Errorf("%w: column %q", ErrColumnDefault, c.Name)
 		}
 	}
 
