@@ -204,6 +204,17 @@ func (c Column) IsBLOB() bool {
 	return c.BaseType == BftBlob || c.BaseType == BftClob || c.BaseType == BftWideClob
 }
 
+// IsAutoInc reports whether the engine numbers this column itself.
+//
+// The field types run from FieldAutoInc through FieldAutoIncUint32, one per
+// integer width, and every AUTOINC column in the corpus is the first of them.
+// The narrower ones are recognised here so that a writer can refuse them by
+// name rather than mistake them for ordinary integers and leave the column's
+// counter stale; see writer_autoinc.go.
+func (c Column) IsAutoInc() bool {
+	return c.FieldType >= FieldAutoInc && c.FieldType <= FieldAutoIncUint32
+}
+
 // NotNull reports whether a NOT NULL constraint record names this column.
 //
 // known is false when the table's constraint array was not read -- because the

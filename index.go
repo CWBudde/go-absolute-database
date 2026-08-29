@@ -488,6 +488,24 @@ func (ir *IndexReader) findLeftmostLeaf(pageNo int) (int, error) {
 // for these keys — the least significant byte comes first, so it orders 256
 // before 2 — while the entries on a page are sorted by value.
 //
+// indexableKeyColumn reports whether an index over this column is one this
+// package builds and maintains: a 5-byte Int32 key, ordered by
+// compareInt32Keys.
+//
+// An AUTOINC column is included because its key is an Integer one byte for
+// byte -- Auto.abs's index record and leaf are the Int32 shape exactly. What
+// kept it out was not the key but the column's counter, which the engine keeps
+// in the table info file and this package now maintains (writer_autoinc.go).
+//
+// The rule had four copies before this one: the writer's index maintenance,
+// CREATE INDEX, CREATE TABLE's key constraints and the compaction rebuild. They
+// have to agree -- a rebuild that builds an index the writer will not maintain
+// produces a table nothing can insert into -- so they share this.
+func indexableKeyColumn(col Column) bool {
+	return col.BaseType == BftInt32 &&
+		(col.FieldType == FieldInteger || col.FieldType == FieldAutoInc)
+}
+
 // A NULL key sorts before every value, which is the opposite of what comparing
 // the flag byte as a number gives. No index in the corpus held one until
 // testdata/Keys-uniqnull.abs, whose UNIQUE index stores the NULL entry ahead

@@ -273,7 +273,7 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 	for _, c := range schema.Columns {
 		// The same checks CreateTable's serializer makes, made here so that a
 		// column it cannot write refuses the compaction before any file exists.
-		if want, ok := knownColumnTypes[c.BaseType]; !ok || want != c.FieldType || c.IsBLOB() {
+		if !knownColumnType(c) {
 			return compactTable{}, fmt.Errorf("%w: column %q is base type %d / field type %s",
 				ErrUnsupportedColumnType, c.Name, c.BaseType, c.FieldType)
 		}
@@ -396,7 +396,7 @@ func planCompactIndexes(
 			return nil, fmt.Errorf("index %q: %w", rec.name, err)
 		}
 
-		if c := schema.Columns[colIdx]; c.BaseType != BftInt32 || c.FieldType != FieldInteger {
+		if c := schema.Columns[colIdx]; !indexableKeyColumn(c) {
 			return nil, fmt.Errorf("%w: index %q keys %q, which is base type %d / field type %s",
 				ErrUnsupportedIndexColumn, rec.name, c.Name, c.BaseType, c.FieldType)
 		}
@@ -419,6 +419,10 @@ func rebuildInto(src, dst *File, plan []compactTable) error {
 			return err
 		}
 
+		if err := dst.bumpFoldedTransactions(tbl.constraints); err != nil {
+			return err
+		}
+
 		for _, idx := range tbl.indexes {
 			if err := dst.CreateIndex(tbl.name, idx.name, idx.column); err != nil {
 				return err
@@ -431,6 +435,39 @@ func rebuildInto(src, dst *File, plan []compactTable) error {
 	}
 
 	return dst.shrinkToLastUsedPage()
+}
+
+// bumpFoldedTransactions advances the header State once for each object
+// createTable wrote in the same transaction as the table but that the engine's
+// rebuild creates in one of its own: a key constraint's backing index, and the
+// constraint record itself.
+//
+// Auto-updcompact.abs is what says the engine counts them separately. Its
+// header State is 5, where one transaction for the database, one for the table
+// and one for the row copy give 3, and the two missing bumps are the PRIMARY
+// KEY's index and its record. MultiTable-dropcompact.abs corroborates from the
+// other side: it has no key constraint, its plain index is already a CreateIndex
+// call of its own, and its State of 6 was reached without this.
+//
+// This is bookkeeping, not structure. The engine's CREATE TABLE ... PRIMARY KEY
+// really is one transaction -- Keys.abs is reproduced byte for byte, header
+// State included, by a single createTable -- so the extra bumps belong to the
+// rebuild and to nothing else.
+func (db *File) bumpFoldedTransactions(constraints []constraintRecord) error {
+	for _, rec := range constraints {
+		if rec.kind != constraintPrimaryKey && rec.kind != constraintUnique {
+			continue
+		}
+
+		// One for the index, one for the record.
+		for range 2 {
+			if err := db.bumpFileState(); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // copyTableRows copies every row of one table, in the order the source reads

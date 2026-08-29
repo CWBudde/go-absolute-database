@@ -291,7 +291,7 @@ func (w *TableWriter) describeIndex(rec indexRecord) (maintainedIndex, error) {
 		return maintainedIndex{}, fmt.Errorf("%w: index %q: %w", ErrIndexNotMaintained, rec.name, err)
 	}
 
-	if col := schema.Columns[colIdx]; col.BaseType != BftInt32 || col.FieldType != FieldInteger {
+	if col := schema.Columns[colIdx]; !indexableKeyColumn(col) {
 		return maintainedIndex{}, fmt.Errorf("%w: index %q keys %q, which is base type %d / field type %s",
 			ErrIndexNotMaintained, rec.name, col.Name, col.BaseType, col.FieldType)
 	}

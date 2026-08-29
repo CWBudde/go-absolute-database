@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"golang.org/x/text/encoding/charmap"
@@ -109,9 +110,26 @@ const (
 
 // knownColumnTypes is the set of (BaseType, FieldType) combinations CREATE
 // TABLE has corpus evidence for.
-var knownColumnTypes = map[BaseFieldType]FieldType{
-	BftInt32:   FieldInteger,
-	BftVarchar: FieldString,
+//
+// Int32/AutoInc is the newest, and its evidence is Auto.abs: the column
+// definition is the Int32/Integer one with the field-type byte changed, size 0
+// and the same autoinc block and absent-DEFAULT marker every other column
+// carries. TestCreateAutoIncTableMatchesEngineByteForByte rebuilds the whole of
+// that file from Empty.abs, which is what pins it -- a serializer that had the
+// shape wrong would not reproduce the compressed schema stream.
+var knownColumnTypes = map[BaseFieldType][]FieldType{
+	BftInt32:   {FieldInteger, FieldAutoInc},
+	BftVarchar: {FieldString},
+}
+
+// knownColumnType reports whether serializeColumnDef has evidence for this
+// column's on-disk encoding.
+func knownColumnType(col Column) bool {
+	if col.IsBLOB() {
+		return false
+	}
+
+	return slices.Contains(knownColumnTypes[col.BaseType], col.FieldType)
 }
 
 // CreateTable adds a new, empty table to the database: no rows, no index, no
@@ -424,7 +442,7 @@ func keyConstraintIndex(rec constraintRecord, owner Column, objectID int) (index
 			ErrConstraintsNotRebuilt, rec.kind, rec.name)
 	}
 
-	if owner.BaseType != BftInt32 || owner.FieldType != FieldInteger {
+	if !indexableKeyColumn(owner) {
 		return indexRecord{}, fmt.Errorf(
 			"%w: the %s constraint %q is on %q, which is base type %d / field type %s",
 			ErrConstraintsNotRebuilt, rec.kind, rec.name, owner.Name, owner.BaseType, owner.FieldType,
@@ -751,8 +769,7 @@ func serializeColumnDefs(columns []Column) ([]byte, error) {
 // reverse: the trailing typed value written here is always the absent marker,
 // so a column that had one would come out without it.
 func serializeColumnDef(col Column) ([]byte, error) {
-	want, ok := knownColumnTypes[col.BaseType]
-	if !ok || want != col.FieldType || col.IsBLOB() {
+	if !knownColumnType(col) {
 		return nil, fmt.Errorf("%w: base type %d / field type %s", ErrUnsupportedColumnType, col.BaseType, col.FieldType)
 	}
 

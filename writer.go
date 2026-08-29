@@ -250,6 +250,13 @@ type TableWriter struct {
 	// -- a table whose tail does not parse gets the zero value, which checks
 	// nothing, and is the behaviour it had before the checks existed.
 	checks constraintChecks
+	// autoInc are the table's AUTOINC counters, read from the table info page
+	// on first use and written back by Commit. Like indexes, they are memoised
+	// with their error, so a table whose counters this package will not
+	// maintain is refused identically on every write rather than on some.
+	autoInc         []autoIncCounter
+	autoIncResolved bool
+	autoIncErr      error
 	// touched counts records modified in any way — inserted, updated or
 	// deleted. The engine's change counter advances by the number of records a
 	// statement affected, not by one per transaction: a two-row UPDATE moves it
@@ -348,6 +355,11 @@ func (w *TableWriter) UpdateColumn(id RecordID, col int, value any) error {
 // has one, and returns the slot it used. It reports ErrTableFull when every
 // slot of every data page is occupied.
 func (w *TableWriter) Insert(values []any) (RecordID, error) {
+	values, err := w.assignAutoInc(values)
+	if err != nil {
+		return RecordID{}, err
+	}
+
 	rec, err := w.r.encodeRecord(values)
 	if err != nil {
 		return RecordID{}, err
@@ -398,6 +410,11 @@ func (w *TableWriter) Insert(values []any) (RecordID, error) {
 	buf.dirty = true
 	w.delta[id.PageNo]++
 	w.touched++
+
+	err = w.raiseAutoInc(rec)
+	if err != nil {
+		return RecordID{}, err
+	}
 
 	err = w.indexInsert(indexes, id)
 	if err != nil {
@@ -862,7 +879,12 @@ func (w *TableWriter) updateTableInfo() error {
 		return err
 	}
 
-	return w.updateCounters(total)
+	err = w.updateCounters(total)
+	if err != nil {
+		return err
+	}
+
+	return w.writeAutoIncCounters()
 }
 
 // updatePageCounts rewrites the per-page record counts of the internal

@@ -238,7 +238,7 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 		}
 	}
 
-	if col := schema.Columns[colIdx]; col.BaseType != BftInt32 || col.FieldType != FieldInteger {
+	if col := schema.Columns[colIdx]; !indexableKeyColumn(col) {
 		return createIndexPlan{}, fmt.Errorf("%w: %q is base type %d / field type %s",
 			ErrUnsupportedIndexColumn, col.Name, col.BaseType, col.FieldType)
 	}
