@@ -182,11 +182,17 @@ func (r indexRecord) coversColumn(name string) bool {
 type createIndexPlan struct {
 	table        *Table
 	colIdx       int
+	column       Column
 	schemaPageNo int
 	raw          []byte
 	colsEnd      int
 	indexCount   int32
 	tailStart    int
+
+	// constraintCount is what the constraint array opens with. A unique index
+	// adds a record to that array as well as to the index one, so the count
+	// has to be rewritten rather than copied through.
+	constraintCount int
 }
 
 // planCreateIndex validates a CREATE INDEX request and returns everything
@@ -221,7 +227,7 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 	// because it is the safety property that matters most: a table this
 	// package cannot safely edit around must be refused before any other
 	// validation gets a chance to look like a green light.
-	colsEnd, indexCount, records, _, tailStart, err := parseSchemaTail(raw)
+	colsEnd, indexCount, records, constraints, tailStart, err := parseSchemaTail(raw)
 	if err != nil {
 		return createIndexPlan{}, err
 	}
@@ -238,14 +244,39 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 	}
 
 	return createIndexPlan{
-		table:        t,
-		colIdx:       colIdx,
-		schemaPageNo: schemaPageNo,
-		raw:          raw,
-		colsEnd:      colsEnd,
-		indexCount:   indexCount,
-		tailStart:    tailStart,
+		table:           t,
+		colIdx:          colIdx,
+		column:          schema.Columns[colIdx],
+		schemaPageNo:    schemaPageNo,
+		raw:             raw,
+		colsEnd:         colsEnd,
+		indexCount:      indexCount,
+		tailStart:       tailStart,
+		constraintCount: len(constraints),
 	}, nil
+}
+
+// splice rebuilds the schema stream with the new index record appended to the
+// index array, and -- for a unique index -- the constraint record appended to
+// the constraint array as well.
+//
+// Appending to both is what testdata/Keys-uniqidx.abs shows: CREATE UNIQUE
+// INDEX IdxAlt ON Keys (Alt) leaves the primary key's records first and adds
+// IdxAlt and C_Unique$Alt behind them.
+func (p createIndexPlan) splice(record, constraint []byte) []byte {
+	indexArray := p.raw[p.colsEnd+4 : p.tailStart]
+
+	if constraint == nil {
+		return spliceIndexRecord(p.raw, p.colsEnd, p.indexCount+1, indexArray, record, p.raw[p.tailStart:])
+	}
+
+	trailerStart := len(p.raw) - systemIndexRootsSize
+	count := binary.LittleEndian.AppendUint32(nil, uint32(p.constraintCount+1)) //nolint:gosec // small counts
+
+	return spliceIndexRecord(p.raw, p.colsEnd, p.indexCount+1,
+		indexArray, record,
+		count, p.raw[p.tailStart+4:trailerStart], constraint,
+		p.raw[trailerStart:])
 }
 
 // CreateIndex adds a single-column index to a table.
@@ -262,8 +293,30 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 // constraints is no longer refused: its constraint records are parsed, and the
 // new index record is spliced in ahead of them so they come back byte for byte.
 // Note that the new index is a plain one -- CreateIndex neither creates nor
-// enforces a constraint.
+// enforces a constraint. CreateUniqueIndex does both.
 func (db *File) CreateIndex(table, index, column string) error {
+	return db.createIndex(table, index, column, false)
+}
+
+// CreateUniqueIndex adds a single-column index that refuses a duplicate key,
+// the way CREATE UNIQUE INDEX does.
+//
+// It is not CreateIndex with a flag set in the file: the engine writes a UNIQUE
+// constraint record alongside the index and hands out two object ids rather
+// than one, which testdata/Keys-uniqidx.abs is the evidence for. The record's
+// name is generated from the covered column -- "C_Unique$Alt" for a unique
+// index on Alt -- and its table name is left empty, both of which that file
+// pins.
+//
+// Every refusal CreateIndex makes applies, plus one: a column already holding
+// two equal values cannot be indexed uniquely (ErrDuplicateKey), which is what
+// the SDK manual says the engine checks "when the index is created (if data
+// already exist)". A NULL counts as a value, so two of those collide as well.
+func (db *File) CreateUniqueIndex(table, index, column string) error {
+	return db.createIndex(table, index, column, true)
+}
+
+func (db *File) createIndex(table, index, column string, unique bool) error {
 	if !db.writable {
 		return ErrReadOnly
 	}
@@ -276,6 +329,12 @@ func (db *File) CreateIndex(table, index, column string) error {
 	entries, err := db.buildIndexLeafEntries(plan.table, plan.colIdx)
 	if err != nil {
 		return err
+	}
+
+	if unique {
+		if err := refuseDuplicateEntries(entries, index, plan.column.Name); err != nil {
+			return err
+		}
 	}
 
 	w := newPageEdit(db)
@@ -293,20 +352,12 @@ func (db *File) CreateIndex(table, index, column string) error {
 
 	objectID := int(db.lastObjectID) + 1
 
-	record, err := serializeIndexRecord(indexRecord{
-		name:       index,
-		objectID:   uint32(objectID),  //nolint:gosec // small object ids
-		rootPageNo: int32(rootPageNo), //nolint:gosec // small page numbers
-		columns:    []indexColumn{{name: column, maxIndexedSize: indexColumnMaxIndexedSize}},
-	})
+	record, constraint, err := serializeNewIndex(plan, index, objectID, rootPageNo, unique)
 	if err != nil {
 		return err
 	}
 
-	newRaw := spliceIndexRecord(plan.raw, plan.colsEnd, plan.indexCount+1,
-		plan.raw[plan.colsEnd+4:plan.tailStart], record, plan.raw[plan.tailStart:])
-
-	if err := db.writeSchemaStream(w, plan.schemaPageNo, newRaw); err != nil {
+	if err := db.writeSchemaStream(w, plan.schemaPageNo, plan.splice(record, constraint)); err != nil {
 		return err
 	}
 
@@ -314,7 +365,12 @@ func (db *File) CreateIndex(table, index, column string) error {
 		return err
 	}
 
-	if err := db.setLastObjectID(int32(objectID)); err != nil { //nolint:gosec // small object ids
+	last := objectID
+	if unique {
+		last++
+	}
+
+	if err := db.setLastObjectID(int32(last)); err != nil { //nolint:gosec // small object ids
 		return err
 	}
 
@@ -324,6 +380,67 @@ func (db *File) CreateIndex(table, index, column string) error {
 
 	if err := db.f.Sync(); err != nil {
 		return fmt.Errorf("absdb: flushing CREATE INDEX %q on %q: %w", index, table, err)
+	}
+
+	return nil
+}
+
+// serializeNewIndex builds the records CREATE INDEX splices in: the index
+// record always, and the UNIQUE constraint record naming it when the index is
+// a unique one. The constraint takes the object id after the index's, which is
+// the order testdata/Keys-uniqidx.abs hands them out in.
+func serializeNewIndex(
+	plan createIndexPlan, index string, objectID, rootPageNo int, unique bool,
+) (record, constraint []byte, err error) {
+	record, err = serializeIndexRecord(indexRecord{
+		name:       index,
+		objectID:   uint32(objectID), //nolint:gosec // small object ids
+		unique:     unique,
+		rootPageNo: int32(rootPageNo), //nolint:gosec // small page numbers
+		columns:    []indexColumn{{name: plan.column.Name, maxIndexedSize: indexColumnMaxIndexedSize}},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !unique {
+		return record, nil, nil
+	}
+
+	constraint, err = serializeConstraintRecord(constraintRecord{
+		kind:     constraintUnique,
+		name:     uniqueConstraintName(plan.column.Name),
+		objectID: uint32(objectID + 1), //nolint:gosec // small object ids
+		ownerID:  uint32(objectID),     //nolint:gosec // small object ids
+		index:    index,
+		columns:  []constraintColumn{{name: plan.column.Name, objectID: plan.column.ID}},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return record, constraint, nil
+}
+
+// uniqueConstraintName is the name the engine generates for the constraint a
+// UNIQUE clause or a CREATE UNIQUE INDEX produces: "C_Unique$" and the covered
+// column. Constraints.abs's CUnique gives "C_Unique$A" for the clause and
+// Keys-uniqidx.abs gives "C_Unique$Alt" for the statement, so the two routes
+// agree.
+func uniqueConstraintName(column string) string {
+	return "C_Unique$" + column
+}
+
+// refuseDuplicateEntries refuses to build a unique index over a column that
+// already holds a key twice, which the SDK manual says the engine checks when
+// the index is created. The entries are sorted by key, so equal keys are
+// adjacent.
+func refuseDuplicateEntries(entries []BTreeEntry, index, column string) error {
+	for i := 1; i < len(entries); i++ {
+		if compareInt32Keys(entries[i-1].Key, entries[i].Key) == 0 {
+			return fmt.Errorf("%w: %q already holds two rows with the same value, so %q cannot be unique",
+				ErrDuplicateKey, column, index)
+		}
 	}
 
 	return nil

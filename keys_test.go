@@ -760,3 +760,75 @@ func TestCompactKeysFixture(t *testing.T) {
 		t.Errorf("insert of a fresh row = %v, want it to be allowed", err)
 	}
 }
+
+// TestCreateUniqueIndexMatchesEngineByteForByte holds CreateUniqueIndex to the
+// statement that produced Keys-uniqidx.abs. Page State words are excluded, as
+// they are for CreateIndex: CREATE INDEX reseeds every page it rewrites, not
+// only the one it allocates.
+//
+// The bar matters more here than for a plain index, because a unique one
+// writes two things rather than one -- the index record with its UNIQUE flag
+// and a constraint record naming it -- and both the generated constraint name
+// and its empty table name are the engine's choices, not this package's.
+func TestCreateUniqueIndexMatchesEngineByteForByte(t *testing.T) {
+	want, err := os.ReadFile(requireFixture(t, keysUniqueIdxFixure))
+	if err != nil {
+		t.Fatalf("reading %s: %v", keysUniqueIdxFixure, err)
+	}
+
+	path := writableCopy(t, keysFixture)
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	if err := db.CreateUniqueIndex("Keys", "IdxAlt", "Alt"); err != nil {
+		t.Fatalf("CreateUniqueIndex: %v", err)
+	}
+
+	pageSize, pageCount := db.PageSize(), db.PageCount()
+
+	db.Close()
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading result: %v", err)
+	}
+
+	excluded := make(map[int]bool, pageCount*4)
+
+	for no := range pageCount {
+		for i := range 4 {
+			excluded[no*pageSize+pageStateOffset+i] = true
+		}
+	}
+
+	reportByteDifferencesExcept(t, got, want, "CREATE UNIQUE INDEX IdxAlt ON Keys (Alt)", excluded)
+}
+
+// TestCreateUniqueIndexRefusesAnExistingDuplicate covers the check the manual
+// says the engine makes when the index is created. Two rows share Alt = 10
+// after the insert, so the index cannot be built.
+func TestCreateUniqueIndexRefusesAnExistingDuplicate(t *testing.T) {
+	path := writableCopy(t, keysFixture)
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	defer db.Close()
+
+	insertOneRow(t, db, "Keys", []any{int32(4), int32(10), "Alan"})
+
+	if err := db.CreateUniqueIndex("Keys", "IdxAlt", "Alt"); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("CreateUniqueIndex over a duplicated column = %v, want ErrDuplicateKey", err)
+	}
+
+	// A plain index over the same column is still fine, which is what says the
+	// refusal is about uniqueness rather than about the data.
+	if err := db.CreateIndex("Keys", "IdxAlt", "Alt"); err != nil {
+		t.Errorf("CreateIndex over the same column = %v, want it to be allowed", err)
+	}
+}
