@@ -49,8 +49,8 @@ var (
 	// have.
 	ErrNoSuchIndex = errors.New("absdb: no such index")
 
-	// ErrNoSuchColumn reports a CREATE INDEX naming a column the table does not
-	// have.
+	// ErrNoSuchColumn reports a CREATE INDEX or a DROP COLUMN (ddl_alter.go)
+	// naming a column the table does not have.
 	ErrNoSuchColumn = errors.New("absdb: no such column")
 
 	// ErrMultiColumnIndex reports a CREATE INDEX over more than one column, or
