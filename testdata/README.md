@@ -10,12 +10,12 @@ project files — run `just test` locally for that.
 
 ## The committed fixtures
 
-Eight sets are committed, fifty-two files in all: the eight `Employees-*.abs` files, one per
+Eight sets are committed, fifty-three files in all: the eight `Employees-*.abs` files, one per
 encryption algorithm, the fourteen `Writes*.abs` files that pin the write path, the twelve
 `MultiTable*.abs` files that pin the table catalog and the schema operations over it, the five
 `Empty*.abs` files that pin what the engine writes for a brand-new database,
 `Constraints.abs`, which isolates one column constraint or index variation per table, the
-two `Types*.abs` files, which between them hold every field type the format supports, the eight
+two `Types*.abs` files, which between them hold every field type the format supports, the nine
 `Keys*.abs` files that pin a key-enforcing index, and the two `Auto*.abs` files that say what an
 `AUTOINC` key does not write.
 
@@ -385,7 +385,7 @@ no UTF-16 strings at all.
 
 The `Writes-idx*` files pin index maintenance against a **plain** index, which is why every write
 to a table declaring a `PRIMARY KEY` or `UNIQUE` constraint was refused: the leaf splice for a
-key-enforcing index had no byte identity behind it. These eight files are that evidence, built
+key-enforcing index had no byte identity behind it. These nine files are that evidence, built
 the same way — a base plus one statement per derivative.
 
 The table is `Keys` — `Id` INTEGER **PRIMARY KEY**, `Alt` INTEGER, `Name` VARCHAR(20) — with
@@ -425,10 +425,12 @@ transaction counter moved:
 | `INSERT INTO Keys VALUES (NULL, 99, 'Nul')`                     | `Constraint 'C_PK$Id' violated. Value in field 'Id' cannot be null` (30330) |
 | `INSERT INTO Keys VALUES (6, 10, 'Dup2')` on `Keys-uniqidx.abs` | `Constraint unique 'C_Unique$Alt' violated. Duplicate found.` (30320)       |
 
-The second is the surprise: a `PRIMARY KEY` column carries **no** `NOT NULL` constraint record,
-and the engine refuses a NULL in it anyway. A writer that only consults the constraint array
-would let one through. The third against a `UNIQUE` index is refused, while `Keys-uniqnull.abs`
-shows a NULL in the same index accepted — so "duplicate" does not include a second NULL.
+Two of them are surprises. A `PRIMARY KEY` column carries **no** `NOT NULL` constraint record,
+and the engine refuses a NULL in it anyway, so a writer that only consults the constraint array
+would let one through. And a `UNIQUE` index admits the _first_ NULL (`Keys-uniqnull.abs`) but
+refuses the second as a duplicate — the engine compares NULL keys by value rather than treating
+them as distinct the way SQL does. The rule is therefore uniform: a key index refuses any key
+already in its leaf, NULL included, and a `PRIMARY` one refuses a NULL outright.
 
 ### `Auto*.abs` — what an `AUTOINC` key does not write
 

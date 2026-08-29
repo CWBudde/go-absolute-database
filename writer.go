@@ -58,9 +58,12 @@ var (
 
 	// ErrConstraintsNotEnforced reports a write against a table declaring a
 	// constraint this package does not check. NOT NULL and MINVALUE/MAXVALUE
-	// are checked (writer_constraint.go, ErrNotNullViolated and
-	// ErrCheckViolated); a PRIMARY KEY or UNIQUE clause is not, and neither is
-	// a record whose covered column or bound type cannot be resolved.
+	// are checked here (writer_constraint.go, ErrNotNullViolated and
+	// ErrCheckViolated), and a PRIMARY KEY or UNIQUE clause is checked by the
+	// index implementing it (ErrDuplicateKey). What is left is a record whose
+	// covered column or bound type cannot be resolved, and a key whose index
+	// is not one this writer maintains -- though an unmaintainable index
+	// usually stops the write with ErrIndexNotMaintained first.
 	//
 	// Letting such a write through would leave the file holding a row the
 	// engine would have refused, which reads back fine here and is not what
@@ -355,15 +358,22 @@ func (w *TableWriter) Insert(values []any) (RecordID, error) {
 		return RecordID{}, err
 	}
 
-	// All three refusals happen before the record is written, so an insert
+	// All four refusals happen before the record is written, so an insert
 	// that cannot be indexed leaves no row behind that no index describes, and
-	// one that breaks a constraint leaves none at all.
+	// one that breaks a constraint or duplicates a key leaves none at all --
+	// which is what the engine does too: a refused insert left every Keys*.abs
+	// probe byte-identical to its parent.
 	err = w.checkConstraints(rec)
 	if err != nil {
 		return RecordID{}, err
 	}
 
 	err = w.indexRoom(indexes)
+	if err != nil {
+		return RecordID{}, err
+	}
+
+	err = w.checkKeyIndexes(indexes, rec, nil)
 	if err != nil {
 		return RecordID{}, err
 	}

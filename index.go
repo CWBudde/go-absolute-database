@@ -487,13 +487,18 @@ func (ir *IndexReader) findLeftmostLeaf(pageNo int) (int, error) {
 // the value in little-endian byte order. Byte-wise comparison must not be used
 // for these keys — the least significant byte comes first, so it orders 256
 // before 2 — while the entries on a page are sorted by value.
+//
+// A NULL key sorts before every value, which is the opposite of what comparing
+// the flag byte as a number gives. No index in the corpus held one until
+// testdata/Keys-uniqnull.abs, whose UNIQUE index stores the NULL entry ahead
+// of 10, 20 and 30; before it, this ordered NULL last and nothing noticed.
 func compareInt32Keys(a, b []byte) int {
 	if len(a) < primaryKeySize || len(b) < primaryKeySize {
 		return bytes.Compare(a, b)
 	}
 
-	if a[0] != b[0] {
-		if a[0] < b[0] {
+	if (a[0] == 0) != (b[0] == 0) {
+		if a[0] != 0 {
 			return -1
 		}
 

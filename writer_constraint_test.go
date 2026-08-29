@@ -135,7 +135,7 @@ func TestNewConstraintChecksRefusals(t *testing.T) {
 		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := newConstraintChecks([]constraintRecord{c.rec}, schema, "T")
+			_, err := newConstraintChecks([]constraintRecord{c.rec}, schema, "T", nil)
 			if !errors.Is(err, ErrConstraintsNotEnforced) {
 				t.Errorf("newConstraintChecks = %v, want ErrConstraintsNotEnforced", err)
 			}
@@ -158,7 +158,7 @@ func TestBoundsCheckDecodesASignedBound(t *testing.T) {
 		maxValue: typedValue{baseType: BftInt16, present: true, data: []byte{0x64, 0x00}}, // 100
 	}
 
-	checks, err := newConstraintChecks([]constraintRecord{rec}, schema, "T")
+	checks, err := newConstraintChecks([]constraintRecord{rec}, schema, "T", nil)
 	if err != nil {
 		t.Fatalf("newConstraintChecks: %v", err)
 	}

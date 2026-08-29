@@ -571,40 +571,52 @@ func TestWriterMatchesEngineByteForByte(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			want, err := os.ReadFile(requireFixture(t, c.want))
-			if err != nil {
-				t.Fatalf("reading %s: %v", c.want, err)
-			}
-
-			path := writableCopy(t, c.base)
-
-			db, err := OpenForWrite(path)
-			if err != nil {
-				t.Fatalf("OpenForWrite: %v", err)
-			}
-
-			w, err := db.OpenTableWriter()
-			if err != nil {
-				t.Fatalf("OpenTableWriter: %v", err)
-			}
-
-			c.apply(t, db, w)
-
-			err = w.Commit()
-			if err != nil {
-				t.Fatalf("Commit: %v", err)
-			}
-
-			db.Close()
-
-			got, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatalf("reading result: %v", err)
-			}
-
-			reportByteDifferences(t, got, want, c.statement)
+			requireEngineBytes(t, c.base, c.want, c.statement, c.apply)
 		})
 	}
+}
+
+// requireEngineBytes applies one statement through this package to a writable
+// copy of base and requires the result to be byte-identical to want, the file
+// the engine produced for that same statement.
+//
+// It takes the single-table shorthand deliberately: every fixture it is used
+// on holds one table, so a case naming the wrong one would be a test bug
+// rather than a silent read of someone else's pages.
+func requireEngineBytes(t *testing.T, base, want, statement string, apply func(*testing.T, *File, *TableWriter)) {
+	t.Helper()
+
+	engine, err := os.ReadFile(requireFixture(t, want))
+	if err != nil {
+		t.Fatalf("reading %s: %v", want, err)
+	}
+
+	path := writableCopy(t, base)
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	w, err := db.OpenTableWriter()
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+
+	apply(t, db, w)
+
+	if err := w.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	db.Close()
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading result: %v", err)
+	}
+
+	reportByteDifferences(t, got, engine, statement)
 }
 
 // reportByteDifferences fails with the first few differing byte offsets, which

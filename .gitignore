@@ -89,6 +89,7 @@ testdata/*
 !testdata/Keys-ins0.abs
 !testdata/Keys-del.abs
 !testdata/Keys-upd.abs
+!testdata/Keys-updname.abs
 !testdata/Keys-uniqidx.abs
 !testdata/Keys-uniqins.abs
 !testdata/Keys-uniqnull.abs

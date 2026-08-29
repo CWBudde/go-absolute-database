@@ -45,14 +45,34 @@ import (
 //     engine would split (ErrIndexTooManyRows, the same error CreateIndex
 //     raises for a table too large to index in the first place);
 //   - a key that is not the 1-null-flag-byte-plus-int32 shape CreateIndex
-//     builds, an index over more than one column, a DESC or NOCASE column, an
-//     index enforcing a PRIMARY KEY or UNIQUE constraint, and a table whose
-//     schema tail does not parse at all (all ErrIndexNotMaintained). See
-//     maintainableIndexColumn for what each of those would get wrong;
-//   - a table declaring a PRIMARY KEY or UNIQUE constraint, indexed or not
-//     (ErrConstraintsNotEnforced). NOT NULL and MINVALUE/MAXVALUE are checked
-//     now (writer_constraint.go); a key is not, because checking it without
-//     being able to maintain the index that implements it would buy nothing.
+//     builds, an index over more than one column, a DESC or NOCASE column, and
+//     a table whose schema tail does not parse at all (all
+//     ErrIndexNotMaintained). See maintainableIndexColumn for what each of
+//     those would get wrong.
+//
+// A UNIQUE or PRIMARY index is no longer among them. Four more engine-made
+// fixtures, each one statement from Keys.abs -- a table whose PRIMARY KEY is a
+// plain Int32 column -- show the engine splicing a key-enforcing leaf exactly
+// as it splices a plain one, the vacated entry of a removal left in place
+// included. What a key index adds is the refusal in front of the splice, and
+// that too comes off files rather than off SQL's rules:
+//
+//	INSERT (2, ...)         a duplicate key            refused, file unchanged
+//	INSERT (NULL, ...)      a NULL primary key         refused, file unchanged
+//	INSERT (.., NULL, ..)   the first NULL in a UNIQUE index   accepted
+//	INSERT (.., NULL, ..)   the second one             refused as a duplicate
+//
+// So the engine compares NULL keys by value rather than treating them as
+// distinct the way SQL does, and a PRIMARY index refuses a NULL outright even
+// though a PRIMARY KEY column carries no NOT NULL constraint record. All four
+// refusals left the file byte-identical to its parent, transaction counter
+// included, which is why they are checked before anything is written.
+
+// ErrDuplicateKey reports a write whose key an index enforcing a PRIMARY KEY
+// or UNIQUE constraint already holds. The engine refuses such a write and
+// leaves the file byte-identical -- testdata/README.md lists the three
+// statements that show it -- so this is raised before any page is touched.
+var ErrDuplicateKey = errors.New("absdb: duplicate key in a UNIQUE or PRIMARY index")
 
 // maintainedIndex is one user index this writer keeps in step with the records:
 // which page its single leaf is, and which column it keys on.
@@ -63,8 +83,16 @@ import (
 // gave for leaving Update unguarded, and Phase 8's parseIndexRecord retired it.
 type maintainedIndex struct {
 	name       string
+	objectID   uint32
 	rootPageNo int
 	colIdx     int
+
+	// unique is set for a UNIQUE or PRIMARY index, which refuses a key its
+	// leaf already holds; primary additionally refuses a NULL key. The two
+	// come from the index record's flag bytes, and a constraint record built
+	// on this index is resolved through objectID (writer_constraint.go).
+	unique  bool
+	primary bool
 }
 
 // maintainedIndexes resolves the table's user indexes once per writer and
@@ -92,12 +120,22 @@ func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
 	// The schema tail is read first because the constraint array gates the
 	// write whether or not the table has an index, while the index records
 	// only matter if it has one. A tail that does not parse says nothing
-	// either way, so it is carried and only raised below, where an index makes
-	// it decisive -- refusing every unparsed tail here would newly refuse
-	// writes to the unindexed private files that have always accepted them.
+	// either way, so it is carried and only raised in discoverIndexes, where
+	// an index makes it decisive -- refusing every unparsed tail here would
+	// newly refuse writes to the unindexed private files that have always
+	// accepted them.
 	records, constraints, tailErr := w.tableSchemaTail()
+
+	indexes, err := w.discoverIndexes(records, tailErr)
+	if err != nil {
+		return nil, err
+	}
+
+	// The checks are built after the indexes, not before, because a PRIMARY
+	// KEY or UNIQUE record is only enforceable if the index implementing it is
+	// one of these -- the record itself carries nothing to test a row against.
 	if tailErr == nil {
-		checks, err := newConstraintChecks(constraints, w.r.Schema(), w.r.table.Name())
+		checks, err := newConstraintChecks(constraints, w.r.Schema(), w.r.table.Name(), indexes)
 		if err != nil {
 			return nil, err
 		}
@@ -105,6 +143,69 @@ func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
 		w.checks = checks
 	}
 
+	return indexes, nil
+}
+
+// discoverIndexes resolves the table's user indexes from the records in its
+// schema stream, and refuses the write unless every one of them is a shape
+// this package maintains.
+//
+// The schema is the authority on which indexes a table has, because it names
+// each one's root page outright. The pages are consulted only as a cross-check
+// in the other direction: an index the pages show that the schema does not
+// name stops the write, rather than being silently left stale.
+//
+// Trusting the pages alone is what used to happen, and it left an index whose
+// leaf is empty invisible -- index.go attributes an index to a table by which
+// data pages its entries point at, so an empty leaf points at nothing and is
+// not returned for a multi-table file. A table whose PRIMARY KEY index has no
+// rows in it yet is exactly that case, and it is the state every table this
+// package creates starts in.
+func (w *TableWriter) discoverIndexes(records []indexRecord, tailErr error) ([]maintainedIndex, error) {
+	found, err := w.tableUserIndexes()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(found) == 0 && len(records) == 0 {
+		return nil, nil
+	}
+
+	// A tail that does not parse says nothing about what indexes the table
+	// has, so it is only decisive once one of them is known to exist.
+	if tailErr != nil {
+		return nil, tailErr
+	}
+
+	named := make(map[int]bool, len(records))
+	for _, rec := range records {
+		named[int(rec.rootPageNo)] = true
+	}
+
+	for _, info := range found {
+		if !named[info.RootPageNo] {
+			return nil, fmt.Errorf("%w: an index rooted at page %d is not named in %q's schema",
+				ErrIndexNotMaintained, info.RootPageNo, w.r.table.Name())
+		}
+	}
+
+	indexes := make([]maintainedIndex, 0, len(records))
+
+	for _, rec := range records {
+		idx, err := w.describeIndex(rec)
+		if err != nil {
+			return nil, err
+		}
+
+		indexes = append(indexes, idx)
+	}
+
+	return indexes, nil
+}
+
+// tableUserIndexes returns the user indexes the table's pages show, treating a
+// file with no index at all as none rather than as an error.
+func (w *TableWriter) tableUserIndexes() ([]IndexInfo, error) {
 	ir, err := w.r.table.OpenIndex()
 	if err != nil {
 		if errors.Is(err, ErrNoIndex) {
@@ -114,32 +215,7 @@ func (w *TableWriter) resolveIndexes() ([]maintainedIndex, error) {
 		return nil, err
 	}
 
-	user := ir.UserIndexes()
-	if len(user) == 0 {
-		return nil, nil
-	}
-
-	if tailErr != nil {
-		return nil, tailErr
-	}
-
-	byRoot := make(map[int]indexRecord, len(records))
-	for _, rec := range records {
-		byRoot[int(rec.rootPageNo)] = rec
-	}
-
-	indexes := make([]maintainedIndex, 0, len(user))
-
-	for _, info := range user {
-		idx, err := w.describeIndex(info, byRoot)
-		if err != nil {
-			return nil, err
-		}
-
-		indexes = append(indexes, idx)
-	}
-
-	return indexes, nil
+	return ir.UserIndexes(), nil
 }
 
 // tableSchemaTail reads this table's index and constraint definitions out of
@@ -177,19 +253,13 @@ func (w *TableWriter) tableSchemaTail() ([]indexRecord, []constraintRecord, erro
 //   - a multi-column index concatenates its columns into one key;
 //   - a DESC column sorts the other way, and compareInt32Keys does not;
 //   - a NOCASE column compares case-folded, which no key this package builds
-//     does;
-//   - a UNIQUE or PRIMARY index rejects a duplicate key. A duplicate scan
-//     would be easy enough, but no fixture shows the engine inserting into
-//     such an index -- all four Writes-idx* files carry a plain one -- so the
-//     leaf splice would be the only write in this package with no byte
-//     identity behind it. The constraint and its index have to lift together;
-//     see writer_constraint.go.
+//     does.
+//
+// A UNIQUE or PRIMARY index used to be refused here as well, on the grounds
+// that no fixture showed the engine inserting into one. The Keys*.abs family
+// is that fixture, so what the flags now select is the duplicate check in
+// checkKeyIndexes rather than a refusal.
 func maintainableIndexColumn(rec indexRecord) (indexColumn, error) {
-	if rec.unique || rec.primary {
-		return indexColumn{}, fmt.Errorf("%w: index %q enforces a PRIMARY KEY or UNIQUE constraint this package does not check",
-			ErrIndexNotMaintained, rec.name)
-	}
-
 	col, ok := rec.singleColumn()
 	if !ok {
 		return indexColumn{}, fmt.Errorf("%w: %w: index %q covers %d columns",
@@ -204,22 +274,11 @@ func maintainableIndexColumn(rec indexRecord) (indexColumn, error) {
 	return col, nil
 }
 
-// describeIndex checks one discovered index against its schema record and the
-// column it keys on, and returns what maintenance needs. Every refusal here is
-// a shape this package will not guess at, checked before any record is written
-// so that a refused write leaves nothing behind.
-func (w *TableWriter) describeIndex(info IndexInfo, byRoot map[int]indexRecord) (maintainedIndex, error) {
-	rec, ok := byRoot[info.RootPageNo]
-	if !ok {
-		return maintainedIndex{}, fmt.Errorf("%w: an index rooted at page %d is not named in %q's schema",
-			ErrIndexNotMaintained, info.RootPageNo, w.r.table.Name())
-	}
-
-	if info.KeySize != indexKeySize {
-		return maintainedIndex{}, fmt.Errorf("%w: index %q has %d-byte keys, only %d-byte Int32 keys are maintained",
-			ErrIndexNotMaintained, rec.name, info.KeySize, indexKeySize)
-	}
-
+// describeIndex turns one schema index record into what maintenance needs,
+// checking the column it keys on and the leaf it is rooted at. Every refusal
+// here is a shape this package will not guess at, checked before any record is
+// written so that a refused write leaves nothing behind.
+func (w *TableWriter) describeIndex(rec indexRecord) (maintainedIndex, error) {
 	col, err := maintainableIndexColumn(rec)
 	if err != nil {
 		return maintainedIndex{}, err
@@ -237,7 +296,14 @@ func (w *TableWriter) describeIndex(info IndexInfo, byRoot map[int]indexRecord) 
 			ErrIndexNotMaintained, rec.name, col.Name, col.BaseType, col.FieldType)
 	}
 
-	idx := maintainedIndex{name: rec.name, rootPageNo: info.RootPageNo, colIdx: colIdx}
+	idx := maintainedIndex{
+		name:       rec.name,
+		objectID:   rec.objectID,
+		rootPageNo: int(rec.rootPageNo),
+		colIdx:     colIdx,
+		unique:     rec.unique || rec.primary,
+		primary:    rec.primary,
+	}
 
 	// Load the leaf now rather than at the first mutation, so that a tree this
 	// package cannot edit is refused before a record has been written.
@@ -322,6 +388,19 @@ func (l indexLeaf) ref(i int) RecordID {
 		PageNo: int(int32(binary.LittleEndian.Uint32(l.buf.payload[off : off+4]))),
 		Slot:   int(binary.LittleEndian.Uint16(l.buf.payload[off+4 : off+6])),
 	}
+}
+
+// hasKey reports whether the leaf already holds this key, by the same
+// comparison insert positions by. Sharing compareInt32Keys is the point: a
+// duplicate is exactly a key the splice would place beside an equal one.
+func (l indexLeaf) hasKey(key []byte) bool {
+	for i := range l.count() {
+		if compareInt32Keys(l.key(i), key) == 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // setCount writes the leaf's entry count back and marks the page modified.
@@ -435,6 +514,14 @@ func (w *TableWriter) indexKeyFor(id RecordID, colIdx int) ([]byte, error) {
 		return nil, err
 	}
 
+	return indexKeyOf(rec, colIdx), nil
+}
+
+// indexKeyOf builds one record's leaf key. It takes a Record rather than a
+// RecordID so that a key can be built for a record that has not been stored
+// yet, which is what the duplicate check needs: the engine leaves a refused
+// write's file byte-identical, so the check has to run before the row exists.
+func indexKeyOf(rec Record, colIdx int) []byte {
 	key := make([]byte, indexKeySize)
 
 	if rec.IsNull(colIdx) {
@@ -443,7 +530,72 @@ func (w *TableWriter) indexKeyFor(id RecordID, colIdx int) ([]byte, error) {
 		binary.LittleEndian.PutUint32(key[1:], uint32(rec.Int(colIdx)))
 	}
 
-	return key, nil
+	return key
+}
+
+// checkKeyIndexes refuses a write that a UNIQUE or PRIMARY index would reject:
+// a key the leaf already holds, and -- for a PRIMARY index -- a NULL.
+//
+// before is the keys the record held before this write, or nil for an insert.
+// An index whose key did not move is skipped, because the entry the leaf holds
+// for this very row would otherwise read as the duplicate.
+//
+// A NULL key is compared like any other value, which is not what SQL says and
+// is what the engine does: testdata/Keys-uniqnull.abs takes the first NULL
+// into a UNIQUE index and the second is refused as a duplicate.
+func (w *TableWriter) checkKeyIndexes(indexes []maintainedIndex, raw []byte, before [][]byte) error {
+	var rec Record
+
+	for i, idx := range indexes {
+		if !idx.unique {
+			continue
+		}
+
+		if rec.reader == nil {
+			var err error
+
+			rec, err = w.recordOver(raw)
+			if err != nil {
+				return err
+			}
+		}
+
+		key := indexKeyOf(rec, idx.colIdx)
+		if before != nil && bytes.Equal(before[i], key) {
+			continue
+		}
+
+		if err := w.checkKeyIndex(idx, key); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// checkKeyIndex tests one key against one key-enforcing index.
+func (w *TableWriter) checkKeyIndex(idx maintainedIndex, key []byte) error {
+	column := w.r.Schema().Columns[idx.colIdx].Name
+
+	// A PRIMARY KEY column carries no NOT NULL constraint record -- Keys.abs
+	// has none -- and the engine refuses a NULL in it anyway, so nothing in
+	// the constraint array would have caught this.
+	if idx.primary && key[0] != 0 {
+		return fmt.Errorf("%w: %s.%s, covered by the primary key index %q",
+			ErrNotNullViolated, w.r.table.Name(), column, idx.name)
+	}
+
+	leaf, err := w.indexLeaf(idx)
+	if err != nil {
+		return err
+	}
+
+	if leaf.hasKey(key) {
+		return fmt.Errorf("%w: index %q on %s.%s already holds that key",
+			ErrDuplicateKey, idx.name, w.r.table.Name(), column)
+	}
+
+	return nil
 }
 
 // indexRoom refuses an insert no index leaf has room for, before the record
@@ -527,6 +679,11 @@ func (w *TableWriter) storeRecordReindexing(id RecordID, buf *pageWriteBuf, star
 	}
 
 	before, err := w.indexKeys(indexes, id)
+	if err != nil {
+		return err
+	}
+
+	err = w.checkKeyIndexes(indexes, rec, before)
 	if err != nil {
 		return err
 	}

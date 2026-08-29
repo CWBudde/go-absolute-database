@@ -3,6 +3,7 @@ package absdb
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"sort"
 	"testing"
@@ -407,4 +408,230 @@ func equalStrings(a, b []string) bool {
 	}
 
 	return true
+}
+
+// TestKeyIndexWritesMatchEngineByteForByte is what lifting the refusal is held
+// to. Each case applies through this package the one statement the engine was
+// given, and requires the result to be byte-identical to the file the engine
+// wrote -- with no State exclusion, because maintenance allocates no page.
+//
+// These are the Writes-idx* cases repeated against a key-enforcing index, plus
+// the two only a key index has: an update that leaves the key alone, and an
+// insert that keeps two key indexes in step at once.
+func TestKeyIndexWritesMatchEngineByteForByte(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		base      string
+		want      string
+		statement string
+		apply     func(*testing.T, *File, *TableWriter)
+	}{
+		{
+			name:      "insert, key sorts last",
+			base:      keysFixture,
+			want:      "Keys-ins.abs",
+			statement: "INSERT INTO Keys VALUES (4, 40, 'Alan')",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				if _, err := w.Insert([]any{int32(4), int32(40), "Alan"}); err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			name:      "insert, key sorts first",
+			base:      keysFixture,
+			want:      "Keys-ins0.abs",
+			statement: "INSERT INTO Keys VALUES (0, 0, 'Zero')",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				if _, err := w.Insert([]any{int32(0), int32(0), "Zero"}); err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			name:      "delete the middle entry",
+			base:      keysFixture,
+			want:      "Keys-del.abs",
+			statement: "DELETE FROM Keys WHERE Id = 2",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.Delete(recordWithKey(t, db, 2)); err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+			},
+		},
+		{
+			name:      "update the key",
+			base:      keysFixture,
+			want:      "Keys-upd.abs",
+			statement: "UPDATE Keys SET Id = 9 WHERE Id = 2",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.UpdateColumn(recordWithKey(t, db, 2), 0, int32(9)); err != nil {
+					t.Fatalf("UpdateColumn: %v", err)
+				}
+			},
+		},
+		{
+			// The case the duplicate check could break: the key does not move,
+			// so the leaf must not be touched at all -- and the row's own
+			// entry must not read as the duplicate that refuses the write.
+			name:      "update a column the key does not cover",
+			base:      keysFixture,
+			want:      "Keys-updname.abs",
+			statement: "UPDATE Keys SET Name = 'Ada2' WHERE Id = 1",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.UpdateColumn(recordWithKey(t, db, 1), 2, "Ada2"); err != nil {
+					t.Fatalf("UpdateColumn: %v", err)
+				}
+			},
+		},
+		{
+			// Two key indexes on one table, both spliced by one insert.
+			name:      "insert with a primary key and a unique index",
+			base:      keysUniqueIdxFixure,
+			want:      "Keys-uniqins.abs",
+			statement: "INSERT INTO Keys VALUES (5, 50, 'Emmy')",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				if _, err := w.Insert([]any{int32(5), int32(50), "Emmy"}); err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			// A NULL is a value to a UNIQUE index: it is stored with the null
+			// flag set and sorts ahead of everything.
+			name:      "insert a NULL into a unique index",
+			base:      keysUniqueIdxFixure,
+			want:      "Keys-uniqnull.abs",
+			statement: "INSERT INTO Keys VALUES (7, NULL, 'Nul1')",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				if _, err := w.Insert([]any{int32(7), nil, "Nul1"}); err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			requireEngineBytes(t, c.base, c.want, c.statement, c.apply)
+		})
+	}
+}
+
+// TestKeyIndexRefusesADuplicate covers the four refusals the engine performs
+// and no fixture can hold, because each one left the file byte-identical to
+// its parent. The statements and the engine's own messages are in
+// testdata/README.md; what is checked here is that this package refuses the
+// same rows, and that it refuses them before writing anything.
+func TestKeyIndexRefusesADuplicate(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		fixture string
+		apply   func(*testing.T, *File, *TableWriter) error
+		want    error
+	}{
+		{
+			name:    "a duplicate primary key",
+			fixture: keysFixture,
+			want:    ErrDuplicateKey,
+			apply: func(_ *testing.T, _ *File, w *TableWriter) error {
+				_, err := w.Insert([]any{int32(2), int32(99), "Dup"})
+
+				return err
+			},
+		},
+		{
+			name:    "a NULL primary key",
+			fixture: keysFixture,
+			want:    ErrNotNullViolated,
+			apply: func(_ *testing.T, _ *File, w *TableWriter) error {
+				_, err := w.Insert([]any{nil, int32(99), "Nul"})
+
+				return err
+			},
+		},
+		{
+			name:    "an update onto another row's key",
+			fixture: keysFixture,
+			want:    ErrDuplicateKey,
+			apply: func(t *testing.T, db *File, w *TableWriter) error {
+				t.Helper()
+
+				return w.UpdateColumn(recordWithKey(t, db, 1), 0, int32(3))
+			},
+		},
+		{
+			name:    "a duplicate in a UNIQUE index",
+			fixture: keysUniqueIdxFixure,
+			want:    ErrDuplicateKey,
+			apply: func(_ *testing.T, _ *File, w *TableWriter) error {
+				_, err := w.Insert([]any{int32(6), int32(10), "Dup2"})
+
+				return err
+			},
+		},
+		{
+			// The second NULL, which SQL would admit and the engine does not.
+			name:    "a second NULL in a UNIQUE index",
+			fixture: "Keys-uniqnull.abs",
+			want:    ErrDuplicateKey,
+			apply: func(_ *testing.T, _ *File, w *TableWriter) error {
+				_, err := w.Insert([]any{int32(8), nil, "Nul2"})
+
+				return err
+			},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			before, err := os.ReadFile(requireFixture(t, c.fixture))
+			if err != nil {
+				t.Fatalf("reading %s: %v", c.fixture, err)
+			}
+
+			path := writableCopy(t, c.fixture)
+
+			db, err := OpenForWrite(path)
+			if err != nil {
+				t.Fatalf("OpenForWrite: %v", err)
+			}
+
+			w, err := db.OpenTableWriter()
+			if err != nil {
+				t.Fatalf("OpenTableWriter: %v", err)
+			}
+
+			if err := c.apply(t, db, w); !errors.Is(err, c.want) {
+				t.Errorf("write = %v, want %v", err, c.want)
+			}
+
+			// Committing after a refused write is what a caller would do next,
+			// and the engine's own answer is a file that did not move at all.
+			if err := w.Commit(); err != nil {
+				t.Fatalf("Commit: %v", err)
+			}
+
+			db.Close()
+
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("reading result: %v", err)
+			}
+
+			if !bytes.Equal(before, after) {
+				t.Errorf("a refused write changed the file; the engine leaves it byte-identical")
+			}
+		})
+	}
 }

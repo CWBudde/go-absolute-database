@@ -16,16 +16,15 @@ import (
 //	NOT NULL (kind 3)   the record's null flag for the covered column
 //	CHECK    (kind 4)   the value against the MINVALUE/MAXVALUE pair
 //
-// and the two key kinds -- PRIMARY KEY (0) and UNIQUE (2) -- keep the refusal,
-// with a reason that has changed. Checking a key needs a duplicate scan, which
-// is straightforward; what it would buy is nothing, because a key constraint
-// always comes with an index record implementing it, and maintainableIndexColumn
-// refuses to maintain that index anyway. Checking the constraint without being
-// able to move its index would let an insert through that leaves the index
-// describing rows it no longer covers -- the exact failure Phase 7's unguarded
-// Update was. The two have to lift together, and the index half needs a fixture
-// of the engine inserting into a UNIQUE or PRIMARY index, which the corpus does
-// not have: all four Writes-idx* files carry a plain index.
+// and the two key kinds -- PRIMARY KEY (0) and UNIQUE (2) -- are checked by
+// their index rather than here. A key record carries nothing to test a row
+// against: it names the index implementing the key, and it is that index that
+// refuses a duplicate (checkKeyIndexes in writer_index.go). So what this file
+// does for a key is structural -- it establishes that the index exists, that
+// it is one this writer maintains, and that it is flagged UNIQUE or PRIMARY --
+// and then records no per-row check at all. A key whose index fails any of
+// that keeps the refusal, because checking a constraint while leaving its
+// index stale is the exact failure Phase 7's unguarded Update was.
 //
 // # What a check is measured against
 //
@@ -44,7 +43,9 @@ import (
 
 var (
 	// ErrNotNullViolated reports a write storing NULL in a column a NOT NULL
-	// constraint record covers.
+	// constraint record covers, or in one a PRIMARY KEY index covers. The
+	// second is not redundant: a PRIMARY KEY column carries no NOT NULL record
+	// and the engine refuses a NULL in it anyway (testdata/README.md).
 	ErrNotNullViolated = errors.New("absdb: NULL in a NOT NULL column")
 
 	// ErrCheckViolated reports a write storing a value outside a column's
@@ -90,7 +91,9 @@ type boundsCheck struct {
 // does not test. The refusal is returned rather than recorded, because a
 // partially checked table is worse than an unwritable one: it would accept
 // writes under a constraint nobody looked at.
-func newConstraintChecks(constraints []constraintRecord, schema *TableSchema, table string) (constraintChecks, error) {
+func newConstraintChecks(
+	constraints []constraintRecord, schema *TableSchema, table string, indexes []maintainedIndex,
+) (constraintChecks, error) {
 	var checks constraintChecks
 
 	for _, rec := range constraints {
@@ -112,10 +115,9 @@ func newConstraintChecks(constraints []constraintRecord, schema *TableSchema, ta
 
 			checks.bounds = append(checks.bounds, bounds)
 		case constraintPrimaryKey, constraintUnique:
-			return constraintChecks{}, fmt.Errorf(
-				"%w: table %q declares the %s constraint %q, whose index this package does not maintain",
-				ErrConstraintsNotEnforced, table, rec.kind, rec.name,
-			)
+			if err := keyIndexEnforces(rec, indexes); err != nil {
+				return constraintChecks{}, fmt.Errorf("%w: table %q: %w", ErrConstraintsNotEnforced, table, err)
+			}
 		default:
 			return constraintChecks{}, fmt.Errorf("%w: table %q declares the constraint %q of kind %d",
 				ErrConstraintsNotEnforced, table, rec.name, byte(rec.kind))
@@ -123,6 +125,33 @@ func newConstraintChecks(constraints []constraintRecord, schema *TableSchema, ta
 	}
 
 	return checks, nil
+}
+
+// keyIndexEnforces reports whether the index a key constraint is built on is
+// one this writer maintains and refuses duplicates on. It is the whole of what
+// checking a key means here: nothing is recorded for the row check, because
+// the index does the refusing.
+//
+// The index is found by object id, which is what the record's ownerObjectID
+// holds for kinds 0 and 2 -- the covered column for the other two. Matching on
+// the name instead would accept a record naming an index of the same name on
+// another table.
+func keyIndexEnforces(rec constraintRecord, indexes []maintainedIndex) error {
+	for _, idx := range indexes {
+		if idx.objectID != rec.ownerID {
+			continue
+		}
+
+		if !idx.unique {
+			return fmt.Errorf("the %s constraint %q is built on index %q, which is not flagged UNIQUE or PRIMARY",
+				rec.kind, rec.name, idx.name)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("the %s constraint %q names index object %d, which is not an index this package maintains",
+		rec.kind, rec.name, rec.ownerID)
 }
 
 // constraintColumnIndex resolves the single column a column-shaped record
@@ -231,14 +260,27 @@ func (w *TableWriter) checkConstraints(rec []byte) error {
 		return nil
 	}
 
-	n := w.r.nullFlagBytes
-	if len(rec) < n+w.r.fieldDataSize {
-		return fmt.Errorf("%w: %d-byte record, want %d", ErrBadLayout, len(rec), n+w.r.fieldDataSize)
+	over, err := w.recordOver(rec)
+	if err != nil {
+		return err
 	}
 
-	return w.checks.check(Record{
+	return w.checks.check(over, w.r.table.Name())
+}
+
+// recordOver reads an encoded record the way a stored one is read, so that a
+// check can run against bytes that have not been written yet. Every refusal in
+// this package happens before a page is touched, and this is what the ones
+// that need field values are built on.
+func (w *TableWriter) recordOver(rec []byte) (Record, error) {
+	n := w.r.nullFlagBytes
+	if len(rec) < n+w.r.fieldDataSize {
+		return Record{}, fmt.Errorf("%w: %d-byte record, want %d", ErrBadLayout, len(rec), n+w.r.fieldDataSize)
+	}
+
+	return Record{
 		reader:    w.r,
 		nullFlags: rec[:n],
 		fieldData: rec[n : n+w.r.fieldDataSize],
-	}, w.r.table.Name())
+	}, nil
 }

@@ -92,21 +92,22 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 	})
 
 	t.Run("index shape the leaf writer cannot reproduce", func(t *testing.T) {
-		// The three refusals maintainableIndexColumn adds on top of the leaf
+		// The two refusals maintainableIndexColumn adds on top of the leaf
 		// shape, checked against hand-built records because no committed
 		// fixture reaches them: the private fixtures that carry these index
 		// shapes all declare a key constraint too, and the constraint gate
 		// stops their writes first (see TestWriterRefusesAConstrainedTable).
+		//
+		// A PRIMARY or UNIQUE flag used to be the third. It is not a refusal
+		// any more -- the Keys*.abs fixtures show the engine splicing such a
+		// leaf exactly as it splices a plain one -- so what the flag selects
+		// now is the duplicate check, which TestKeyIndexRefusesADuplicate
+		// covers.
 		for _, c := range []struct {
 			name string
 			rec  indexRecord
 			want error
 		}{
-			{
-				name: "PRIMARY KEY or UNIQUE",
-				rec:  indexRecord{name: "p", primary: true, columns: []indexColumn{{name: "A"}}},
-				want: ErrIndexNotMaintained,
-			},
 			{
 				name: "more than one column",
 				rec:  indexRecord{name: "RecIdx", columns: []indexColumn{{name: "A"}, {name: "B"}}},
@@ -132,18 +133,22 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 // refuses every write, because a write that ignores one leaves the file
 // holding a row the engine would have rejected.
 //
-// Which constraints those are has narrowed. NOT NULL and MINVALUE/MAXVALUE are
-// checked now (writer_constraint.go), so CNotNull and CMinMax accept writes
-// and are tested for what they reject in TestWriterChecksConstraints. A
-// PRIMARY KEY or UNIQUE clause still refuses, because its index is one
-// maintainableIndexColumn will not maintain and checking the constraint alone
-// would let a row through that the index no longer describes.
+// What is refused has narrowed twice. NOT NULL and MINVALUE/MAXVALUE are
+// checked (writer_constraint.go), so CNotNull and CMinMax accept writes and
+// are tested for what they reject in TestWriterChecksConstraints; a PRIMARY
+// KEY or UNIQUE clause over a single Int32 column is enforced by its own index
+// now (checkKeyIndexes), so CPk and CUnique accept writes too.
+//
+// What is left refuses because of the index rather than the record, and that
+// is the point of the two remaining cases: CBoth's UNIQUE is on a VARCHAR
+// column and CPkMulti's key covers two, so neither index is one this package
+// can splice. The refusal now comes from index resolution, which runs first --
+// a constraint whose index cannot be maintained is not separately reported as
+// unchecked, because the index is what would have checked it.
 //
 // Constraints.abs isolates one clause per table, so each case names exactly
 // which one stopped the write. CNone is the control: the same file, the same
-// writer, no constraint, and the write is not refused. CBoth is the case that
-// matters most -- it declares a NOT NULL and a UNIQUE -- because a checker
-// that recorded what it could and ignored the rest would let it through.
+// writer, no constraint, and the write is not refused.
 func TestWriterRefusesAConstrainedTable(t *testing.T) {
 	for _, c := range []struct {
 		table string
@@ -153,10 +158,10 @@ func TestWriterRefusesAConstrainedTable(t *testing.T) {
 		{"CDefault", nil},
 		{"CNotNull", nil},
 		{"CMinMax", nil},
-		{"CPk", ErrConstraintsNotEnforced},
-		{"CUnique", ErrConstraintsNotEnforced},
-		{"CBoth", ErrConstraintsNotEnforced},
-		{"CPkMulti", ErrConstraintsNotEnforced},
+		{"CPk", nil},
+		{"CUnique", nil},
+		{"CBoth", ErrIndexNotMaintained},
+		{"CPkMulti", ErrMultiColumnIndex},
 	} {
 		t.Run(c.table, func(t *testing.T) {
 			path := writableCopy(t, "Constraints.abs")
