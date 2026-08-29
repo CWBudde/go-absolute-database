@@ -81,7 +81,10 @@ Not unknowns — decisions, recorded so they can be revisited on purpose.
   rebuild needs six free pages and nothing could grow a file) has expired now that growth
   exists, and compaction has since shown object-id replay works. What remains is the work of
   reproducing the four-transaction sequence.
-- **Compaction refuses a table carrying constraint records** (`ErrConstraintsNotRebuilt`),
-  because `CREATE TABLE` cannot write them back and silently dropping a `NOT NULL` or a
-  `PRIMARY KEY` is worse than refusing. Constraint records are read; nothing writes them. That
-  one gap is what keeps compaction off most real tables.
+- **Compaction refuses a table carrying a `PRIMARY KEY` or `UNIQUE` record**
+  (`ErrConstraintsNotRebuilt`). The column-shaped kinds are written back now; a key record's
+  `ownerObjectID` names the index implementing it, and nothing here builds a key-enforcing
+  index, so silently returning a copy that no longer enforces its own key is the outcome the
+  refusal avoids. Every constrained table in the private corpus declares a key, so this is
+  still what keeps compaction off most real tables — but the remaining gap is the index, not
+  the record.

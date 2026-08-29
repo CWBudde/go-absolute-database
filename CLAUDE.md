@@ -51,7 +51,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 
 - **One table is a special case, not the shape of the API**: a database can hold several tables, and only data pages record which one they belong to. Reads and writes are scoped through `File.Table(name)`; the no-argument `Schema`, `OpenTable` and `OpenTableWriter` are shorthand for `Table("")` and report `ErrAmbiguousTable` rather than mixing tables. Before this existed, `OpenTable` on a three-table file returned six rows for a two-row table with no error. When adding anything that scans pages by type, ask what happens with three tables in the file — the answer is usually "it silently reads someone else's".
 
-- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete, growing a table by a free page when every existing one is full, and keeping the table's user indexes in step (`writer_index.go`); Phase 8 adds the schema operations — `DROP TABLE` and the allocation model in `ddl.go`, `CREATE TABLE` in `ddl_create.go`, `CREATE INDEX`/`DROP INDEX` in `ddl_index.go`, and `ALTER TABLE ADD`/`DROP COLUMN` in `ddl_alter.go`. Database growth — extending the file by whole extents when no free page remains — is in `ddl_grow.go`. `ddl_database.go` writes an `.abs` from nothing (`CreateDatabase`), and `ddl_compact.go` rebuilds one into a new file on top of it (`CompactDatabase`), which closes Phase 8.
+- **Read-only by default**: Phases 1–6 (header, schema, records, BLOBs, indexes, encryption) are read-only, and `Open` still returns a read-only handle. Writing needs `OpenForWrite` explicitly, and every write path checks that flag. Phase 7 (`writer.go`) adds record insert, update and delete, growing a table by a free page when every existing one is full, keeping the table's user indexes in step (`writer_index.go`) and checking the constraints a table declares (`writer_constraint.go`); Phase 8 adds the schema operations — `DROP TABLE` and the allocation model in `ddl.go`, `CREATE TABLE` in `ddl_create.go`, `CREATE INDEX`/`DROP INDEX` in `ddl_index.go`, `ALTER TABLE ADD`/`DROP COLUMN` in `ddl_alter.go`, and the constraint-record serializer `CREATE TABLE` and compaction write through in `ddl_constraint_write.go`. Database growth — extending the file by whole extents when no free page remains — is in `ddl_grow.go`. `ddl_database.go` writes an `.abs` from nothing (`CreateDatabase`), and `ddl_compact.go` rebuilds one into a new file on top of it (`CompactDatabase`), which closes Phase 8.
 
 - **The engine's zlib is the C library at level 1, and `internal/zlib1` reproduces it**: every compressed internal file in the corpus — schema (type 8), table info (9), catalog (6) — is byte-identical to `zlib.compress(data, 1)`, all 48 of them, and to no other level. Go's `compress/zlib` matches none of them at any level, because its level 1 is its own fast encoder rather than zlib's `deflate_fast`. This blocked every schema operation except `DROP TABLE` until `internal/zlib1` ported zlib's level-1 path; `TestZlib1ReproducesEveryCorpusStream` re-compresses all 48 and requires each to reproduce the engine's bytes, and `testdata/zlib1` holds 37 golden vectors that pin it without any fixture. **Never write a stream the engine will read with `compress/zlib`** — it is for reading only. A writer using it produces a file that reads back correctly and is not what the engine wrote, which is exactly the failure the byte-identity tests exist to catch.
 
@@ -108,17 +108,19 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   exactly the shape `CREATE INDEX` builds. Everything else is refused with `ErrIndexNotMaintained`
   rather than guessed at: a tree deep enough to have split, a key of another shape, and an index
   whose ordering this package does not reproduce — multi-column, `DESC`, `NOCASE`, or backing a
-  `UNIQUE`/`PRIMARY KEY` constraint, since nothing here checks for duplicates. In front of all of
-  that sits a broader gate: a table declaring **any** constraint refuses every write with
-  `ErrConstraintsNotEnforced` (`refuseConstraints` in `writer_index.go`), because nothing here checks
-  a `NOT NULL`, a `MINVALUE`/`MAXVALUE` pair or a uniqueness rule, and a write that ignores them
-  leaves the file holding a row the engine would have rejected. **Every constrained private fixture
-  refuses writes**, indexed or not, and the reason has now changed twice: it used to be that
-  `parseSchemaTail` could not read their schema tail at all; `ddl_constraint.go` made that tail
-  readable and turned an accidental refusal into a hole — a constrained table with a maintainable
-  index would have accepted an insert violating its own `NOT NULL` — and the constraint gate is the
-  stated rule that closed it. Widening the refusal to unindexed constrained tables, which did accept
-  writes before, is deliberate: they were never checked either. What it replaced is worse than a refusal: `Update` went through and
+  `UNIQUE`/`PRIMARY KEY` constraint. In front of all of
+  that sits the constraint gate (`newConstraintChecks` in `writer_constraint.go`): a `NOT NULL` and a
+  `MINVALUE`/`MAXVALUE` pair are **checked** on every insert and update (`ErrNotNullViolated`,
+  `ErrCheckViolated`), and a table declaring anything else — a key constraint, or a record whose
+  column or bound type does not resolve — refuses every write with `ErrConstraintsNotEnforced`,
+  because a write that ignores a rule leaves the file holding a row the engine would have rejected.
+  **Every constrained private fixture still refuses writes**, indexed or not, because every one of them
+  declares a `PRIMARY KEY`. The reason a key is refused has changed and is worth keeping straight: it is
+  no longer "nothing checks for duplicates" — a duplicate scan is easy — but that the index implementing
+  the key is one nothing here can build or maintain, and no fixture shows the engine inserting into such
+  an index. Checking the constraint while leaving its index stale is the failure the gate exists to
+  prevent, so the two must lift together. Do not lift the `maintainableIndexColumn` refusal on the
+  strength of the duplicate check alone. What the gate replaced is worse than a refusal: `Update` went through and
   silently left the index describing a key the row no longer had. Two behaviours come from fixtures and must not be
   "tidied": a removal **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), and a
   key-moving update is a **removal followed by a sorted insertion**, not an in-place patch

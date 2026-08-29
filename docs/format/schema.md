@@ -21,6 +21,10 @@ Because the stream is a sequence of variable-length records, every write path ed
 **surgically** — inflate, splice bytes in or out, re-compress — rather than parsing it into a
 `TableSchema` and re-serializing. A re-serializer drops what it does not understand.
 
+`CREATE TABLE` is the one exception, and only because it builds the whole stream from nothing:
+there is nothing on the page yet for it to preserve. It writes the column definitions, an empty
+index array and the constraint array a rebuild hands it.
+
 ## Column definition
 
 ```
@@ -164,6 +168,11 @@ A table hands out ids in a fixed order: one for itself, one per column, one per 
 constraint record. In a database of twelve two-column tables that order is what makes the table
 ids run 1, 4, 8, 13, 18, 21, 25, 31, 36, 39, 42, 45 rather than three apart — and it is
 corroborating evidence for the record layout above.
+
+The write path reproduces that order rather than merely reading it: replaying `Constraints.abs`'s
+`CREATE TABLE` statements into a fresh database lands each table's constraint record on the
+engine's own object id, which is what makes the schema stream come back byte for byte. See
+[writing.md](../writing.md#constraint-records).
 
 ## What is refused rather than guessed
 

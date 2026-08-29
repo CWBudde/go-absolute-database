@@ -88,13 +88,17 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 
 ### Phase 8 — schema operations
 
-- [ ] **Write and check constraint records.** They are read; nothing writes or enforces them,
-      and that one gap blocks two operations. Compaction refuses a table carrying them
-      (`ErrConstraintsNotRebuilt`) because `CREATE TABLE` cannot write them back, and the record
-      writer refuses one too (`ErrConstraintsNotEnforced`, `refuseConstraints` in
-      `writer_index.go`) because no write here checks a `NOT NULL`, a `MINVALUE`/`MAXVALUE` pair
-      or a uniqueness rule. Between them that keeps both operations off most real tables, which
-      makes this the highest-leverage item in this file.
+- [x] **Write and check the column-shaped constraint records.** `NOT NULL` and
+      `MINVALUE`/`MAXVALUE` are written by `CREATE TABLE`, rebuilt by compaction and checked on
+      every insert and update (`ErrNotNullViolated`, `ErrCheckViolated`). See
+      [docs/writing.md](docs/writing.md#constraint-records).
+- [ ] **Write and check a `PRIMARY KEY` or `UNIQUE` record.** Both halves are blocked by the
+      same missing piece, which is not the record: such a constraint names the index that
+      implements it, nothing here builds a key-enforcing index, and no fixture shows the engine
+      inserting into one. So compaction still refuses the table
+      (`ErrConstraintsNotRebuilt`) and every write to it is still refused
+      (`ErrConstraintsNotEnforced`). Every constrained table in the private corpus declares a
+      key, which is what keeps this the highest-leverage item in this file.
 - [ ] **Write a `DEFAULT`.** The same problem one level down, refused the same way
       (`ErrColumnDefault`): it lives in the column definition rather than the constraint array,
       and `serializeColumnDef` writes the absent marker unconditionally.
@@ -131,18 +135,21 @@ Deferred until there is a concrete use case.
 
 In rough order of what unblocks the most:
 
-1. **Writing and checking constraint records.** The missing half of work whose reading side is
-   already done and pinned by `Constraints.abs`, and it now unblocks two things rather than one:
-   compaction on real tables (`ErrConstraintsNotRebuilt`) and record writes to a constrained
-   table (`ErrConstraintsNotEnforced`). A `DEFAULT` is the same gap one level down
-   (`ErrColumnDefault`).
+1. **A key-enforcing index**, which is now the whole of what a `PRIMARY KEY` or `UNIQUE`
+   constraint is waiting on — the records themselves are written and the column-shaped kinds
+   are checked. It needs `CREATE INDEX` to write the unique/primary flag bytes
+   (`Constraints.abs` pins them) and a fixture of the engine inserting into such an index, which
+   the corpus does not have and `testdata/README.md`'s recipe can produce. Until then every
+   constrained private table stays unwritable and uncompactable. A `DEFAULT` is a separate gap
+   one level down (`ErrColumnDefault`).
 2. **The `ALTER TABLE` rebuild**, which would retire the last deliberate divergence from the
    engine's byte output.
 3. **Encrypted writes**, which need the control block decoded first. A guess produces a file the
    engine will not open, so this starts with analysis, not code.
 
 The remaining validation gaps need the Delphi engine driven directly: evidence for a **split
-B-tree leaf** or a **second PFS page**, and a **`Bytes` value**, which needs a parameterised
-insert rather than DBManager's SQL tab — every literal form the SQL grammar offers has now been
-tried and refused. The fixture recipe in `testdata/README.md` is the route to both; it is what
-produced `Types.abs` and `Types2.abs` and closed the field-type gap between them.
+B-tree leaf** or a **second PFS page**, an **insert into a `UNIQUE` or `PRIMARY` index**, and a
+**`Bytes` value**, which needs a parameterised insert rather than DBManager's SQL tab — every
+literal form the SQL grammar offers has now been tried and refused. The fixture recipe in
+`testdata/README.md` is the route to the first three; it is what produced `Types.abs` and
+`Types2.abs` and closed the field-type gap between them.

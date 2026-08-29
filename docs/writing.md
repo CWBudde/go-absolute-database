@@ -89,6 +89,49 @@ a `DESC` or `NOCASE` index, which orders its leaf differently than this package 
 still covers every indexed private fixture — they all carry a multi-column index or a
 uniqueness constraint this package does not check.
 
+## Constraint records
+
+Read since the schema tail was decoded, written and checked since. The two halves landed
+together because each is useless without the other: writing a `NOT NULL` a write then ignores
+puts a row in the file the engine would have rejected, and checking one the rebuild drops
+enforces a rule the copy no longer has.
+
+**Writing.** `serializeConstraintRecord` is the exact mirror of the parser, and its oracle runs
+in the only direction the corpus allows: no fixture shows the engine adding a constraint to a
+table that did not have one, so every record in every fixture is parsed and written again and
+compared against the bytes it came from — 75 of them over 27 tables, both bodies, all four
+kinds, one, two and three covered columns, and a `CHECK` record's bounds
+(`TestConstraintRecordsReserializeByteForByte`).
+
+Placing the records is measured separately, because a correct record in the wrong place is
+still a broken stream. `CREATE TABLE` writes the array itself rather than splicing it in
+afterwards, and replaying `Constraints.abs`'s own statements into a database this package
+created reproduces the engine's schema stream byte for byte, **object ids included**
+(`TestCreateTableWritesTheEngineSchemaStream`). Reaching `CMinMax`'s ids means standing in for
+the three tables between it and `CNotNull` that this package cannot create; that it then lands
+on the engine's bytes is what checks the id order — table, columns, indexes, constraints.
+
+**Checking.** A write tests the encoded record before any page is touched:
+
+| Kind                            | Checked                                       | Refused with                |
+| ------------------------------- | --------------------------------------------- | --------------------------- |
+| `NOT NULL` (3)                  | the record's null flag for the covered column | `ErrNotNullViolated`        |
+| `MINVALUE`/`MAXVALUE` (4)       | the value against either bound, inclusive     | `ErrCheckViolated`          |
+| `PRIMARY KEY` (0), `UNIQUE` (2) | not checked                                   | `ErrConstraintsNotEnforced` |
+
+A key constraint keeps the blanket refusal, and the reason has changed. The duplicate scan it
+needs is straightforward; what it would buy is nothing, because such a constraint always comes
+with an index record implementing it and `maintainableIndexColumn` will not maintain that
+index. Letting the insert through would leave the index describing rows it no longer covers —
+the exact failure Phase 7's unguarded `Update` was. The two have to lift together, and the
+index half needs a fixture of the engine inserting into a `UNIQUE` or `PRIMARY` index; all four
+`Writes-idx*` files carry a plain one.
+
+No fixture can show the engine _rejecting_ a write, because a rejected write leaves no file
+behind, so the checks are held to the narrower standard of never passing a row the constraint's
+own bytes forbid. The two rules assumed rather than observed are in
+[open-questions.md](open-questions.md); both can only make this package accept a row.
+
 ## Schema operations
 
 Measured as one-statement diffs from a three-table database:
@@ -203,7 +246,10 @@ Each is an error rather than a silent success.
 | `ErrTableHasBlobPages`       | `DROP TABLE` on a table owning BLOB pages                                                                                                                                                |
 | `ErrPageUnattributed`        | The file holds an allocated page belonging to no table                                                                                                                                   |
 | `ErrCatalogNotWritable`      | A compressed catalog, or one spanning more than one page                                                                                                                                 |
-| `ErrConstraintsNotRebuilt`   | Compaction of a table carrying constraint records, which `CREATE TABLE` cannot write back                                                                                                |
+| `ErrConstraintsNotRebuilt`   | Compaction of a table carrying a `PRIMARY KEY` or `UNIQUE` record, whose index a re-created table would not have                                                                         |
+| `ErrConstraintsNotEnforced`  | A write to a table declaring a constraint this package does not check — a key constraint, or a record whose column or bound type does not resolve                                        |
+| `ErrNotNullViolated`         | A write storing `NULL` in a column a `NOT NULL` record covers                                                                                                                            |
+| `ErrCheckViolated`           | A write storing a value outside a column's `MINVALUE`/`MAXVALUE` pair                                                                                                                    |
 | `ErrEncryptionUnsupported`   | `CreateDatabase` with `Encrypted: true`, or compaction of an encrypted database                                                                                                          |
 | `ErrUnsupportedColumnType`   | `CREATE TABLE` with a column type no fixture evidences                                                                                                                                   |
 | `ErrUnsupportedIndexColumn`  | `CREATE INDEX` over a column type no fixture evidences                                                                                                                                   |
