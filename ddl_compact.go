@@ -278,6 +278,14 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 		if c.hasDefault {
 			return compactTable{}, fmt.Errorf("%w: column %q", ErrColumnDefault, c.Name)
 		}
+
+		// AUTOINC parameters live in the column definition for the same
+		// reason and are lost the same way: a rebuild would reset a real
+		// INCREMENT to the engine's default and the rows would keep numbering
+		// themselves differently from then on.
+		if !c.autoInc.engineDefault() {
+			return compactTable{}, fmt.Errorf("%w: column %q", ErrColumnAutoIncOptions, c.Name)
+		}
 	}
 
 	schemaPageNo, err := t.schemaPageNo()

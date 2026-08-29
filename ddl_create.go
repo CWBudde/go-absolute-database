@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"golang.org/x/text/encoding/charmap"
@@ -70,6 +71,13 @@ var (
 	// fill the column in on an insert that omits it -- so the column is
 	// refused instead. testdata/Constraints.abs's CDefault is the fixture.
 	ErrColumnDefault = errors.New("absdb: column carries a DEFAULT clause this package cannot write")
+
+	// ErrColumnAutoIncOptions reports a column whose AUTOINC parameters are
+	// not the engine's defaults. serializeColumnDef writes those defaults
+	// unconditionally, so re-serializing such a column would silently reset a
+	// real INCREMENT, INITIALVALUE, MINVALUE, MAXVALUE or CYCLED clause.
+	// Types.abs's TAutoInc is the only table anywhere that carries any.
+	ErrColumnAutoIncOptions = errors.New("absdb: column carries AUTOINC options this package cannot write")
 )
 
 const (
@@ -85,15 +93,10 @@ const (
 	// the first place that writes it.
 	tableInfoCounterFields = 8
 
-	// columnDefPaddingZeros and columnDefPaddingFF are the fixed padding a
-	// non-BLOB column definition carries between its flags byte and its
-	// 4-byte terminator, measured identically on both of Delta's columns.
-	columnDefPaddingZeros = 23
-	columnDefPaddingFF    = 7
-
-	// columnDefTerminatorSize is the 0x7F 0x00 <baseType> 0xFF sequence
-	// findColumnTerminator (schema.go) scans for.
-	columnDefTerminatorSize = 4
+	// columnDefDefaultSize is the typed value that closes a column
+	// definition when there is no DEFAULT: the TABSVariant type tag and the
+	// absent marker.
+	columnDefDefaultSize = 2
 
 	// schemaTrailerSize is the 16 bytes following the column definitions:
 	// int32 indexCount (0 for a fresh table), a still-unidentified int32
@@ -478,11 +481,16 @@ func serializeColumnDef(col Column) ([]byte, error) {
 		return nil, fmt.Errorf("%w: base type %d / field type %s", ErrUnsupportedColumnType, col.BaseType, col.FieldType)
 	}
 
-	// Only a column read off a disk image can have this set, so this refuses
-	// re-serializing a parsed definition whose DEFAULT the output would lose,
-	// never a column a caller built for CreateTable.
+	// Only a column read off a disk image can have either of these set, so
+	// they refuse re-serializing a parsed definition whose DEFAULT or whose
+	// AUTOINC options the output would lose, never a column a caller built
+	// for CreateTable.
 	if col.hasDefault {
 		return nil, fmt.Errorf("%w: column %q", ErrColumnDefault, col.Name)
+	}
+
+	if !col.autoInc.engineDefault() {
+		return nil, fmt.Errorf("%w: column %q", ErrColumnAutoIncOptions, col.Name)
 	}
 
 	raw, err := charmap.Windows1252.NewEncoder().Bytes([]byte(col.Name))
@@ -494,7 +502,7 @@ func serializeColumnDef(col Column) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %d-byte column name", ErrValueRange, len(raw))
 	}
 
-	out := make([]byte, 0, 1+len(raw)+4+1+1+4+1+columnDefPaddingZeros+columnDefPaddingFF+columnDefTerminatorSize)
+	out := make([]byte, 0, 1+len(raw)+4+2+4+autoIncBlockSize+columnDefDefaultSize)
 
 	out = append(out, byte(len(raw))) //nolint:gosec // checked above: len(raw) <= 255
 	out = append(out, raw...)
@@ -509,17 +517,22 @@ func serializeColumnDef(col Column) ([]byte, error) {
 	binary.LittleEndian.PutUint32(sizeBuf[:], col.Size)
 	out = append(out, sizeBuf[:]...)
 
-	// The flags byte: both of Delta's columns carry 1, and Column has no
-	// field yet to say a different value is ever wanted.
-	out = append(out, 1)
+	// TABSFieldDef's five autoinc fields, at the engine's defaults. Every
+	// column in the corpus carries exactly these; a parsed column that does
+	// not was refused above.
+	var block [8]byte
 
-	out = append(out, make([]byte, columnDefPaddingZeros)...)
-
-	for range columnDefPaddingFF {
-		out = append(out, 0xFF)
+	for _, v := range []int64{1, 0, 0, math.MaxInt64} {
+		binary.LittleEndian.PutUint64(block[:], uint64(v))
+		out = append(out, block[:]...)
 	}
 
-	out = append(out, 0x7F, 0x00, byte(col.BaseType), 0xFF)
+	out = append(out, 0) // AutoincCycled
+
+	// The DEFAULT typed value: the variant's type tag, then the absent
+	// marker. serializeColumnDef never writes a present one; a column
+	// carrying a DEFAULT was refused above.
+	out = append(out, byte(col.BaseType), typedValueAbsent)
 
 	return out, nil
 }

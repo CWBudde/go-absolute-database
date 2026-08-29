@@ -147,6 +147,17 @@ type Column struct {
 	// only parseColumnDef ever sets it.
 	hasDefault bool
 
+	// autoInc carries TABSFieldDef's five autoinc parameters, which sit
+	// between the column's size (or its BLOB settings) and its DEFAULT. Every
+	// column in the corpus stores the engine's defaults there, so what this
+	// exists for is to notice one that does not: serializeColumnDef writes the
+	// defaults unconditionally and would silently drop a real INCREMENT.
+	autoInc autoIncOptions
+
+	// blob carries the BLOB compression settings, present only on a Blob,
+	// Clob or WideClob column.
+	blob blobSettings
+
 	// notNull and nullabilityKnown carry what the table's constraint array
 	// said about this column. Nullability is not in the column definition at
 	// all -- CNone.A and CNotNull.A in Constraints.abs differ only by their
@@ -158,6 +169,34 @@ type Column struct {
 	// bytes serializeColumnDef writes.
 	notNull          bool
 	nullabilityKnown bool
+}
+
+// autoIncOptions is the AUTOINC clause's five parameters as TABSFieldDef
+// declares them. known distinguishes a column whose block was read from one
+// built by a caller, whose zero value is not what the engine writes.
+type autoIncOptions struct {
+	increment    int64
+	initialValue int64
+	minValue     int64
+	maxValue     int64
+	cycled       bool
+	known        bool
+}
+
+// engineDefault reports whether these are the values every column in the
+// corpus carries, which are the only ones serializeColumnDef can write.
+func (o autoIncOptions) engineDefault() bool {
+	return !o.known ||
+		(o.increment == 1 && o.initialValue == 0 && o.minValue == 0 &&
+			o.maxValue == math.MaxInt64 && !o.cycled)
+}
+
+// blobSettings is a BLOB column's compression declaration.
+type blobSettings struct {
+	algorithm byte
+	mode      byte
+	blockSize uint32
+	known     bool
 }
 
 // IsBLOB returns true if this column stores BLOB data (Memo, Graphic, etc.).
@@ -194,11 +233,20 @@ const (
 	// prefixes an internal file (such as the schema) stored in a page.
 	internalFileHeaderSize = 10
 
+	// autoIncBlockSize is the width of TABSFieldDef's five autoinc fields:
+	// four int64s and a ByteBool. See docs/format/schema.md.
+	autoIncBlockSize = 33
+
+	// blobSettingsSize is the width of a BLOB column's compression
+	// declaration: algorithm, mode and an int32 block size.
+	blobSettingsSize = 6
+
 	// minColumnDefSize is the smallest number of bytes a column definition can
-	// occupy: an empty name (1) + ID (4) + types (2) + size (4) + flags (1) +
-	// the 4-byte terminator. It bounds the column count against the amount of
-	// data actually present, so a truncated blob cannot request a huge slice.
-	minColumnDefSize = 16
+	// occupy: an empty name (1) + ID (4) + types (2) + size (4) + the autoinc
+	// block (33) + a DEFAULT that is a type tag and an absent marker (2). It
+	// bounds the column count against the amount of data actually present, so
+	// a truncated blob cannot request a huge slice.
+	minColumnDefSize = 1 + 4 + 2 + 4 + autoIncBlockSize + 2
 
 	// maxSchemaColumns is an absolute ceiling on the column count.
 	maxSchemaColumns = 65000
@@ -467,25 +515,50 @@ func parseColumnDef(data []byte, pos int, index int) (Column, int, error) {
 	size := binary.LittleEndian.Uint32(data[pos : pos+4])
 	pos += 4
 
-	// Flags (1 byte).
-	if pos >= len(data) {
-		return Column{}, 0, errors.New("truncated flags")
-	}
+	// BLOB types carry their compression settings here, before the autoinc
+	// block: TABSFieldDef declares BLOBCompressionAlgorithm,
+	// BLOBCompressionMode and BLOBBlockSize in that order.
+	var blob blobSettings
 
-	pos++ // skip flags byte
-
-	// BLOB types have 6 extra bytes of BLOB descriptor info.
 	if baseType == BftBlob || baseType == BftClob || baseType == BftWideClob {
-		if pos+6 > len(data) {
-			return Column{}, 0, errors.New("truncated BLOB info")
+		if pos+blobSettingsSize > len(data) {
+			return Column{}, 0, errors.New("truncated BLOB settings")
 		}
 
-		pos += 6
+		blob = blobSettings{
+			algorithm: data[pos],
+			mode:      data[pos+1],
+			blockSize: binary.LittleEndian.Uint32(data[pos+2 : pos+6]),
+			known:     true,
+		}
+		pos += blobSettingsSize
 	}
 
-	pos, hasDefault, err := findColumnTerminator(data, pos, baseType)
-	if err != nil {
-		return Column{}, 0, err
+	if pos+autoIncBlockSize > len(data) {
+		return Column{}, 0, errors.New("truncated autoinc options")
+	}
+
+	autoInc := autoIncOptions{
+		increment:    int64(binary.LittleEndian.Uint64(data[pos : pos+8])),
+		initialValue: int64(binary.LittleEndian.Uint64(data[pos+8 : pos+16])),
+		minValue:     int64(binary.LittleEndian.Uint64(data[pos+16 : pos+24])),
+		maxValue:     int64(binary.LittleEndian.Uint64(data[pos+24 : pos+32])),
+		cycled:       data[pos+32] != 0,
+		known:        true,
+	}
+	pos += autoIncBlockSize
+
+	// The DEFAULT clause closes the definition as a typed value: a
+	// TABSVariant type tag, then the present/absent flag and its payload.
+	if pos >= len(data) {
+		return Column{}, 0, errors.New("truncated default value tag")
+	}
+
+	pos++ // the variant's type tag, which echoes baseType or is 0x00
+
+	pos, hasDefault, ok := columnDefaultEnd(data, pos)
+	if !ok {
+		return Column{}, 0, errors.New("malformed default value")
 	}
 
 	col := Column{
@@ -496,51 +569,11 @@ func parseColumnDef(data []byte, pos int, index int) (Column, int, error) {
 		Size:       size,
 		Position:   index,
 		hasDefault: hasDefault,
+		autoInc:    autoInc,
+		blob:       blob,
 	}
 
 	return col, pos, nil
-}
-
-// findColumnTerminator scans forward from pos for the sequence that ends a
-// column definition and returns the position just past it.
-//
-// After the flags (and optional BLOB info) there is variable-length padding
-// (zeros followed by 0xFF bytes), then
-//
-//	0x7F 0x00 <byte> <default>
-//
-// where <byte> is either the baseType echo or 0x00 (varies by version) and
-// <default> is the column's DEFAULT clause, stored as the typed value
-// ddl_constraint.go documents: a single 0xFF when the column has no default,
-// and otherwise 0x00 followed by an int32 byte count and that many bytes. The
-// second result reports which of those two it was, so that a caller about to
-// re-serialize the column knows whether doing so would drop a DEFAULT.
-//
-// testdata/Constraints.abs isolates that last field. CDefault's
-// "A INTEGER DEFAULT 7" differs from the control CNone's plain "A INTEGER" in
-// exactly those bytes -- 7F 00 07 FF becomes
-// 7F 00 07 00 04 00 00 00 07 00 00 00 -- and until this function read them,
-// a table with a DEFAULT on any column could not be parsed at all: the scan
-// ran past every remaining column looking for a 0xFF that was no longer there.
-func findColumnTerminator(data []byte, pos int, baseType BaseFieldType) (end int, hasDefault bool, err error) {
-	for i := pos; i+3 < len(data); i++ {
-		if data[i] != 0x7F || data[i+1] != 0x00 {
-			continue
-		}
-
-		if mid := data[i+2]; mid != byte(baseType) && mid != 0x00 {
-			continue
-		}
-
-		// A candidate whose default field does not read is not the
-		// terminator: keep scanning rather than accept a position derived
-		// from bytes that did not parse.
-		if end, present, ok := columnDefaultEnd(data, i+3); ok {
-			return end, present, nil
-		}
-	}
-
-	return 0, false, errors.New("column terminator not found")
 }
 
 // columnDefaultEnd returns the position just past the DEFAULT field at pos,

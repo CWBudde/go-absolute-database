@@ -336,13 +336,31 @@ func TestParseSchemaTruncated(t *testing.T) {
 		}
 	}
 
-	// One column announced, but no terminator anywhere in the blob.
-	data := make([]byte, 4+64)
-	binary.LittleEndian.PutUint32(data[0:4], 1)
+	// One column announced in fewer bytes than a definition can occupy, which
+	// the column-count bound rejects before any slice is sized.
+	short := make([]byte, 4+minColumnDefSize-1)
+	binary.LittleEndian.PutUint32(short[0:4], 1)
 
-	_, err := parseSchema(data)
-	if !errors.Is(err, ErrBadSchema) {
-		t.Errorf("error = %v, want ErrBadSchema", err)
+	if _, err := parseSchema(short); !errors.Is(err, ErrBadSchema) {
+		t.Errorf("column shorter than minColumnDefSize: error = %v, want ErrBadSchema", err)
+	}
+
+	// Long enough to pass that bound, but the name runs past the end.
+	data := make([]byte, 4+2*minColumnDefSize)
+	binary.LittleEndian.PutUint32(data[0:4], 1)
+	data[4] = 0xFF // a 255-byte name in far fewer bytes
+
+	if _, err := parseSchema(data); !errors.Is(err, ErrBadSchema) {
+		t.Errorf("name past the end: error = %v, want ErrBadSchema", err)
+	}
+
+	// Long enough for the name, types and size, but truncated inside the
+	// autoinc block that follows them.
+	cut := make([]byte, 4+1+4+2+4+autoIncBlockSize-1)
+	binary.LittleEndian.PutUint32(cut[0:4], 1)
+
+	if _, err := parseSchema(cut); !errors.Is(err, ErrBadSchema) {
+		t.Errorf("truncated autoinc block: error = %v, want ErrBadSchema", err)
 	}
 }
 

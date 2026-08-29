@@ -123,8 +123,10 @@ func writeDBHeader(buf []byte, pageSize, pageCount int) {
 // --- schema page ---
 
 // encodeSchemaBlob encodes the decompressed schema: a column count followed by
-// one definition per column, each ended by the 0x7F 0x00 <baseType> 0xFF
-// terminator that parseColumnDef searches for.
+// one definition per column, each carrying the autoinc block and the absent
+// DEFAULT that close it (docs/format/schema.md). The block holds the engine's
+// own defaults, so a synthetic file is bytes the engine could have written
+// rather than a layout only this package's parser accepts.
 func encodeSchemaBlob(cols []synthColumn) []byte {
 	var buf bytes.Buffer
 
@@ -137,13 +139,22 @@ func encodeSchemaBlob(cols []synthColumn) []byte {
 		buf.WriteByte(byte(c.base))
 		buf.WriteByte(byte(c.field))
 		_ = binary.Write(&buf, binary.LittleEndian, c.size)
-		buf.WriteByte(0) // flags
 
 		if c.base == BftBlob || c.base == BftClob || c.base == BftWideClob {
-			buf.Write(make([]byte, 6)) // BLOB descriptor
+			buf.Write(make([]byte, blobSettingsSize))
 		}
 
-		buf.Write([]byte{0x7F, 0x00, byte(c.base), 0xFF})
+		// AutoincIncrement 1, InitialValue 0, MinValue 0,
+		// MaxValue High(Int64), Cycled False.
+		_ = binary.Write(&buf, binary.LittleEndian, int64(1))
+		_ = binary.Write(&buf, binary.LittleEndian, int64(0))
+		_ = binary.Write(&buf, binary.LittleEndian, int64(0))
+		_ = binary.Write(&buf, binary.LittleEndian, int64(math.MaxInt64))
+		buf.WriteByte(0)
+
+		// The DEFAULT typed value: the variant's type tag, then absent.
+		buf.WriteByte(byte(c.base))
+		buf.WriteByte(typedValueAbsent)
 	}
 
 	return buf.Bytes()
