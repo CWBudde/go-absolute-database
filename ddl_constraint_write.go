@@ -102,7 +102,11 @@ func appendKeyConstraintBody(out []byte, rec constraintRecord) ([]byte, error) {
 	out = binary.LittleEndian.AppendUint32(out, constraintBodyCount)
 	out = append(out, 0) // pad
 
-	out, err := appendSizedString32(out, rec.table)
+	// The table name is the one field the engine ever leaves empty: a UNIQUE
+	// record CREATE UNIQUE INDEX wrote carries none, where the same field of a
+	// CREATE TABLE ... PRIMARY KEY record names the table
+	// (testdata/Keys-uniqidx.abs against testdata/Keys.abs).
+	out, err := appendOptionalSizedString32(out, rec.table)
 	if err != nil {
 		return nil, fmt.Errorf("table name: %w", err)
 	}
@@ -200,9 +204,29 @@ func appendSizedString32(out []byte, name string) ([]byte, error) {
 		return nil, err
 	}
 
+	return appendSized32(out, raw), nil
+}
+
+// appendOptionalSizedString32 is appendSizedString32 for a field the engine
+// writes empty: it accepts the empty string and writes "01 00 00 00 00", the
+// size field plus a zero length byte, which is what the engine wrote for the
+// table name of testdata/Keys-uniqidx.abs's UNIQUE record.
+func appendOptionalSizedString32(out []byte, name string) ([]byte, error) {
+	raw, err := encodeOptionalPascalName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	return appendSized32(out, raw), nil
+}
+
+// appendSized32 writes an already-encoded name behind its int32 size field.
+// The size counts the Pascal string including its own length byte, which is
+// the redundancy parseConstraintRecord checks rather than skips.
+func appendSized32(out, raw []byte) []byte {
 	out = binary.LittleEndian.AppendUint32(out, uint32(len(raw)+1)) //nolint:gosec // encodePascalName bounds raw to 255 bytes
 
-	return appendPascalString(out, raw), nil
+	return appendPascalString(out, raw)
 }
 
 // appendSizedString8 is appendSizedString32 with the single-byte count NOT

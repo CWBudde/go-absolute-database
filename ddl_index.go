@@ -810,12 +810,32 @@ func serializeIndexRecord(name string, objectID uint32, rootPageNo int32, column
 // one place a name a caller chose is checked against what a length byte can
 // describe, which is why every serializer here goes through it.
 func encodePascalName(name string) ([]byte, error) {
+	raw, err := encodeOptionalPascalName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("%w: 0-byte name", ErrValueRange)
+	}
+
+	return raw, nil
+}
+
+// encodeOptionalPascalName is encodePascalName for the one field the engine
+// leaves empty. A UNIQUE constraint record that CREATE UNIQUE INDEX wrote
+// carries an empty table name -- testdata/Keys-uniqidx.abs holds
+// "01 00 00 00 00" where the same field of a CREATE TABLE ... PRIMARY KEY
+// record holds "05 00 00 00 04 'K' 'e' 'y' 's'" -- so refusing an empty name
+// everywhere made that record unwritable. Only the key-shaped body's table
+// name is ever empty; every other name goes through encodePascalName.
+func encodeOptionalPascalName(name string) ([]byte, error) {
 	raw, err := charmap.Windows1252.NewEncoder().Bytes([]byte(name))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %q: %w", ErrStringEncoding, name, err)
 	}
 
-	if len(raw) == 0 || len(raw) > 255 {
+	if len(raw) > 255 {
 		return nil, fmt.Errorf("%w: %d-byte name", ErrValueRange, len(raw))
 	}
 

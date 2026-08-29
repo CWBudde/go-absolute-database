@@ -254,7 +254,10 @@ func checkFixtureTable(t *testing.T, db *File, name string) {
 	}
 
 	for _, c := range constraints {
-		if !strings.EqualFold(c.table, name) {
+		// The table name is empty in exactly one shape: a UNIQUE record that
+		// CREATE UNIQUE INDEX wrote rather than a CREATE TABLE clause
+		// (testdata/Keys-uniqidx.abs). Everything else names its own table.
+		if c.table != "" && !strings.EqualFold(c.table, name) {
 			t.Errorf("%s: constraint %q names table %q", name, c.name, c.table)
 		}
 

@@ -3,18 +3,21 @@
 Almost everything in this directory is **deliberately not committed**. The `.abs`
 fixtures the parser is developed against are real private project data, and
 `.gitignore` excludes `testdata/*` for that reason. A fresh clone therefore has only the
-`Employees-*`, `Writes*`, `MultiTable*`, `Empty*`, `Constraints` and `Types*` fixtures below, and every
-test that needs one of the others skips (see `requireFixture` in `absdb_test.go`). A green CI run does **not** mean the parser was
-validated against real private project files — run `just test` locally for that.
+`Employees-*`, `Writes*`, `MultiTable*`, `Empty*`, `Constraints`, `Types*`, `Keys*` and `Auto*`
+fixtures below, and every test that needs one of the others skips (see `requireFixture` in
+`absdb_test.go`). A green CI run does **not** mean the parser was validated against real private
+project files — run `just test` locally for that.
 
 ## The committed fixtures
 
-Six sets are committed, forty-two files in all: the eight `Employees-*.abs` files, one per
+Eight sets are committed, fifty-two files in all: the eight `Employees-*.abs` files, one per
 encryption algorithm, the fourteen `Writes*.abs` files that pin the write path, the twelve
 `MultiTable*.abs` files that pin the table catalog and the schema operations over it, the five
 `Empty*.abs` files that pin what the engine writes for a brand-new database,
-`Constraints.abs`, which isolates one column constraint or index variation per table, and the
-two `Types*.abs` files, which between them hold every field type the format supports.
+`Constraints.abs`, which isolates one column constraint or index variation per table, the
+two `Types*.abs` files, which between them hold every field type the format supports, the eight
+`Keys*.abs` files that pin a key-enforcing index, and the two `Auto*.abs` files that say what an
+`AUTOINC` key does not write.
 
 ### `Employees-*.abs` — one per encryption algorithm
 
@@ -377,6 +380,73 @@ though their contents are unreachable.
 It contains no private data and no vendor material, checked the same way as the others: scanning
 finds only `ABS0LUTEDATABASE`, `ABSP`, the four invented table names and the invented values, and
 no UTF-16 strings at all.
+
+### `Keys*.abs` — a `PRIMARY KEY` and a `UNIQUE` index, with rows in them
+
+The `Writes-idx*` files pin index maintenance against a **plain** index, which is why every write
+to a table declaring a `PRIMARY KEY` or `UNIQUE` constraint was refused: the leaf splice for a
+key-enforcing index had no byte identity behind it. These eight files are that evidence, built
+the same way — a base plus one statement per derivative.
+
+The table is `Keys` — `Id` INTEGER **PRIMARY KEY**, `Alt` INTEGER, `Name` VARCHAR(20) — with
+three rows. `Id` is a plain `INTEGER` rather than an `AUTOINC` so that its backing index is the
+single-column, ascending, case-sensitive, `Int32` shape `CREATE INDEX` builds, and `Alt` is a
+second `Int32` column so a `UNIQUE` index can be added without touching the primary key's.
+
+| File                | Made from             | Statement                                  | Pins                                    |
+| ------------------- | --------------------- | ------------------------------------------ | --------------------------------------- |
+| `Keys.abs`          | a copy of `Empty.abs` | `CREATE TABLE` + three `INSERT`s           | a key index whose leaf holds rows       |
+| `Keys-ins.abs`      | `Keys.abs`            | `INSERT ... (4, 40, 'Alan')`               | a key that sorts last — an append       |
+| `Keys-ins0.abs`     | `Keys.abs`            | `INSERT ... (0, 0, 'Zero')`                | a key that sorts first — a shift up     |
+| `Keys-del.abs`      | `Keys.abs`            | `DELETE FROM Keys WHERE Id = 2`            | the middle entry removed                |
+| `Keys-upd.abs`      | `Keys.abs`            | `UPDATE Keys SET Id = 9 WHERE Id = 2`      | a key-moving update                     |
+| `Keys-uniqidx.abs`  | `Keys.abs`            | `CREATE UNIQUE INDEX IdxAlt ON Keys (Alt)` | what a standalone unique index writes   |
+| `Keys-uniqins.abs`  | `Keys-uniqidx.abs`    | `INSERT ... (5, 50, 'Emmy')`               | two key indexes maintained in one write |
+| `Keys-uniqnull.abs` | `Keys-uniqidx.abs`    | `INSERT ... (7, NULL, 'Nul1')`             | that a `UNIQUE` index **admits a NULL** |
+
+The first five say the splice is the same one a plain index gets: append, shift up, and — in
+`Keys-del.abs` — the vacated entry's bytes left exactly where they were, the behaviour
+`Writes-idx-del.abs` pins for a plain index. So a key-enforcing index needs no new leaf code,
+only a duplicate check in front of it.
+
+`Keys-uniqidx.abs` is the one that changed an implementation. `CREATE UNIQUE INDEX` does not
+just set the index record's `UNIQUE` flag: the engine also writes a `UNIQUE` **constraint**
+record named `C_Unique$Alt`, and hands out two object ids rather than one. That record's table
+name is **empty**, which nothing else in the corpus is, and the constraint serializer refused an
+empty name until this file arrived.
+
+**Three more statements were run and produced nothing to commit**, which is itself the finding.
+Each was refused by the engine and left the file **byte-identical** to its parent — not even the
+transaction counter moved:
+
+| Statement                                                       | Engine's message                                                            |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `INSERT INTO Keys VALUES (2, 99, 'Dup')`                        | `Primary Key constraint 'C_PK$Id' violated. Duplicate found.` (30319)       |
+| `INSERT INTO Keys VALUES (NULL, 99, 'Nul')`                     | `Constraint 'C_PK$Id' violated. Value in field 'Id' cannot be null` (30330) |
+| `INSERT INTO Keys VALUES (6, 10, 'Dup2')` on `Keys-uniqidx.abs` | `Constraint unique 'C_Unique$Alt' violated. Duplicate found.` (30320)       |
+
+The second is the surprise: a `PRIMARY KEY` column carries **no** `NOT NULL` constraint record,
+and the engine refuses a NULL in it anyway. A writer that only consults the constraint array
+would let one through. The third against a `UNIQUE` index is refused, while `Keys-uniqnull.abs`
+shows a NULL in the same index accepted — so "duplicate" does not include a second NULL.
+
+### `Auto*.abs` — what an `AUTOINC` key does not write
+
+Fifteen of the corpus's twenty-five key constraints are backed by an index over an `AUTOINC`
+column, so an `AUTOINC` key is the shape the private fixtures actually have. `Auto` is
+`Id` AUTOINC **PRIMARY KEY**, `Name` VARCHAR(20), with three rows; `Auto-ins.abs` adds a fourth
+with `INSERT INTO Auto (Name) VALUES ('Alan')`.
+
+Its purpose is a negative. An `AUTOINC` column's next value has to come from somewhere, and a
+counter kept on some page of its own would be a reason to keep refusing such an index even once
+key indexes are maintained. The insert touches the **same page types** an `INTEGER`-keyed insert
+touches, so there is no such counter — the next value is derived, not stored. The index record
+and the leaf are the `Int32` shape exactly, which leaves the column's field type as the only
+thing standing between this package and those fifteen tables.
+
+Neither set contains private data or vendor material, checked the same way as the others:
+scanning each finds only `ABS0LUTEDATABASE`, `ABSP`, the invented table and column names and the
+invented row values, and no UTF-16 strings.
 
 ## Regenerating them
 
