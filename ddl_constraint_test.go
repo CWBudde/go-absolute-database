@@ -164,6 +164,59 @@ func TestConstraintRecordsDecodeTheConstraintsFixture(t *testing.T) {
 	}
 }
 
+// TestMultiColumnIndexKeyPrefixSizeIsTheSumOfItsColumns closes the part of
+// the multi-column-key survey that the committed, empty Constraints.abs
+// fixture can settle without an engine run. Its A index uses a 5-byte key, its
+// B index uses a 12-byte key, and both indexes over (A, B) use 17 bytes. Thus
+// the compound KeyPrefixSize is the sum of the component widths, with no byte
+// removed from the width accounting for a hypothetical shared null flag.
+//
+// Empty roots cannot show whether those widths are concatenated in column
+// order, where their null flags sit or which component breaks a tie. Those
+// remain deliberately unclaimed until the row fixture in PLAN.md.
+func TestMultiColumnIndexKeyPrefixSizeIsTheSumOfItsColumns(t *testing.T) {
+	db := openFixture(t, constraintsFixture)
+
+	keySize := func(table string) int {
+		t.Helper()
+
+		_, _, records, _ := tailOf(t, db, table)
+		if len(records) != 1 {
+			t.Fatalf("%s has %d index records, want 1", table, len(records))
+		}
+
+		page, err := db.ReadPage(int(records[0].rootPageNo))
+		if err != nil {
+			t.Fatalf("%s: ReadPage(%d): %v", table, records[0].rootPageNo, err)
+		}
+
+		hdr, err := parseBTreeHeader(page.PageData())
+		if err != nil {
+			t.Fatalf("%s: parseBTreeHeader: %v", table, err)
+		}
+
+		if hdr.EntryCount != 0 {
+			t.Fatalf("%s has %d entries, want the empty sizing oracle", table, hdr.EntryCount)
+		}
+
+		return int(hdr.KeyPrefixSize)
+	}
+
+	integerSize := keySize("CIdxOne")
+	stringSize := keySize("CBoth")
+
+	if integerSize != 5 || stringSize != 12 {
+		t.Fatalf("component key sizes = (%d, %d), want (5, 12)", integerSize, stringSize)
+	}
+
+	for _, table := range []string{"CPkMulti", "CIdxMulti"} {
+		if got, want := keySize(table), integerSize+stringSize; got != want {
+			t.Errorf("%s KeyPrefixSize = %d, want %d + %d = %d",
+				table, got, integerSize, stringSize, want)
+		}
+	}
+}
+
 // checkConstraint compares one parsed record against what the fixture's DDL
 // says it should hold.
 func checkConstraint(t *testing.T, i int, got constraintRecord,

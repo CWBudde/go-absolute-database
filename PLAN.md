@@ -90,9 +90,12 @@ line.
 
 `Constraints.abs`'s `CPkMulti` and `CIdxMulti` and five private tables' `RecIdx`/`p`.
 
-- [ ] a. Confirm from the files already committed what a concatenated key looks like — the
+- [x] a. Confirm from the files already committed what a concatenated key looks like — the
       corpus's key sizes of 10 and 15 bytes are consistent with two and three 5-byte keys, and
-      that is a hypothesis, not a reading. Needs no Wine run.
+      `Constraints.abs` confirms the width rule directly: its 5-byte `INTEGER` component plus
+      its 12-byte `VARCHAR(10)` component produce a 17-byte compound `KeyPrefixSize`. The empty
+      roots cannot settle the occupied bytes or tie-breaking; that remains step c. Needs no
+      Wine run. See [docs/format/indexes.md](docs/format/indexes.md#multi-column-key-width).
 - [ ] b. Fixtures: a two-column index with rows, plus an insert, a delete and a key-moving
       update, in the shape of the `Writes-idx*` family.
 - [ ] c. Read the leaf: the key's layout, its `KeyPrefixSize`, and which column breaks a tie.

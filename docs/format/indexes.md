@@ -27,9 +27,32 @@ Entry _i_ starts at `18 + stride*i`.
 
 ## Key encoding
 
-A key is `[null flag byte] + int32 little-endian` for the `Int32` columns every measured index
-in the corpus covers. Keys must be compared **by value**, not with `bytes.Compare`: the page is
-sorted by value, while a byte-wise comparison of little-endian integers orders 256 before 2.
+An `Int32` key is `[null flag byte] + int32 little-endian`, for a total of 5 bytes. Keys must be
+compared **by value**, not with `bytes.Compare`: the page is sorted by value, while a byte-wise
+comparison of little-endian integers orders 256 before 2.
+
+### Multi-column key width
+
+The empty index roots in the committed `Constraints.abs` fixture settle how component widths
+combine even though they cannot yet settle the bytes of an occupied compound key:
+
+| Declaration                   | `KeyPrefixSize` |
+| ----------------------------- | --------------- |
+| `CIdxOne (A INTEGER)`         | 5               |
+| `CBoth (B VARCHAR(10))`       | 12              |
+| `CPkMulti PRIMARY KEY (A, B)` | 17              |
+| `CIdxMulti INDEX (A, B)`      | 17              |
+
+So a multi-column key's `KeyPrefixSize` is the sum of its component key widths: here the 5-byte
+integer component and the 12-byte string component make 17 bytes. The width accounting reserves
+the full single-column width for each component; it does not subtract a byte for a hypothetical
+shared null flag. This is also consistent with the 10- and 15-byte compound keys in the private
+corpus being made from two and three 5-byte integer components.
+
+Because both committed compound roots are empty, this evidence does **not** yet establish the
+occupied byte layout, whether the component encodings are concatenated in column order, the
+comparison at component boundaries or which column breaks a tie. Those need the planned
+row-bearing fixture before index maintenance can rely on them.
 
 An internal node's separator key is the child's smallest key, with a `0` sentinel on the first
 entry, so a descent takes the rightmost separator `<= searchKey`.
