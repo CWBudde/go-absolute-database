@@ -203,6 +203,106 @@ func TestTS03StringIndexLookup(t *testing.T) {
 	}
 }
 
+// BenchmarkIndexLookupAgainstFullScan measures the public primary-key lookup
+// against the equivalent scan for a key at the end of the table. Setup grows
+// the committed three-row fixture to 100 rows; it is deliberately outside the
+// timed sub-benchmarks, as are index discovery and the correctness checks.
+func BenchmarkIndexLookupAgainstFullScan(b *testing.B) {
+	const (
+		rowCount = int32(100)
+		target   = rowCount
+	)
+
+	path := writableCopy(b, keysFixture)
+
+	writable, err := OpenForWrite(path)
+	if err != nil {
+		b.Fatalf("OpenForWrite: %v", err)
+	}
+
+	w, err := writable.OpenTableWriter()
+	if err != nil {
+		b.Fatalf("OpenTableWriter: %v", err)
+	}
+
+	for id := int32(4); id <= rowCount; id++ {
+		if _, err := w.Insert([]any{id, id * 10, "benchmark"}); err != nil {
+			b.Fatalf("Insert(%d): %v", id, err)
+		}
+	}
+
+	if err := w.Commit(); err != nil {
+		b.Fatalf("Commit: %v", err)
+	}
+
+	if err := writable.Close(); err != nil {
+		b.Fatalf("closing writable fixture: %v", err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+
+	b.Cleanup(func() { _ = db.Close() })
+
+	table, err := db.Table("Keys")
+	if err != nil {
+		b.Fatalf("Table: %v", err)
+	}
+
+	ir, err := table.OpenIndex()
+	if err != nil {
+		b.Fatalf("OpenIndex: %v", err)
+	}
+
+	if _, _, err := ir.FindByPrimaryKey(target); err != nil {
+		b.Fatalf("FindByPrimaryKey(%d): %v", target, err)
+	}
+
+	assertScanFindsKey(b, table, target)
+
+	b.Run("Index", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for range b.N {
+			pageNo, _, err := ir.FindByPrimaryKey(target)
+			if err != nil || pageNo == 0 {
+				b.Fatalf("FindByPrimaryKey(%d): page=%d, err=%v", target, pageNo, err)
+			}
+		}
+	})
+
+	b.Run("FullScan", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for range b.N {
+			assertScanFindsKey(b, table, target)
+		}
+	})
+}
+
+func assertScanFindsKey(tb testing.TB, table *Table, key int32) {
+	tb.Helper()
+
+	r, err := table.Open()
+	if err != nil {
+		tb.Fatalf("Open: %v", err)
+	}
+
+	for r.Next() {
+		if r.Record().Int(0) == key {
+			return
+		}
+	}
+
+	if err := r.Err(); err != nil {
+		tb.Fatalf("scanning for %d: %v", key, err)
+	}
+
+	tb.Fatalf("full scan did not find %d", key)
+}
+
 func TestTS03IndexScan(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
 

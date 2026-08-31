@@ -24,7 +24,7 @@ func testdataPath(name string) string {
 // reaches a fixture — Open, ReadFile, OpenWithPassword — should go through
 // here, so that a fresh clone skips cleanly instead of reporting dozens of
 // failures. Any error other than a missing file is still a hard failure.
-func requireFixture(t *testing.T, name string) string {
+func requireFixture(t testing.TB, name string) string {
 	t.Helper()
 
 	path := testdataPath(name)

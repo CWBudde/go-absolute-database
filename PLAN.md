@@ -191,7 +191,9 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
       schema definition to its B-tree root by page number, which also attributes empty indexes
       in multi-table files. `FindByStringKey` now selects the named column's single-column index
       rather than `secondaries[0]`; compound search remains behind the row-bearing fixture.
-- [ ] Benchmark index lookup against a full scan.
+- [x] Benchmark index lookup against a full scan. `BenchmarkIndexLookupAgainstFullScan`
+      grows the committed `Keys.abs` fixture to 100 rows during untimed setup, then compares a
+      primary-key lookup with a worst-case scan for the last row.
 
 ### Phase 7 — record writes
 

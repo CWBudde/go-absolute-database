@@ -17,7 +17,7 @@ import (
 // Every write test works on a copy. The fixtures in testdata/ are read-only
 // ground truth — most of them are private files that exist nowhere else — so no
 // test is ever allowed to open one for writing.
-func writableCopy(t *testing.T, fixture string) string {
+func writableCopy(t testing.TB, fixture string) string {
 	t.Helper()
 
 	src := requireFixture(t, fixture)
