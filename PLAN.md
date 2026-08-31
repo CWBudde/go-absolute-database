@@ -187,10 +187,10 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 
 ### Phase 5 — indexes
 
-- [ ] Carry the **index name and covered column** on `IndexInfo`. Both are decoded from the
-      schema stream now, but `IndexInfo` does not expose them, so `FindByStringKey` still takes
-      `secondaries[0]` rather than the index that covers the column asked for. Small, and it is
-      the read-side half of what the multi-column item needs anyway.
+- [x] Carry the **index name and covered columns** on `IndexInfo`. `Table.OpenIndex` joins the
+      schema definition to its B-tree root by page number, which also attributes empty indexes
+      in multi-table files. `FindByStringKey` now selects the named column's single-column index
+      rather than `secondaries[0]`; compound search remains behind the row-bearing fixture.
 - [ ] Benchmark index lookup against a full scan.
 
 ### Phase 7 — record writes

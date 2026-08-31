@@ -42,6 +42,103 @@ func TestTS03IndexDiscovery(t *testing.T) {
 	}
 }
 
+// TestConstraintsIndexMetadata joins the committed fixture's schema records
+// to its empty B-tree roots. Empty leaves cannot identify their owner through
+// record references, so this also pins that Table.OpenIndex uses the schema's
+// root page number as the authority in a multi-table database.
+func TestConstraintsIndexMetadata(t *testing.T) {
+	db := openTestFile(t, constraintsFixture)
+
+	tests := []struct {
+		table   string
+		name    string
+		columns []string
+		primary bool
+	}{
+		{table: "CBoth", name: "C_Unique$B", columns: []string{"B"}, primary: false},
+		{table: "CIdxMulti", name: "IdxMulti", columns: []string{"A", "B"}, primary: false},
+		{table: "CPkMulti", name: "C_PK$A$B", columns: []string{"A", "B"}, primary: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.table, func(t *testing.T) {
+			table, err := db.Table(tt.table)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ir, err := table.OpenIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			user := ir.UserIndexes()
+			if len(user) != 1 {
+				t.Fatalf("UserIndexes() = %d, want 1", len(user))
+			}
+
+			if got := user[0]; got.Name != tt.name || !slices.Equal(got.Columns, tt.columns) {
+				t.Errorf("index metadata = %q %v, want %q %v",
+					got.Name, got.Columns, tt.name, tt.columns)
+			}
+
+			primary, err := ir.PrimaryKeyIndex()
+			if tt.primary {
+				if err != nil {
+					t.Fatalf("PrimaryKeyIndex(): %v", err)
+				}
+
+				if primary.RootPageNo != user[0].RootPageNo {
+					t.Errorf("primary root = %d, want %d", primary.RootPageNo, user[0].RootPageNo)
+				}
+			} else if !errors.Is(err, ErrNoIndex) {
+				t.Errorf("PrimaryKeyIndex() error = %v, want ErrNoIndex", err)
+			}
+		})
+	}
+}
+
+func TestFindByStringKeySelectsTheCoveredColumn(t *testing.T) {
+	db := openTestFile(t, constraintsFixture)
+
+	table, err := db.Table("CBoth")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ir, err := table.OpenIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// CBoth's only index covers B. The empty leaf cannot find a value, but it
+	// distinguishes selecting that index from finding no index for A.
+	_, _, err = ir.FindByStringKey("b", "value")
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("FindByStringKey(B) error = %v, want ErrKeyNotFound", err)
+	}
+
+	_, _, err = ir.FindByStringKey("A", "value")
+	if !errors.Is(err, ErrNoIndex) {
+		t.Errorf("FindByStringKey(A) error = %v, want ErrNoIndex", err)
+	}
+
+	multi, err := db.Table("CIdxMulti")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ir, err = multi.OpenIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = ir.FindByStringKey("B", "value")
+	if !errors.Is(err, ErrNoIndex) {
+		t.Errorf("FindByStringKey through compound index error = %v, want ErrNoIndex", err)
+	}
+}
+
 func TestTS03PrimaryKeyLookup(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
 
@@ -77,13 +174,18 @@ func TestTS03PrimaryKeyLookup(t *testing.T) {
 func TestTS03StringIndexLookup(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
 
-	ir, err := db.OpenIndex()
+	table, err := db.Table("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ir, err := table.OpenIndex()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Look up "EC / IC" by name in the secondary index.
-	pageNo, itemNo, err := ir.FindByStringKey("EC / IC")
+	pageNo, itemNo, err := ir.FindByStringKey("Name", "EC / IC")
 	if err != nil {
 		t.Fatalf("FindByStringKey: %v", err)
 	}
@@ -95,7 +197,7 @@ func TestTS03StringIndexLookup(t *testing.T) {
 	}
 
 	// Non-existent value.
-	_, _, err = ir.FindByStringKey("Nonexistent Train Type")
+	_, _, err = ir.FindByStringKey("Name", "Nonexistent Train Type")
 	if !errors.Is(err, ErrKeyNotFound) {
 		t.Errorf("expected ErrKeyNotFound for non-existent key, got %v", err)
 	}
@@ -577,15 +679,16 @@ func TestZeroKeyPrefixSize(t *testing.T) {
 		keySize:    0,
 		entryCount: 3,
 	}})
+	ir.indexes[0].columns = []string{"Name"}
 
 	_, err := ir.ScanIndex(1)
 	if !errors.Is(err, ErrMalformedIndex) {
 		t.Fatalf("ScanIndex with zero key size: error = %v, want ErrMalformedIndex", err)
 	}
 
-	// A zero key size is neither system (4) nor primary (5), so the page shows
-	// up as a secondary index and FindByStringKey has to reject it.
-	_, _, err = ir.FindByStringKey("anything")
+	// Give the crafted root a covered column so FindByStringKey reaches the key
+	// builder and rejects its zero key size.
+	_, _, err = ir.FindByStringKey("Name", "anything")
 	if !errors.Is(err, ErrMalformedIndex) {
 		t.Fatalf("FindByStringKey with zero key size: error = %v, want ErrMalformedIndex", err)
 	}

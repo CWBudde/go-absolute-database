@@ -80,13 +80,21 @@ The two are told apart by their keys: the record-page index's keys are the table
 ## Attributing a user index to a table
 
 Index pages carry `ObjectID == 0xFFFFFFFF`, and a user index is not part of the table's
-six-page run, so it has no recorded owner. It is attributed by evidence instead: an index is a
-table's when its leaf entries point at that table's data pages.
+six-page run, so the page itself has no recorded owner. The table's schema stream supplies the
+authoritative join: each index definition names its root page, index name and covered columns.
+`Table.OpenIndex` joins that record to the scanned B-tree root by page number, so `IndexInfo`
+exposes `Name` and `Columns` and even an empty user index can be attributed in a multi-table
+file. The column order is preserved because it is also the key's comparison order.
 
-Two cases have no evidence and are therefore not returned for a multi-table file — an index
-whose leftmost leaf is empty, and the BLOB-page index, whose keys are BLOB pages and whose
-owner nothing in the file records. Neither arises for a single-table file, where every index is
-returned because there is no other table it could belong to.
+System indexes have no index-definition record. They retain the evidence-based fallback: an
+index belongs to a table when its leaf entries name that table's data pages. The BLOB-page index
+can therefore still be unattributable in a multi-table file when its keys offer no such link.
+
+The schema metadata also makes lookup selection explicit. `FindByStringKey` takes a column name
+and selects the single-column index whose `Columns` entry matches it case-insensitively; it no
+longer assumes that the first secondary index happens to cover the requested value. Compound
+indexes are deliberately excluded until their occupied key layout is pinned by an engine-made
+fixture.
 
 ## Key-enforcing indexes
 

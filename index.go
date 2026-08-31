@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 const (
@@ -75,10 +76,12 @@ func (e BTreeEntry) RecordID() (int32, uint16) {
 
 // IndexInfo describes a discovered index.
 type IndexInfo struct {
-	RootPageNo int  // root page of the B-tree
-	KeySize    int  // key size in bytes
-	EntryCount int  // entries on the root page (whole tree only for root-only trees)
-	IsInternal bool // true for system indexes (RecordPage, BlobPage)
+	RootPageNo int      // root page of the B-tree
+	KeySize    int      // key size in bytes
+	EntryCount int      // entries on the root page (whole tree only for root-only trees)
+	IsInternal bool     // true for system indexes (RecordPage, BlobPage)
+	Name       string   // name from the schema definition (empty for system indexes)
+	Columns    []string // covered columns in comparison order
 }
 
 // parseBTreeHeader reads the TABSBTreePageHeader from index page data.
@@ -167,21 +170,41 @@ type indexRoot struct {
 	pageNo  int
 	header  *BTreePageHeader
 	keySize int
+	name    string
+	columns []string
+	primary bool
 }
 
 // info converts a discovered root into its public description.
-func (r indexRoot) info() IndexInfo {
+func (r *indexRoot) info() IndexInfo {
 	return IndexInfo{
 		RootPageNo: r.pageNo,
 		KeySize:    r.keySize,
 		EntryCount: int(r.header.EntryCount),
 		IsInternal: r.keySize == systemKeySize,
+		Name:       r.name,
+		Columns:    append([]string(nil), r.columns...),
+	}
+}
+
+// applyDefinition joins the schema stream's description of a user index to
+// the B-tree root discovered from the page scan. Index pages do not carry a
+// name or covered-column list themselves; the root page number is the field
+// shared by both structures.
+func (r *indexRoot) applyDefinition(rec indexRecord) {
+	r.name = rec.name
+	r.primary = rec.primary
+	r.columns = make([]string, len(rec.columns))
+
+	for i, col := range rec.columns {
+		r.columns[i] = col.name
 	}
 }
 
 // OpenIndex creates an IndexReader by scanning all index pages.
 func (db *File) OpenIndex() (*IndexReader, error) {
 	var roots []indexRoot
+	var schemaPages []int
 
 	for i := range db.PageCount() {
 		page, err := db.ReadPage(i)
@@ -190,6 +213,10 @@ func (db *File) OpenIndex() (*IndexReader, error) {
 		}
 
 		if page.Header == nil || page.Header.PageType != PageTypeIndex {
+			if page.Header != nil && page.Header.PageType == PageTypeSchema {
+				schemaPages = append(schemaPages, i)
+			}
+
 			continue
 		}
 
@@ -205,6 +232,9 @@ func (db *File) OpenIndex() (*IndexReader, error) {
 				pageNo:  i,
 				header:  hdr,
 				keySize: int(hdr.KeyPrefixSize),
+				name:    "",
+				columns: nil,
+				primary: false,
 			})
 		}
 	}
@@ -214,7 +244,46 @@ func (db *File) OpenIndex() (*IndexReader, error) {
 		return roots[i].pageNo < roots[j].pageNo
 	})
 
+	// Metadata is best-effort at file scope. OpenIndex historically succeeds
+	// on files whose schema tail is unknown, and a malformed definition must
+	// not hide otherwise readable B-tree pages. Table.OpenIndex repeats the
+	// join against its one authoritative schema and uses it for ownership.
+	byPage := make(map[int]*indexRoot, len(roots))
+	for i := range roots {
+		byPage[roots[i].pageNo] = &roots[i]
+	}
+
+	for _, pageNo := range schemaPages {
+		records, err := db.indexRecords(pageNo)
+		if err != nil {
+			continue
+		}
+
+		for _, rec := range records {
+			if root := byPage[int(rec.rootPageNo)]; root != nil {
+				root.applyDefinition(rec)
+			}
+		}
+	}
+
 	return &IndexReader{db: db, indexes: roots}, nil
+}
+
+// indexRecords reads the index-definition array from one table's schema
+// stream. The caller supplies the schema head page so this works for both a
+// named Table and the file-wide best-effort metadata pass above.
+func (db *File) indexRecords(schemaPageNo int) ([]indexRecord, error) {
+	raw, err := db.readSchemaStream(schemaPageNo)
+	if err != nil {
+		return nil, err
+	}
+
+	_, _, records, _, _, err := parseSchemaTail(raw) //nolint:dogsled // only index definitions belong here
+	if err != nil {
+		return nil, err
+	}
+
+	return records, nil
 }
 
 // Indexes returns information about all discovered indexes, system indexes
@@ -247,12 +316,18 @@ func (ir *IndexReader) UserIndexes() []IndexInfo {
 	return result
 }
 
-// PrimaryKeyIndex returns the user index over the primary key: the one with
-// primaryKeySize keys (1 null flag byte + int32). Tables whose primary key is
-// composite have no such index and yield ErrNoIndex.
+// PrimaryKeyIndex returns the user index whose schema definition marks it as
+// the primary key. A file-scoped reader whose schema metadata could not be
+// decoded falls back to the historical 5-byte-key heuristic.
 func (ir *IndexReader) PrimaryKeyIndex() (IndexInfo, error) {
 	for _, root := range ir.indexes {
-		if root.keySize == primaryKeySize {
+		if root.primary {
+			return root.info(), nil
+		}
+	}
+
+	for _, root := range ir.indexes {
+		if root.name == "" && root.keySize == primaryKeySize {
 			return root.info(), nil
 		}
 	}
@@ -260,17 +335,22 @@ func (ir *IndexReader) PrimaryKeyIndex() (IndexInfo, error) {
 	return IndexInfo{}, ErrNoIndex
 }
 
-// SecondaryIndexes returns the user indexes other than the primary key index,
-// that is UserIndexes minus the primaryKeySize entry.
+// SecondaryIndexes returns the user indexes other than the primary key index.
+// Parsed definitions provide the distinction directly; roots without schema
+// metadata retain the historical 5-byte-key heuristic.
 func (ir *IndexReader) SecondaryIndexes() []IndexInfo {
 	var result []IndexInfo
 
-	for _, idx := range ir.UserIndexes() {
-		if idx.KeySize == primaryKeySize {
+	for _, root := range ir.indexes {
+		if root.keySize == systemKeySize || root.primary {
 			continue
 		}
 
-		result = append(result, idx)
+		if root.name == "" && root.keySize == primaryKeySize {
+			continue
+		}
+
+		result = append(result, root.info())
 	}
 
 	return result
@@ -296,26 +376,36 @@ func (ir *IndexReader) FindByPrimaryKey(key int32) (dataPageNo int32, itemNo uin
 	return entry.PageNo, entry.ItemNo, nil
 }
 
-// FindByStringKey searches a secondary string index for the given value.
-//
-// Known limitation: index definitions are not parsed yet, so an index cannot be
-// mapped to the column it covers. The lookup therefore always uses the first
-// secondary index of the table and silently returns ErrKeyNotFound for values
-// of any other indexed column.
-func (ir *IndexReader) FindByStringKey(value string) (dataPageNo int32, itemNo uint16, err error) {
-	secondaries := ir.SecondaryIndexes()
-	if len(secondaries) == 0 {
+// FindByStringKey searches the single-column user index that covers column for
+// value. Column names are matched case-insensitively, like table and column
+// names elsewhere in the package. A compound index is not selected: building
+// its search key needs the full component layout that PLAN.md still leaves to
+// a row-bearing engine fixture.
+func (ir *IndexReader) FindByStringKey(column, value string) (dataPageNo int32, itemNo uint16, err error) {
+	var idx *indexRoot
+
+	for i := range ir.indexes {
+		root := &ir.indexes[i]
+		if root.keySize == systemKeySize || len(root.columns) != 1 ||
+			!strings.EqualFold(root.columns[0], column) {
+			continue
+		}
+
+		idx = root
+
+		break
+	}
+
+	if idx == nil {
 		return 0, 0, ErrNoIndex
 	}
 
-	idx := secondaries[0]
-
-	searchKey, err := makeStringKey(value, idx.KeySize)
+	searchKey, err := makeStringKey(value, idx.keySize)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	entry, err := ir.searchTree(idx.RootPageNo, searchKey, compareStringKeys)
+	entry, err := ir.searchTree(idx.pageNo, searchKey, compareStringKeys)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -597,16 +687,38 @@ func makeStringKey(value string, keySize int) ([]byte, error) {
 // this table's data pages; the engine's internal record-page index is this
 // table's when its keys are those pages.
 //
-// Two cases are therefore not returned for a multi-table database: an index
-// whose leftmost leaf is empty, which offers no evidence either way, and the
-// engine's BLOB page index, whose keys are BLOB pages and whose owner nothing
-// in the file records. Neither arises for a single-table file, where every
-// index in the file is returned because there is no other table it could
-// belong to.
+// User indexes are also named by root page in this table's schema stream, so
+// that definition is authoritative even when an empty leaf offers no record
+// references. System indexes have no such definition and retain the evidence
+// rule; in particular a BLOB page index can still be unattributable in a
+// multi-table database. A single-table file returns every root because there
+// is no other table it could belong to.
 func (t *Table) OpenIndex() (*IndexReader, error) {
 	ir, err := t.db.OpenIndex()
 	if err != nil {
 		return nil, err
+	}
+
+	// The table's own schema is the authority for its user indexes. Besides
+	// supplying public metadata, this identifies an empty index whose leaf has
+	// no record references from which ownership could be inferred.
+	var definitions map[int]indexRecord
+
+	schemaPageNo, schemaErr := t.schemaPageNo()
+	if schemaErr == nil {
+		records, recordsErr := t.db.indexRecords(schemaPageNo)
+		if recordsErr == nil {
+			definitions = make(map[int]indexRecord, len(records))
+			for _, rec := range records {
+				definitions[int(rec.rootPageNo)] = rec
+			}
+
+			for i := range ir.indexes {
+				if rec, ok := definitions[ir.indexes[i].pageNo]; ok {
+					ir.indexes[i].applyDefinition(rec)
+				}
+			}
+		}
 	}
 
 	if t.sole || t.unlisted {
@@ -626,6 +738,11 @@ func (t *Table) OpenIndex() (*IndexReader, error) {
 	var kept []indexRoot
 
 	for _, root := range ir.indexes {
+		if _, named := definitions[root.pageNo]; named {
+			kept = append(kept, root)
+			continue
+		}
+
 		ok, err := ir.rootReferences(root, own)
 		if err != nil {
 			return nil, err

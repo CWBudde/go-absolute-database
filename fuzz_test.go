@@ -179,7 +179,7 @@ func exerciseIndexes(db *File) {
 		_ = err
 	}
 
-	if _, _, err := ir.FindByStringKey("x"); err != nil {
+	if _, _, err := ir.FindByStringKey("x", "x"); err != nil {
 		_ = err
 	}
 }
