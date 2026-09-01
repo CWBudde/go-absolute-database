@@ -143,6 +143,45 @@ func TestNewConstraintChecksRefusals(t *testing.T) {
 	}
 }
 
+// TestConstraintGateResolvesACompoundKey establishes that the constraint side
+// has no single-column assumption left: a key record resolves all covered
+// columns, in order, against the maintained index with the matching object id.
+// The fixture itself has a VARCHAR component and remains outside occupied
+// maintenance; the all-Int32 compound writer reaches and uses this same gate.
+func TestConstraintGateResolvesACompoundKey(t *testing.T) {
+	db := openFixture(t, constraintsFixture)
+
+	table, err := db.Table("CPkMulti")
+	if err != nil {
+		t.Fatalf("Table(CPkMulti): %v", err)
+	}
+
+	schema, err := table.Schema()
+	if err != nil {
+		t.Fatalf("Schema: %v", err)
+	}
+
+	constraints := constraintsOf(t, db, "CPkMulti")
+	if len(constraints) != 1 {
+		t.Fatalf("CPkMulti has %d constraints, want 1", len(constraints))
+	}
+
+	rec := constraints[0]
+	idx := maintainedIndex{
+		name: rec.index, objectID: rec.ownerID, rootPageNo: 0,
+		colIdx: 0, colIdxs: []int{0, 1}, unique: true, primary: true,
+	}
+
+	if _, err := newConstraintChecks(constraints, schema, "CPkMulti", []maintainedIndex{idx}); err != nil {
+		t.Fatalf("compound key resolution: %v", err)
+	}
+
+	idx.colIdxs = []int{1, 0}
+	if _, err := newConstraintChecks(constraints, schema, "CPkMulti", []maintainedIndex{idx}); !errors.Is(err, ErrConstraintsNotEnforced) {
+		t.Errorf("reversed compound index columns = %v, want ErrConstraintsNotEnforced", err)
+	}
+}
+
 // TestBoundsCheckDecodesASignedBound pins the sign extension a narrow bound
 // needs. Constraints.abs holds only "MINVALUE 0 MAXVALUE 99", both of which
 // survive being read unsigned, so the negative case is built by hand.

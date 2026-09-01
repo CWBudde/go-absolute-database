@@ -1,7 +1,9 @@
 package absdb
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -60,6 +62,11 @@ func TestCreateTableWritesTheEngineSchemaStream(t *testing.T) {
 		{table: "CUnique", columns: constraintTestColumns, check: true},
 		{table: "FillerForCDefault", columns: fillerColumns(2)},
 		{table: "CMinMax", columns: constraintTestColumns, check: true},
+		// CBoth consumes six ids (table, two columns, one index and two
+		// constraints). A five-column filler consumes the same six without
+		// asking this test to build its still-unsupported string UNIQUE key.
+		{table: "FillerForCBoth", columns: fillerColumns(5), check: false},
+		{table: "CPkMulti", columns: constraintTestColumns, check: true},
 	} {
 		var constraints []constraintRecord
 		if step.check {
@@ -86,7 +93,40 @@ func TestCreateTableWritesTheEngineSchemaStream(t *testing.T) {
 
 			end := len(want) - systemIndexRootsSize
 			requireStreamsEqual(t, step.table, got[:end], want[:end], indexRootOffsets(t, db, step.table))
+
+			if step.table == "CPkMulti" {
+				requireEmptyIndexRootEqual(t, fixture, db, step.table)
+			}
 		})
+	}
+}
+
+// requireEmptyIndexRootEqual compares the whole B-tree payload of the one key
+// index on table. Unlike a populated leaf, this shape is fully established by
+// Constraints.abs: the compound KeyPrefixSize is 17 and every remaining byte
+// is the same zero/flag/sentinel byte CreateTable writes.
+func requireEmptyIndexRootEqual(t *testing.T, wantDB, gotDB *File, table string) {
+	t.Helper()
+
+	wantRecords := indexRecordsOf(t, wantDB, table)
+
+	gotRecords := indexRecordsOf(t, gotDB, table)
+	if len(wantRecords) != 1 || len(gotRecords) != 1 {
+		t.Fatalf("%s index records: got %d, want %d", table, len(gotRecords), len(wantRecords))
+	}
+
+	want, err := wantDB.ReadPage(int(wantRecords[0].rootPageNo))
+	if err != nil {
+		t.Fatalf("read engine index root: %v", err)
+	}
+
+	got, err := gotDB.ReadPage(int(gotRecords[0].rootPageNo))
+	if err != nil {
+		t.Fatalf("read rebuilt index root: %v", err)
+	}
+
+	if !bytes.Equal(got.PageData(), want.PageData()) {
+		t.Errorf("%s empty compound index root differs from the engine's", table)
 	}
 }
 
@@ -216,6 +256,231 @@ func TestCompactDatabaseRebuildsConstraints(t *testing.T) {
 	schema := schemaOfTable(t, after, "CNotNull")
 	if notNull, known := schema.Columns[0].NotNull(); !known || !notNull {
 		t.Errorf("CNotNull.A after compaction: NotNull = %t, known = %t, want true/true", notNull, known)
+	}
+}
+
+// TestCompactDatabaseRebuildsEmptyCompoundShapes covers the only compound
+// compaction the committed roots can prove: both a key-backed index and a plain
+// index on rowless tables. Populated compound tables remain a planning error,
+// before a destination is created.
+func TestCompactDatabaseRebuildsEmptyCompoundShapes(t *testing.T) {
+	fixture := openFixture(t, constraintsFixture)
+	src := newDatabasePath(t, "compound-empty.abs")
+
+	db, err := CreateDatabase(src, CreateDatabaseOptions{
+		PageSize:          0,
+		PageCountInExtent: 0,
+		MaxConnections:    0,
+		Encrypted:         false,
+	})
+	if err != nil {
+		t.Fatalf("CreateDatabase: %v", err)
+	}
+
+	if err := db.createTable(
+		"CPkMulti", constraintTestColumns, constraintsOf(t, fixture, "CPkMulti"),
+	); err != nil {
+		t.Fatalf("createTable(CPkMulti): %v", err)
+	}
+
+	if err := db.CreateTable("CIdxMulti", constraintTestColumns); err != nil {
+		t.Fatalf("CreateTable(CIdxMulti): %v", err)
+	}
+
+	if err := db.CreateIndex("CIdxMulti", "IdxMulti", "A", "B"); err != nil {
+		t.Fatalf("CreateIndex(CIdxMulti): %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close source: %v", err)
+	}
+
+	dst := newDatabasePath(t, "compound-empty-compacted.abs")
+	if err := CompactDatabase(src, dst); err != nil {
+		t.Fatalf("CompactDatabase: %v", err)
+	}
+
+	after := openTestFileAt(t, dst)
+	for _, table := range []string{"CPkMulti", "CIdxMulti"} {
+		t.Run(table, func(t *testing.T) {
+			requireEmptyIndexRootEqual(t, fixture, after, table)
+
+			got := indexRecordsOf(t, after, table)
+			if len(got) != 1 || len(got[0].columns) != 2 ||
+				got[0].columns[0].name != "A" || got[0].columns[1].name != "B" {
+				t.Errorf("rebuilt compound index = %+v", got)
+			}
+		})
+	}
+
+	wantConstraints := constraintsOf(t, fixture, "CPkMulti")
+
+	gotConstraints := constraintsOf(t, after, "CPkMulti")
+	if len(gotConstraints) != 1 || len(wantConstraints) != 1 {
+		t.Fatalf("CPkMulti constraints after compaction = %d, want %d",
+			len(gotConstraints), len(wantConstraints))
+	}
+
+	want, got := wantConstraints[0], gotConstraints[0]
+
+	want.objectID, got.objectID, want.ownerID, got.ownerID = 0, 0, 0, 0
+	for i := range want.columns {
+		want.columns[i].objectID, got.columns[i].objectID = 0, 0
+	}
+
+	if summary(got) != summary(want) {
+		t.Errorf("CPkMulti constraint after compaction:\n got %s\nwant %s", summary(got), summary(want))
+	}
+}
+
+// TestCompactDatabaseRebuildsPopulatedCompoundIndex proves the replay path can
+// create the empty ten-byte root first and then maintain it while rows are
+// copied. The source is the official-engine MultiKeys fixture.
+func TestCompactDatabaseRebuildsPopulatedCompoundIndex(t *testing.T) {
+	src := requireFixture(t, "MultiKeys.abs")
+	dst := newDatabasePath(t, "multikeys-compacted.abs")
+
+	if err := CompactDatabase(src, dst); err != nil {
+		t.Fatalf("CompactDatabase: %v", err)
+	}
+
+	compareRows(t, dst, src, "MultiKeys", "COMPACT DATABASE with a populated compound index")
+
+	got, want := captureIndexes(t, dst, "MultiKeys"), captureIndexes(t, src, "MultiKeys")
+	if len(got) != 1 || len(want) != 1 || got[0].name != want[0].name || len(got[0].entries) != len(want[0].entries) {
+		t.Fatalf("compacted indexes = %+v, source indexes = %+v", got, want)
+	}
+
+	for i := range got[0].entries {
+		if !bytes.Equal(got[0].entries[i].Key, want[0].entries[i].Key) {
+			t.Errorf("compacted key %d = %x, want %x", i, got[0].entries[i].Key, want[0].entries[i].Key)
+		}
+	}
+
+	after := openTestFileAt(t, dst)
+
+	table, err := after.Table("MultiKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	if checked := crossCheckTable(t, table); checked != 1 {
+		t.Errorf("cross-checked %d indexes, want 1", checked)
+	}
+}
+
+// TestCompoundPrimaryKeySurvivesCreateAndCompact covers the key-backed path:
+// CREATE TABLE builds a two-column primary index, inserts maintain it, and a
+// compaction preserves both tuple uniqueness and PRIMARY's no-NULL rule.
+func TestCompoundPrimaryKeySurvivesCreateAndCompact(t *testing.T) {
+	src := newDatabasePath(t, "compound-primary.abs")
+
+	db, err := CreateDatabase(src, CreateDatabaseOptions{})
+	if err != nil {
+		t.Fatalf("CreateDatabase: %v", err)
+	}
+
+	columns := []Column{
+		{Name: "A", BaseType: BftInt32, FieldType: FieldInteger},
+		{Name: "B", BaseType: BftInt32, FieldType: FieldInteger},
+	}
+
+	constraint := constraintRecord{
+		kind: constraintPrimaryKey, name: "C_PK$A$B", table: "Pairs", index: "C_PK$A$B",
+		columns: []constraintColumn{{name: "A"}, {name: "B"}},
+	}
+	if err := db.createTable("Pairs", columns, []constraintRecord{constraint}); err != nil {
+		t.Fatalf("createTable: %v", err)
+	}
+
+	w, err := db.OpenTableWriter()
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+
+	for _, row := range [][]any{{int32(1), int32(10)}, {int32(1), int32(20)}, {int32(2), int32(10)}} {
+		if _, err := w.Insert(row); err != nil {
+			t.Fatalf("Insert(%v): %v", row, err)
+		}
+	}
+
+	if err := w.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close source: %v", err)
+	}
+
+	dst := newDatabasePath(t, "compound-primary-compacted.abs")
+	if err := CompactDatabase(src, dst); err != nil {
+		t.Fatalf("CompactDatabase: %v", err)
+	}
+
+	after, err := OpenForWrite(dst)
+	if err != nil {
+		t.Fatalf("OpenForWrite compacted database: %v", err)
+	}
+	defer after.Close()
+
+	writer, err := after.OpenTableWriter()
+	if err != nil {
+		t.Fatalf("OpenTableWriter compacted database: %v", err)
+	}
+
+	if _, err := writer.Insert([]any{int32(1), int32(10)}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("duplicate compound primary key = %v, want ErrDuplicateKey", err)
+	}
+
+	if _, err := writer.Insert([]any{int32(1), nil}); !errors.Is(err, ErrNotNullViolated) {
+		t.Errorf("NULL compound primary component = %v, want ErrNotNullViolated", err)
+	}
+
+	if _, err := writer.Insert([]any{int32(2), int32(20)}); err != nil {
+		t.Errorf("distinct compound primary key: %v", err)
+	}
+
+	writer.Rollback()
+}
+
+// TestCompoundUniqueChecksTheWholeTuple ensures equality is over every
+// component: repeating A is allowed until B repeats as well.
+func TestCompoundUniqueChecksTheWholeTuple(t *testing.T) {
+	path := newDatabasePath(t, "compound-unique.abs")
+
+	db, err := CreateDatabase(path, CreateDatabaseOptions{})
+	if err != nil {
+		t.Fatalf("CreateDatabase: %v", err)
+	}
+	defer db.Close()
+
+	columns := []Column{
+		{Name: "A", BaseType: BftInt32, FieldType: FieldInteger},
+		{Name: "B", BaseType: BftInt32, FieldType: FieldInteger},
+	}
+
+	constraint := constraintRecord{
+		kind: constraintUnique, name: "C_Unique$A$B", table: "Pairs", index: "U_AB",
+		columns: []constraintColumn{{name: "A"}, {name: "B"}},
+	}
+	if err := db.createTable("Pairs", columns, []constraintRecord{constraint}); err != nil {
+		t.Fatalf("createTable: %v", err)
+	}
+
+	w, err := db.OpenTableWriter()
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+	defer w.Rollback()
+
+	for _, row := range [][]any{{int32(1), int32(10)}, {int32(1), int32(20)}} {
+		if _, err := w.Insert(row); err != nil {
+			t.Fatalf("Insert(%v): %v", row, err)
+		}
+	}
+
+	if _, err := w.Insert([]any{int32(1), int32(10)}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("duplicate tuple = %v, want ErrDuplicateKey", err)
 	}
 }
 

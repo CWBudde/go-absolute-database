@@ -484,6 +484,36 @@ Neither set contains private data or vendor material, checked the same way as th
 scanning each finds only `ABS0LUTEDATABASE`, `ABSP`, the invented table and column names and the
 invented row values, and no UTF-16 strings.
 
+### `MultiKeys*.abs` — compound-leaf oracle
+
+These five files were generated with the official engine under Wine. Keeping both key columns
+`INTEGER` isolates compound layout and comparison from the separate `VARCHAR`-key and `NOCASE`
+questions. `MultiKeys-pre.abs` is the populated table immediately before `CREATE INDEX`; the
+other four start with the occupied index.
+
+```sql
+CREATE TABLE MultiKeys (A INTEGER, B INTEGER, Name VARCHAR(20));
+INSERT INTO MultiKeys VALUES (2, 20, 'two-twenty');
+INSERT INTO MultiKeys VALUES (1, 20, 'one-twenty');
+INSERT INTO MultiKeys VALUES (1, 10, 'one-ten');
+INSERT INTO MultiKeys VALUES (2, 10, 'two-ten');
+CREATE INDEX IdxAB ON MultiKeys (A, B);
+```
+
+| File                | From                | One statement                                         |
+| ------------------- | ------------------- | ----------------------------------------------------- |
+| `MultiKeys-pre.abs` | created fresh       | table plus the four inserts above                     |
+| `MultiKeys.abs`     | `MultiKeys-pre.abs` | `CREATE INDEX IdxAB ON MultiKeys (A, B)`              |
+| `MultiKeys-ins.abs` | `MultiKeys.abs`     | `INSERT INTO MultiKeys VALUES (1, 15, 'one-fifteen')` |
+| `MultiKeys-del.abs` | `MultiKeys.abs`     | `DELETE FROM MultiKeys WHERE A = 1 AND B = 10`        |
+| `MultiKeys-upd.abs` | `MultiKeys.abs`     | `UPDATE MultiKeys SET B = 15 WHERE A = 1 AND B = 20`  |
+
+The base establishes component order and the second-column tie-break; the insert lands inside that
+tie, the delete pins the vacated tail bytes, and the update moves the second component and must
+remove then reinsert. `TestCreateMultiColumnIndexOnPopulatedTableMatchesEngine` checks the
+pre/index pair with only the documented page-`State` exclusions; the three maintenance tests
+compare whole files with no exclusion.
+
 ## Regenerating them
 
 They can be recreated on Linux by driving `DBManager.exe` from the SDK under Wine with a

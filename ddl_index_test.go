@@ -56,6 +56,72 @@ func schemaPageBytesOf(t *testing.T, path string, db *File, table string) []byte
 	return data[start+pageDataOffset : start+db.PageSize()]
 }
 
+// TestIndexRecordsReserializeByteForByte is the engine oracle for the index
+// serializer. Every parsed record is written back and compared with the exact
+// bytes DBManager stored, including the repeated covered-column entries of
+// Constraints.abs's CPkMulti and CIdxMulti records.
+//
+// The compound roots are empty, so this establishes the schema record only;
+// it deliberately makes no claim about an occupied compound leaf.
+func TestIndexRecordsReserializeByteForByte(t *testing.T) {
+	compound := 0
+
+	for _, name := range fixtureNames(t) {
+		t.Run(name, func(t *testing.T) {
+			db := openFixture(t, name)
+
+			tables, err := db.Tables()
+			if err != nil {
+				t.Fatalf("Tables: %v", err)
+			}
+
+			for _, info := range tables {
+				raw, tailStart, records, _ := tailOf(t, db, info.Name)
+
+				for i, rec := range records {
+					got, err := serializeIndexRecord(rec)
+					if err != nil {
+						t.Errorf("%s.%s index %d (%q): %v", name, info.Name, i, rec.name, err)
+
+						continue
+					}
+
+					if len(rec.columns) > 1 {
+						compound++
+					}
+
+					if want := raw[rec.start:rec.end]; !bytes.Equal(got, want) {
+						t.Errorf("%s.%s index %d (%q):\n got % x\nwant % x",
+							name, info.Name, i, rec.name, got, want)
+					}
+				}
+
+				colsEnd, _, _, _, _, err := parseSchemaTail(raw)
+				if err != nil {
+					t.Errorf("%s.%s schema tail: %v", name, info.Name, err)
+
+					continue
+				}
+
+				got, err := serializeIndexArray(records)
+				if err != nil {
+					t.Errorf("%s.%s index array: %v", name, info.Name, err)
+
+					continue
+				}
+
+				if want := raw[colsEnd:tailStart]; !bytes.Equal(got, want) {
+					t.Errorf("%s.%s index array:\n got % x\nwant % x", name, info.Name, got, want)
+				}
+			}
+		})
+	}
+
+	if compound < 2 {
+		t.Fatalf("re-serialized %d compound index records, want at least CPkMulti and CIdxMulti", compound)
+	}
+}
+
 // TestCreateIndexReproducesTheEngineStream is the strongest check available:
 // Writes-idx.abs is the engine's own output for exactly
 // "CREATE INDEX IdxId ON Writes (Id)" against Writes.abs, so both the
@@ -94,6 +160,108 @@ func TestCreateIndexReproducesTheEngineStream(t *testing.T) {
 	if !bytes.Equal(gotPageBytes, wantPageBytes) {
 		t.Errorf("recompressed schema page bytes differ from Writes-idx.abs's:\ngot:  %x\nwant: %x", gotPageBytes, wantPageBytes)
 	}
+}
+
+// TestCreateMultiColumnIndexWritesTheMeasuredEmptyShape covers the part of a
+// compound CREATE INDEX the committed fixtures fully determine: the repeated
+// schema columns and a rowless mixed INTEGER/VARCHAR root whose key width is
+// 5 + 12 = 17. Its first occupied string component remains guarded by
+// ErrMultiColumnIndex; the all-Int32 occupied case is tested below.
+func TestCreateMultiColumnIndexWritesTheMeasuredEmptyShape(t *testing.T) {
+	path := writableCopy(t, "MultiTable-create.abs")
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.CreateIndex("Delta", "IdxDeltaXY", "X", "Y"); err != nil {
+		t.Fatalf("CreateIndex: %v", err)
+	}
+
+	records := indexRecordsOf(t, db, "Delta")
+	if len(records) != 1 {
+		t.Fatalf("Delta has %d index records, want 1", len(records))
+	}
+
+	rec := records[0]
+	if rec.name != "IdxDeltaXY" || len(rec.columns) != 2 ||
+		rec.columns[0].name != "X" || rec.columns[1].name != "Y" {
+		t.Fatalf("compound index record = %+v", rec)
+	}
+
+	page, err := db.ReadPage(int(rec.rootPageNo))
+	if err != nil {
+		t.Fatalf("ReadPage(%d): %v", rec.rootPageNo, err)
+	}
+
+	hdr, err := parseBTreeHeader(page.PageData())
+	if err != nil {
+		t.Fatalf("parseBTreeHeader: %v", err)
+	}
+
+	if !hdr.IsRoot || !hdr.IsLeaf || hdr.EntryCount != 0 || hdr.KeyPrefixSize != 17 {
+		t.Errorf("compound root = root:%t leaf:%t entries:%d key size:%d, want true/true/0/17",
+			hdr.IsRoot, hdr.IsLeaf, hdr.EntryCount, hdr.KeyPrefixSize)
+	}
+
+	table, err := db.Table("Delta")
+	if err != nil {
+		t.Fatalf("Table(Delta): %v", err)
+	}
+
+	w, err := table.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	defer w.Close()
+
+	if _, err := w.Insert([]any{int32(1), "one"}); !errors.Is(err, ErrMultiColumnIndex) {
+		t.Errorf("first insert into compound index = %v, want ErrMultiColumnIndex", err)
+	}
+}
+
+// TestCreateMultiColumnIndexOnPopulatedTableMatchesEngine builds the occupied
+// ten-byte leaf from MultiKeys-pre.abs and compares every deterministic byte
+// with the official engine's CREATE INDEX output.
+func TestCreateMultiColumnIndexOnPopulatedTableMatchesEngine(t *testing.T) {
+	want, err := os.ReadFile(requireFixture(t, "MultiKeys.abs"))
+	if err != nil {
+		t.Fatalf("reading MultiKeys.abs: %v", err)
+	}
+
+	path := writableCopy(t, "MultiKeys-pre.abs")
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	if err := db.CreateIndex("MultiKeys", "IdxAB", "A", "B"); err != nil {
+		t.Fatalf("CreateIndex: %v", err)
+	}
+
+	pageSize, pageCount := db.PageSize(), db.PageCount()
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after: %v", err)
+	}
+
+	excluded := make(map[int]bool, pageCount*4)
+	for no := range pageCount {
+		start := no*pageSize + pageStateOffset
+		for i := range 4 {
+			excluded[start+i] = true
+		}
+	}
+
+	reportByteDifferencesExcept(t, got, want, "CREATE INDEX IdxAB ON MultiKeys (A, B)", excluded)
 }
 
 // TestDropIndexReproducesTheEngineStream is TestCreateIndexReproducesTheEngineStream

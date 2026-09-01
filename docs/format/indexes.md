@@ -31,10 +31,9 @@ An `Int32` key is `[null flag byte] + int32 little-endian`, for a total of 5 byt
 compared **by value**, not with `bytes.Compare`: the page is sorted by value, while a byte-wise
 comparison of little-endian integers orders 256 before 2.
 
-### Multi-column key width
+### Multi-column keys
 
-The empty index roots in the committed `Constraints.abs` fixture settle how component widths
-combine even though they cannot yet settle the bytes of an occupied compound key:
+The empty index roots in `Constraints.abs` settle how component widths combine:
 
 | Declaration                   | `KeyPrefixSize` |
 | ----------------------------- | --------------- |
@@ -49,10 +48,28 @@ the full single-column width for each component; it does not subtract a byte for
 shared null flag. This is also consistent with the 10- and 15-byte compound keys in the private
 corpus being made from two and three 5-byte integer components.
 
-Because both committed compound roots are empty, this evidence does **not** yet establish the
-occupied byte layout, whether the component encodings are concatenated in column order, the
-comparison at component boundaries or which column breaks a tie. Those need the planned
-row-bearing fixture before index maintenance can rely on them.
+`MultiKeys.abs` settles the occupied all-`INTEGER` case. Its index on `(A, B)` has a ten-byte
+`KeyPrefixSize`; each key is the ordinary five-byte encoding of A followed immediately by the
+ordinary five-byte encoding of B:
+
+| Row `(A, B)` | Key bytes                       | Record reference |
+| ------------ | ------------------------------- | ---------------- |
+| `(1, 10)`    | `00 01 00 00 00 00 0a 00 00 00` | page 10, item 2  |
+| `(1, 20)`    | `00 01 00 00 00 00 14 00 00 00` | page 10, item 1  |
+| `(2, 10)`    | `00 02 00 00 00 00 0a 00 00 00` | page 10, item 3  |
+| `(2, 20)`    | `00 02 00 00 00 00 14 00 00 00` | page 10, item 0  |
+
+Comparison is lexicographic by component value in schema order: B breaks a tie only after A is
+equal. `MultiKeys-ins.abs` inserts `(1, 15)` between `(1, 10)` and `(1, 20)`;
+`MultiKeys-del.abs` and `MultiKeys-upd.abs` show the same splice and remove-then-insert rules as
+the single-column fixtures, with no extra compound-key bookkeeping.
+
+The write path therefore builds and maintains any root-only ascending, case-sensitive compound
+index whose components are all `INTEGER`/`AUTOINC`: populated `CreateIndex`, insert, delete,
+key-moving update, compound `PRIMARY KEY`/`UNIQUE` enforcement, and compaction all use the measured
+concatenation and ordering. Empty compound roots may additionally contain a `VARCHAR` component
+whose width `Constraints.abs` establishes. An occupied string component remains part of the
+separate `VARCHAR`-key work; it is not inferred from the integer fixture.
 
 An internal node's separator key is the child's smallest key, with a `0` sentinel on the first
 entry, so a descent takes the rightmost separator `<= searchKey`.

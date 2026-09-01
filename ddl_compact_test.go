@@ -576,10 +576,10 @@ func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 		{"CPk", nil},
 		{"CUnique", nil},
 		{"CBoth", ErrConstraintsNotRebuilt},
-		{"CPkMulti", ErrConstraintsNotRebuilt},
+		{"CPkMulti", nil},
 		{"CIdxDesc", ErrIndexNotMaintained},
 		{"CIdxNoCase", ErrIndexNotMaintained},
-		{"CIdxMulti", ErrMultiColumnIndex},
+		{"CIdxMulti", nil},
 	} {
 		t.Run(c.table, func(t *testing.T) {
 			tbl, err := db.Table(c.table)
@@ -611,11 +611,14 @@ func TestPlanCompactIndexesRefusesAStringKey(t *testing.T) {
 	}}
 
 	records := []indexRecord{{
-		name:    "IdxS",
-		columns: []indexColumn{{name: "S", maxIndexedSize: indexColumnMaxIndexedSize}},
+		name: "IdxS",
+		columns: []indexColumn{{
+			name: "S", descending: false, caseInsensitive: false,
+			maxIndexedSize: indexColumnMaxIndexedSize,
+		}},
 	}}
 
-	_, err := planCompactIndexes(schema, records, nil)
+	_, err := planCompactIndexes(schema, records, nil, false)
 	if !errors.Is(err, ErrUnsupportedIndexColumn) {
 		t.Errorf("planCompactIndexes over a string column = %v, want %v", err, ErrUnsupportedIndexColumn)
 	}

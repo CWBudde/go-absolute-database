@@ -160,9 +160,10 @@ func (db *File) CreateTable(name string, columns []Column) error {
 //
 // A PRIMARY KEY or UNIQUE record brings an index with it, and that index is
 // built here: one more page, one more object id and one more record in the
-// schema stream's index array. What is still refused is a key covering more
-// than one column, or one whose column is not the Int32 shape an index leaf is
-// built for -- planTableConstraints is where each refusal is made.
+// schema stream's index array. Constraints.abs pins a compound key's schema
+// record and empty root exactly; later writes maintain it when every occupied
+// component is the all-Int32 shape MultiKeys.abs measures. A key with another
+// occupied component remains refused by writer index resolution.
 func (db *File) createTable(name string, columns []Column, constraints []constraintRecord) error {
 	if !db.writable {
 		return ErrReadOnly
@@ -288,6 +289,14 @@ func (p newTablePlan) internalFiles(pages newTablePages) (tableInternalFiles, er
 		return tableInternalFiles{}, err
 	}
 
+	keySizes := make([]int, len(p.indexes))
+	for i, rec := range p.indexes {
+		keySizes[i], err = indexRecordKeySize(rec, p.columns)
+		if err != nil {
+			return tableInternalFiles{}, err
+		}
+	}
+
 	constraintArray, err := serializeConstraintArray(p.constraints)
 	if err != nil {
 		return tableInternalFiles{}, err
@@ -298,6 +307,7 @@ func (p newTablePlan) internalFiles(pages newTablePages) (tableInternalFiles, er
 		indexes:     indexArray,
 		constraints: constraintArray,
 		columnCount: len(p.columns),
+		keySizes:    keySizes,
 	}, nil
 }
 
@@ -356,10 +366,10 @@ func assignColumnIDs(tableID int, columns []Column) []Column {
 func planTableConstraints(
 	table string, firstID int, columns []Column, constraints []constraintRecord,
 ) ([]indexRecord, []constraintRecord, error) {
-	owners := make([]Column, 0, len(constraints))
+	owners := make([][]Column, 0, len(constraints))
 
 	for _, rec := range constraints {
-		owner, err := constraintOwnerColumn(table, rec, columns)
+		owner, err := constraintOwnerColumns(table, rec, columns)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -387,8 +397,12 @@ func planTableConstraints(
 
 	for i, rec := range constraints {
 		rec.objectID = uint32(firstID + len(indexes) + len(records)) //nolint:gosec // small object ids
-		rec.ownerID = owners[i].ID
+		rec.ownerID = owners[i][0].ID
 		rec.start, rec.end = 0, 0
+
+		for j := range rec.columns {
+			rec.columns[j].objectID = owners[i][j].ID
+		}
 
 		if rec.kind == constraintPrimaryKey || rec.kind == constraintUnique {
 			rec.ownerID = indexes[nextIndex].objectID
@@ -401,30 +415,37 @@ func planTableConstraints(
 	return indexes, records, nil
 }
 
-// constraintOwnerColumn resolves the single column a constraint record covers,
-// refusing every record this package will not place.
+// constraintOwnerColumns resolves every column a constraint record covers.
+// Column-shaped NOT NULL and CHECK records still require exactly one; a key
+// record may cover several, which Constraints.abs's CPkMulti pins.
 //
 // An empty table name passes: a UNIQUE record CREATE UNIQUE INDEX wrote carries
 // none (testdata/Keys-uniqidx.abs), and refusing it would make such a table
 // uncompactable for a field the engine itself left blank.
-func constraintOwnerColumn(table string, rec constraintRecord, columns []Column) (Column, error) {
+func constraintOwnerColumns(table string, rec constraintRecord, columns []Column) ([]Column, error) {
 	if rec.table != "" && !strings.EqualFold(rec.table, table) {
-		return Column{}, fmt.Errorf("%w: the constraint %q names table %q, not %q",
+		return nil, fmt.Errorf("%w: the constraint %q names table %q, not %q",
 			ErrConstraintsNotRebuilt, rec.name, rec.table, table)
 	}
 
-	if len(rec.columns) != 1 {
-		return Column{}, fmt.Errorf("%w: the constraint %q covers %d columns",
+	key := rec.kind == constraintPrimaryKey || rec.kind == constraintUnique
+	if len(rec.columns) == 0 || (!key && len(rec.columns) != 1) {
+		return nil, fmt.Errorf("%w: the constraint %q covers %d columns",
 			ErrConstraintsNotRebuilt, rec.name, len(rec.columns))
 	}
 
-	owner, ok := columnByName(columns, rec.columns[0].name)
-	if !ok {
-		return Column{}, fmt.Errorf("%w: the constraint %q covers %q, which is not a column of %q",
-			ErrConstraintsNotRebuilt, rec.name, rec.columns[0].name, table)
+	owners := make([]Column, 0, len(rec.columns))
+	for _, covered := range rec.columns {
+		owner, ok := columnByName(columns, covered.name)
+		if !ok {
+			return nil, fmt.Errorf("%w: the constraint %q covers %q, which is not a column of %q",
+				ErrConstraintsNotRebuilt, rec.name, covered.name, table)
+		}
+
+		owners = append(owners, owner)
 	}
 
-	return owner, nil
+	return owners, nil
 }
 
 // keyConstraintIndex builds the index record a PRIMARY KEY or UNIQUE record is
@@ -436,17 +457,33 @@ func constraintOwnerColumn(table string, rec constraintRecord, columns []Column)
 // shows DBManager writing: CPk's index is primary and not unique, CUnique's is
 // unique and not primary. (A private fixture's own "p" index sets both; nothing
 // this package writes produces that.)
-func keyConstraintIndex(rec constraintRecord, owner Column, objectID int) (indexRecord, error) {
+func keyConstraintIndex(rec constraintRecord, owners []Column, objectID int) (indexRecord, error) {
 	if rec.index == "" {
 		return indexRecord{}, fmt.Errorf("%w: the %s constraint %q names no index",
 			ErrConstraintsNotRebuilt, rec.kind, rec.name)
 	}
 
-	if !indexableKeyColumn(owner) {
+	if len(owners) == 1 && !indexableKeyColumn(owners[0]) {
 		return indexRecord{}, fmt.Errorf(
 			"%w: the %s constraint %q is on %q, which is base type %d / field type %s",
-			ErrConstraintsNotRebuilt, rec.kind, rec.name, owner.Name, owner.BaseType, owner.FieldType,
+			ErrConstraintsNotRebuilt, rec.kind, rec.name,
+			owners[0].Name, owners[0].BaseType, owners[0].FieldType,
 		)
+	}
+
+	columns := make([]indexColumn, len(owners))
+	for i, owner := range owners {
+		if _, ok := knownEmptyIndexComponentSize(owner); !ok {
+			return indexRecord{}, fmt.Errorf(
+				"%w: component %q of the %s constraint %q has no measured empty-index width",
+				ErrConstraintsNotRebuilt, owner.Name, rec.kind, rec.name,
+			)
+		}
+
+		columns[i] = indexColumn{
+			name: owner.Name, descending: false, caseInsensitive: false,
+			maxIndexedSize: indexColumnMaxIndexedSize,
+		}
 	}
 
 	return indexRecord{
@@ -454,11 +491,54 @@ func keyConstraintIndex(rec constraintRecord, owner Column, objectID int) (index
 		objectID: uint32(objectID), //nolint:gosec // small object ids
 		unique:   rec.kind == constraintUnique,
 		primary:  rec.kind == constraintPrimaryKey,
-		columns: []indexColumn{{
-			name:           owner.Name,
-			maxIndexedSize: indexColumnMaxIndexedSize,
-		}},
+		columns:  columns,
 	}, nil
+}
+
+// knownEmptyIndexComponentSize returns the component width established by an
+// empty engine-written root. It is deliberately narrower than an encoder: an
+// Int32 contributes five bytes, while Constraints.abs establishes twelve for
+// its VARCHAR(10), hence declared size plus null flag and terminator. A string
+// longer than MaxIndexedSize remains unknown because the empty fixtures cannot
+// say whether the engine truncates it there.
+func knownEmptyIndexComponentSize(col Column) (int, bool) {
+	if indexableKeyColumn(col) {
+		return indexKeySize, true
+	}
+
+	if col.BaseType == BftVarchar && col.FieldType == FieldString &&
+		col.Size > 0 && col.Size <= indexColumnMaxIndexedSize {
+		return int(col.Size) + 2, true
+	}
+
+	return 0, false
+}
+
+// indexRecordKeySize sums the measured component widths in schema order. The
+// committed CPkMulti root establishes that 5 + 12 is written as 17.
+func indexRecordKeySize(rec indexRecord, columns []Column) (int, error) {
+	size := 0
+
+	for _, covered := range rec.columns {
+		owner, ok := columnByName(columns, covered.name)
+		if !ok {
+			return 0, fmt.Errorf("%w: index %q covers unknown column %q", ErrBadSchema, rec.name, covered.name)
+		}
+
+		component, ok := knownEmptyIndexComponentSize(owner)
+		if !ok {
+			return 0, fmt.Errorf("%w: index %q component %q has no measured empty-index width",
+				ErrUnsupportedIndexColumn, rec.name, owner.Name)
+		}
+
+		size += component
+	}
+
+	if size == 0 || size > math.MaxUint16 {
+		return 0, fmt.Errorf("%w: index %q key width %d", ErrValueRange, rec.name, size)
+	}
+
+	return size, nil
 }
 
 // rootIndexRecords fills in each planned index's root page from the pages just
@@ -608,6 +688,7 @@ type tableInternalFiles struct {
 	indexes     []byte
 	constraints []byte
 	columnCount int
+	keySizes    []int
 }
 
 // writeTableInternalFiles writes the content of every one of CreateTable's new
@@ -628,8 +709,8 @@ func (db *File) writeTableInternalFiles(
 	// record-page index's page with a 5-byte key instead of a 4-byte one:
 	// pages 20 and 26 of Constraints.abs are byte-identical to page 19 but
 	// for that field.
-	for _, pageNo := range pages.keys {
-		if err := db.writeIndexLeaf(w, pageNo, nil); err != nil {
+	for i, pageNo := range pages.keys {
+		if err := db.writeIndexLeafOfSize(w, pageNo, files.keySizes[i], nil); err != nil {
 			return err
 		}
 	}

@@ -88,29 +88,27 @@ import (
 // the key material), a column type CREATE TABLE has no corpus evidence for
 // (ErrUnsupportedColumnType), a column carrying a DEFAULT clause, which the
 // serializer cannot write back (ErrColumnDefault), a schema tail that does not
-// parse (ErrSchemaTailNotUnderstood), a PRIMARY KEY or UNIQUE constraint record,
-// whose index a re-created table would not have (ErrConstraintsNotRebuilt), and
-// an index that is not the plain,
-// ascending, case-sensitive, single-column Int32 index CreateIndex builds
+// parse (ErrSchemaTailNotUnderstood), a constraint whose index a re-created
+// table would not safely have (ErrConstraintsNotRebuilt), and an index shape
+// CreateIndex cannot safely rebuild
 // (ErrIndexNotMaintained, ErrMultiColumnIndex or ErrUnsupportedIndexColumn).
 // Losing an index is not an acceptable outcome of a compaction, so a
-// string-keyed index -- which CreateIndex cannot build -- refuses the whole
-// operation.
+// string-keyed index—including a compound one with an occupied string
+// component—refuses the whole operation.
 
 // ErrConstraintsNotRebuilt reports a compaction of a table carrying a
 // constraint record the rebuild cannot write back. CreateTable writes the
 // column-shaped kinds -- NOT NULL and MINVALUE/MAXVALUE -- into the new table's
-// schema stream, so those no longer refuse. A PRIMARY KEY or UNIQUE record
-// still does: its ownerObjectID names the index implementing it, and nothing
-// here builds a key-enforcing index. Compacting such a table would quietly
-// return a database that no longer enforces its own key.
+// schema stream, and key records bring their backing index. A compound key is
+// rebuildable with rows when all components use the measured Int32 encoding;
+// another occupied component is refused before destination creation.
 var ErrConstraintsNotRebuilt = errors.New("absdb: table carries constraint records a rebuild would lose")
 
-// compactIndex is one index CompactDatabase re-creates: its name and the single
-// column it keys on.
+// compactIndex is one index CompactDatabase re-creates: its name and covered
+// columns in key order.
 type compactIndex struct {
-	name   string
-	column string
+	name    string
+	columns []string
 }
 
 // compactTable is one table's whole definition, which is everything CreateTable
@@ -311,11 +309,16 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 		return compactTable{}, err
 	}
 
-	if err := planCompactConstraints(t.Name(), schema, constraints); err != nil {
+	empty, err := tableIsEmpty(t)
+	if err != nil {
 		return compactTable{}, err
 	}
 
-	indexes, err := planCompactIndexes(schema, records, keyBackingIndexes(constraints))
+	if err := planCompactConstraints(t.Name(), schema, constraints, empty); err != nil {
+		return compactTable{}, err
+	}
+
+	indexes, err := planCompactIndexes(schema, records, keyBackingIndexes(constraints), empty)
 	if err != nil {
 		return compactTable{}, err
 	}
@@ -333,7 +336,26 @@ func planCompactTable(db *File, t *Table) (compactTable, error) {
 // property every other check in this file has.
 //
 // The object ids handed out here are discarded, so the first one is arbitrary.
-func planCompactConstraints(table string, schema *TableSchema, constraints []constraintRecord) error {
+func planCompactConstraints(
+	table string, schema *TableSchema, constraints []constraintRecord, allowMixedEmpty bool,
+) error {
+	for _, rec := range constraints {
+		if !allowMixedEmpty &&
+			(rec.kind == constraintPrimaryKey || rec.kind == constraintUnique) && len(rec.columns) > 1 {
+			for _, covered := range rec.columns {
+				colIdx, err := findColumnIndex(schema, covered.name)
+				if err != nil {
+					return fmt.Errorf("%w: constraint %q: %w", ErrConstraintsNotRebuilt, rec.name, err)
+				}
+
+				if !indexableKeyColumn(schema.Columns[colIdx]) {
+					return fmt.Errorf("%w: the populated compound constraint %q keys unsupported column %q",
+						ErrConstraintsNotRebuilt, rec.name, covered.name)
+				}
+			}
+		}
+	}
+
 	_, _, err := planTableConstraints(table, 1, schema.Columns, constraints)
 
 	return err
@@ -371,13 +393,12 @@ func schemaTailArrays(raw []byte) ([]indexRecord, []constraintRecord, error) {
 	return records, constraints, err
 }
 
-// planCompactIndexes checks every index record against what CreateIndex builds:
-// a plain, ascending, case-sensitive index over one Int32 column.
-// maintainableIndexColumn is the same gate the record writer puts in front of
-// index maintenance, which is not a coincidence -- the rows are copied through
-// that writer, so an index it would not maintain could not be filled anyway.
+// planCompactIndexes checks every index record against what CreateIndex builds.
+// A table with rows retains the writer's ascending Int32-component gate because
+// its rows are copied through that writer. An empty table may also carry the
+// measured mixed compound schema/root shape because no leaf entry is filled.
 func planCompactIndexes(
-	schema *TableSchema, records []indexRecord, keyed map[uint32]bool,
+	schema *TableSchema, records []indexRecord, keyed map[uint32]bool, allowMixedEmpty bool,
 ) ([]compactIndex, error) {
 	indexes := make([]compactIndex, 0, len(records))
 
@@ -386,25 +407,48 @@ func planCompactIndexes(
 			continue
 		}
 
-		col, err := maintainableIndexColumn(rec)
+		columns, err := compactIndexColumns(schema, rec, allowMixedEmpty)
 		if err != nil {
 			return nil, err
 		}
 
+		indexes = append(indexes, compactIndex{name: rec.name, columns: columns})
+	}
+
+	return indexes, nil
+}
+
+// compactIndexColumns accepts all-Int32 compound indexes with rows. When the
+// source is empty it may additionally reproduce a measured mixed compound's
+// metadata and key width without encoding an occupied entry.
+func compactIndexColumns(schema *TableSchema, rec indexRecord, allowMixedEmpty bool) ([]string, error) {
+	covered, err := maintainableIndexColumns(rec)
+	if err != nil {
+		return nil, err
+	}
+
+	columns := make([]string, len(covered))
+	for i, col := range covered {
 		colIdx, err := findColumnIndex(schema, col.name)
 		if err != nil {
 			return nil, fmt.Errorf("index %q: %w", rec.name, err)
 		}
 
-		if c := schema.Columns[colIdx]; !indexableKeyColumn(c) {
-			return nil, fmt.Errorf("%w: index %q keys %q, which is base type %d / field type %s",
-				ErrUnsupportedIndexColumn, rec.name, c.Name, c.BaseType, c.FieldType)
+		owner := schema.Columns[colIdx]
+		if len(covered) == 1 || !allowMixedEmpty {
+			if !indexableKeyColumn(owner) {
+				return nil, fmt.Errorf("%w: index %q keys %q, which is base type %d / field type %s",
+					ErrUnsupportedIndexColumn, rec.name, owner.Name, owner.BaseType, owner.FieldType)
+			}
+		} else if _, ok := knownEmptyIndexComponentSize(owner); !ok {
+			return nil, fmt.Errorf("%w: index %q component %q has no measured empty-index width",
+				ErrUnsupportedIndexColumn, rec.name, col.name)
 		}
 
-		indexes = append(indexes, compactIndex{name: rec.name, column: col.name})
+		columns[i] = owner.Name
 	}
 
-	return indexes, nil
+	return columns, nil
 }
 
 // rebuildInto replays the plan into the freshly created destination, table by
@@ -424,7 +468,7 @@ func rebuildInto(src, dst *File, plan []compactTable) error {
 		}
 
 		for _, idx := range tbl.indexes {
-			if err := dst.CreateIndex(tbl.name, idx.name, idx.column); err != nil {
+			if err := dst.CreateIndex(tbl.name, idx.name, idx.columns...); err != nil {
 				return err
 			}
 		}

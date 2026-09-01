@@ -38,10 +38,12 @@ exceptions; see [docs/writing.md](docs/writing.md).
 
 ## What is left, and what each piece unblocks
 
-The write path takes **95 of the corpus's 111 tables**. Every one of the sixteen it refuses is
-refused for the shape of an index, and several are refused for more than one shape at once. The
-table below counts **every** reason a table is refused, not just the first one reported, which is
-what makes the ordering meaningful:
+The last available private-corpus survey found the write path taking **95 of 111 tables**. Every
+one of the sixteen it refused was refused for the shape of an index, and several were refused for
+more than one shape at once. The all-integer compound implementation below predicts **100 of 111**;
+the corpus is not in this checkout, so that remains a projection until the survey can be rerun.
+The table below is the last measured count of **every** reason a table was refused, not just the
+first one reported, which is what makes the ordering meaningful:
 
 | Capability             | Unblocks alone | Appears in | Cumulative, in this order |
 | ---------------------- | -------------- | ---------- | ------------------------- |
@@ -82,9 +84,9 @@ steps, and the sub-steps below are written in that shape so each is separately t
 
 ## Index shapes the write path refuses (Phases 7 and 8)
 
-These five are the whole of the sixteen refusals. Each crosses index maintenance, the constraint
-gate, `CREATE TABLE`/`CREATE INDEX` and compaction, which is why each is a list rather than a
-line.
+At the last survey these five were the whole of the sixteen refusals. Each crosses index
+maintenance, the constraint gate, `CREATE TABLE`/`CREATE INDEX` and compaction, which is why each
+is a list rather than a line.
 
 ### A multi-column key — 5 tables alone, 9 in total
 
@@ -94,18 +96,32 @@ line.
       corpus's key sizes of 10 and 15 bytes are consistent with two and three 5-byte keys, and
       `Constraints.abs` confirms the width rule directly: its 5-byte `INTEGER` component plus
       its 12-byte `VARCHAR(10)` component produce a 17-byte compound `KeyPrefixSize`. The empty
-      roots cannot settle the occupied bytes or tie-breaking; that remains step c. Needs no
-      Wine run. See [docs/format/indexes.md](docs/format/indexes.md#multi-column-key-width).
-- [ ] b. Fixtures: a two-column index with rows, plus an insert, a delete and a key-moving
-      update, in the shape of the `Writes-idx*` family.
-- [ ] c. Read the leaf: the key's layout, its `KeyPrefixSize`, and which column breaks a tie.
+      roots did not settle the occupied bytes or tie-breaking; step c below now supplies that
+      evidence. This width check needed no Wine run. See
+      [docs/format/indexes.md](docs/format/indexes.md#multi-column-keys).
+- [x] b. Fixtures: `MultiKeys-pre.abs`, the populated `MultiKeys.abs` two-column index, plus an
+      insert, a delete and a key-moving update made by the official engine under Wine. The exact
+      statements and provenance are in `testdata/README.md`.
+- [x] c. Read the leaf: the key's layout, its `KeyPrefixSize`, and which column breaks a tie.
       → `docs/format/indexes.md`.
-- [ ] d. Maintain it — a comparison over the concatenation, and the splice
-      (`ErrMultiColumnIndex` lifted only for the shape the fixtures pin).
-- [ ] e. Resolve a multi-column `PRIMARY KEY`/`UNIQUE` in the constraint gate.
-- [ ] f. `CREATE TABLE` builds it; `CREATE INDEX` writes a multi-column record.
-- [ ] g. Compaction rebuilds it (`planCompactIndexes`, `planCompactConstraints`).
-- [ ] h. Docs, and re-measure.
+- [x] d. Maintain it — all-`INTEGER` components are concatenated and compared lexicographically;
+      insert, delete and a second-component-moving update are byte-identical to the engine with
+      no `State` exclusion. `ErrMultiColumnIndex` remains only where another unmeasured component
+      shape is involved, and on the separate `CreateUniqueIndex` convenience API whose generated
+      compound constraint record has no fixture; compound `UNIQUE` clauses themselves are enforced.
+- [x] e. Resolve a multi-column `PRIMARY KEY`/`UNIQUE` in the constraint gate. Key records now
+      resolve every covered column in order against the maintained index with the matching object
+      id; `TestConstraintGateResolvesACompoundKey` pins both the match and an order mismatch.
+- [x] f. `CREATE TABLE` builds it; `CREATE INDEX` writes a multi-column record and builds a
+      populated all-`INTEGER` leaf. The populated result matches `MultiKeys.abs` in every deterministic
+      byte; the existing documented page-`State` exclusion is the only difference.
+- [x] g. Compaction rebuilds it (`planCompactIndexes`, `planCompactConstraints`), for both a plain
+      populated compound index and a compound `PRIMARY KEY`; tuple uniqueness and no-NULL enforcement
+      survive the replay.
+- [~] h. Docs, and re-measure. The occupied layout, supported boundary, fixtures and write behavior
+  are documented. The last survey predicts five newly writable tables (sixteen down to eleven),
+  but re-measuring the 111-table private corpus is a hard blocker because that corpus is not in
+  this checkout.
 
 ### A `VARCHAR` key column — 2 tables alone, 7 in total
 
@@ -190,7 +206,8 @@ Each of these is a known gap rather than an oversight. Nothing below blocks anyt
 - [x] Carry the **index name and covered columns** on `IndexInfo`. `Table.OpenIndex` joins the
       schema definition to its B-tree root by page number, which also attributes empty indexes
       in multi-table files. `FindByStringKey` now selects the named column's single-column index
-      rather than `secondaries[0]`; compound search remains behind the row-bearing fixture.
+      rather than `secondaries[0]`. The occupied compound layout is now pinned, but a tuple lookup
+      remains a separate public-API design: the current lookup methods each accept one scalar.
 - [x] Benchmark index lookup against a full scan. `BenchmarkIndexLookupAgainstFullScan`
       grows the committed `Keys.abs` fixture to 100 rows during untimed setup, then compares a
       primary-key lookup with a worst-case scan for the last row.
@@ -266,10 +283,10 @@ Deferred until there is a concrete use case.
 
 ## Next
 
-The index-shape table above is the order: **a multi-column key**, then a **`VARCHAR` key
-column**, then **`NOCASE`**, which together take the write path from 95 of 111 tables to 107.
-Step (a) of the multi-column item is desk work on files already committed and is where to start;
-step (b) is the first that needs the engine.
+The index-shape table above now points next to a **`VARCHAR` key column**, then **`NOCASE`**.
+The completed all-integer multi-column item predicts the write path moving from 95 to 100 of 111
+tables; `VARCHAR` and `NOCASE` would take that projection to 107. The private corpus must be
+available before those projections can be reported as a fresh measurement.
 
 Three of the remaining validation gaps need the Delphi engine driven directly rather than through
 DBManager's SQL tab: a **`Bytes` value**, a **split B-tree leaf**, and a **second PFS page**. The

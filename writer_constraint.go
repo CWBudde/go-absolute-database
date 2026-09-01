@@ -97,17 +97,22 @@ func newConstraintChecks(
 	var checks constraintChecks
 
 	for _, rec := range constraints {
-		colIdx, err := constraintColumnIndex(rec, schema)
-		if err != nil {
-			return constraintChecks{}, fmt.Errorf("%w: table %q: %w", ErrConstraintsNotEnforced, table, err)
-		}
-
 		switch rec.kind {
 		case constraintNotNull:
+			colIdx, err := constraintColumnIndex(rec, schema)
+			if err != nil {
+				return constraintChecks{}, fmt.Errorf("%w: table %q: %w", ErrConstraintsNotEnforced, table, err)
+			}
+
 			checks.notNull = append(checks.notNull, notNullCheck{
 				colIdx: colIdx, column: schema.Columns[colIdx].Name, record: rec.name,
 			})
 		case constraintCheck:
+			colIdx, err := constraintColumnIndex(rec, schema)
+			if err != nil {
+				return constraintChecks{}, fmt.Errorf("%w: table %q: %w", ErrConstraintsNotEnforced, table, err)
+			}
+
 			bounds, err := newBoundsCheck(rec, schema.Columns[colIdx], colIdx)
 			if err != nil {
 				return constraintChecks{}, fmt.Errorf("%w: table %q: %w", ErrConstraintsNotEnforced, table, err)
@@ -115,7 +120,7 @@ func newConstraintChecks(
 
 			checks.bounds = append(checks.bounds, bounds)
 		case constraintPrimaryKey, constraintUnique:
-			if err := keyIndexEnforces(rec, indexes); err != nil {
+			if err := keyIndexEnforces(rec, indexes, schema); err != nil {
 				return constraintChecks{}, fmt.Errorf("%w: table %q: %w", ErrConstraintsNotEnforced, table, err)
 			}
 		default:
@@ -136,7 +141,7 @@ func newConstraintChecks(
 // holds for kinds 0 and 2 -- the covered column for the other two. Matching on
 // the name instead would accept a record naming an index of the same name on
 // another table.
-func keyIndexEnforces(rec constraintRecord, indexes []maintainedIndex) error {
+func keyIndexEnforces(rec constraintRecord, indexes []maintainedIndex, schema *TableSchema) error {
 	for _, idx := range indexes {
 		if idx.objectID != rec.ownerID {
 			continue
@@ -145,6 +150,28 @@ func keyIndexEnforces(rec constraintRecord, indexes []maintainedIndex) error {
 		if !idx.unique {
 			return fmt.Errorf("the %s constraint %q is built on index %q, which is not flagged UNIQUE or PRIMARY",
 				rec.kind, rec.name, idx.name)
+		}
+
+		if len(idx.colIdxs) != len(rec.columns) {
+			return fmt.Errorf("the %s constraint %q covers %d columns, but index %q covers %d",
+				rec.kind, rec.name, len(rec.columns), idx.name, len(idx.colIdxs))
+		}
+
+		for i, covered := range rec.columns {
+			colIdx, err := findColumnIndex(schema, covered.name)
+			if err != nil {
+				return fmt.Errorf("the %s constraint %q: %w", rec.kind, rec.name, err)
+			}
+
+			if idx.colIdxs[i] < 0 || idx.colIdxs[i] >= len(schema.Columns) {
+				return fmt.Errorf("the %s constraint %q index %q column %d resolves outside the schema",
+					rec.kind, rec.name, idx.name, i)
+			}
+
+			if idx.colIdxs[i] != colIdx {
+				return fmt.Errorf("the %s constraint %q column %d is %q, but index %q covers %q there",
+					rec.kind, rec.name, i, covered.name, idx.name, schema.Columns[idx.colIdxs[i]].Name)
+			}
 		}
 
 		return nil

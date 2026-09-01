@@ -627,6 +627,27 @@ func compareInt32Keys(a, b []byte) int {
 	}
 }
 
+// compareCompoundInt32Keys compares a concatenation of fixed-width Int32 key
+// components in schema order. MultiKeys.abs establishes both the five-byte
+// component concatenation and the lexicographic tie break: B orders two rows
+// only after their A components compare equal.
+func compareCompoundInt32Keys(a, b []byte, components int) int {
+	for i := range components {
+		start := i * indexKeySize
+
+		end := start + indexKeySize
+		if end > len(a) || end > len(b) {
+			return bytes.Compare(a, b)
+		}
+
+		if cmp := compareInt32Keys(a[start:end], b[start:end]); cmp != 0 {
+			return cmp
+		}
+	}
+
+	return bytes.Compare(a[components*indexKeySize:], b[components*indexKeySize:])
+}
+
 // compareStringKeys compares two string index keys.
 // Keys have format: [null_flag] + null-terminated string + garbage.
 // We compare the null flag byte, then the string up to the first null terminator.

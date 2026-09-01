@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 )
 
 // Index maintenance: keeping a table's user indexes in step with its records.
@@ -44,10 +45,10 @@ import (
 //   - an insert into a leaf with no room for another entry, which is where the
 //     engine would split (ErrIndexTooManyRows, the same error CreateIndex
 //     raises for a table too large to index in the first place);
-//   - a key that is not the 1-null-flag-byte-plus-int32 shape CreateIndex
-//     builds, an index over more than one column, a DESC or NOCASE column, and
-//     a table whose schema tail does not parse at all (all
-//     ErrIndexNotMaintained). See maintainableIndexColumn for what each of
+//   - a key component that is not the 1-null-flag-byte-plus-int32 shape
+//     CreateIndex builds, a DESC or NOCASE column, and a table whose schema
+//     tail does not parse at all (all
+//     ErrIndexNotMaintained). See maintainableIndexColumns for what each of
 //     those would get wrong.
 //
 // A UNIQUE or PRIMARY index is no longer among them. Four more engine-made
@@ -75,7 +76,9 @@ import (
 var ErrDuplicateKey = errors.New("absdb: duplicate key in a UNIQUE or PRIMARY index")
 
 // maintainedIndex is one user index this writer keeps in step with the records:
-// which page its single leaf is, and which column it keys on.
+// which page its single leaf is, and which columns it keys on. colIdx names the
+// first column for diagnostics and older test helpers; colIdxs is the complete
+// schema-order tuple used for encoding and constraint resolution.
 //
 // The covered column comes from the schema stream's index-definition array, not
 // from the leaf. That is what makes maintenance possible at all: the B-tree
@@ -86,6 +89,8 @@ type maintainedIndex struct {
 	objectID   uint32
 	rootPageNo int
 	colIdx     int
+	colIdxs    []int
+	keySize    int
 
 	// unique is set for a UNIQUE or PRIMARY index, which refuses a key its
 	// leaf already holds; primary additionally refuses a NULL key. The two
@@ -243,14 +248,13 @@ func (w *TableWriter) tableSchemaTail() ([]indexRecord, []constraintRecord, erro
 	return records, constraints, nil
 }
 
-// maintainableIndexColumn returns the one column an index keys on, refusing
-// every index shape whose leaf this package cannot reproduce.
+// maintainableIndexColumns returns the columns an index keys on, refusing
+// every per-column ordering shape whose leaf this package cannot reproduce.
 //
 // Reading the schema tail stopped being the gate here once constraint records
 // were decoded, so these are the refusals that carry the weight now, and each
 // one names a leaf this package would order differently than the engine did:
 //
-//   - a multi-column index concatenates its columns into one key;
 //   - a DESC column sorts the other way, and compareInt32Keys does not;
 //   - a NOCASE column compares case-folded, which no key this package builds
 //     does.
@@ -259,19 +263,19 @@ func (w *TableWriter) tableSchemaTail() ([]indexRecord, []constraintRecord, erro
 // that no fixture showed the engine inserting into one. The Keys*.abs family
 // is that fixture, so what the flags now select is the duplicate check in
 // checkKeyIndexes rather than a refusal.
-func maintainableIndexColumn(rec indexRecord) (indexColumn, error) {
-	col, ok := rec.singleColumn()
-	if !ok {
-		return indexColumn{}, fmt.Errorf("%w: %w: index %q covers %d columns",
-			ErrIndexNotMaintained, ErrMultiColumnIndex, rec.name, len(rec.columns))
+func maintainableIndexColumns(rec indexRecord) ([]indexColumn, error) {
+	if len(rec.columns) == 0 {
+		return nil, fmt.Errorf("%w: index %q covers no columns", ErrIndexNotMaintained, rec.name)
 	}
 
-	if col.descending || col.caseInsensitive {
-		return indexColumn{}, fmt.Errorf("%w: index %q keys %q with descending=%t, case-insensitive=%t",
-			ErrIndexNotMaintained, rec.name, col.name, col.descending, col.caseInsensitive)
+	for _, col := range rec.columns {
+		if col.descending || col.caseInsensitive {
+			return nil, fmt.Errorf("%w: index %q keys %q with descending=%t, case-insensitive=%t",
+				ErrIndexNotMaintained, rec.name, col.name, col.descending, col.caseInsensitive)
+		}
 	}
 
-	return col, nil
+	return rec.columns, nil
 }
 
 // describeIndex turns one schema index record into what maintenance needs,
@@ -279,28 +283,40 @@ func maintainableIndexColumn(rec indexRecord) (indexColumn, error) {
 // here is a shape this package will not guess at, checked before any record is
 // written so that a refused write leaves nothing behind.
 func (w *TableWriter) describeIndex(rec indexRecord) (maintainedIndex, error) {
-	col, err := maintainableIndexColumn(rec)
+	columns, err := maintainableIndexColumns(rec)
 	if err != nil {
 		return maintainedIndex{}, err
 	}
 
 	schema := w.r.Schema()
+	colIdxs := make([]int, len(columns))
 
-	colIdx, err := findColumnIndex(schema, col.name)
-	if err != nil {
-		return maintainedIndex{}, fmt.Errorf("%w: index %q: %w", ErrIndexNotMaintained, rec.name, err)
-	}
+	for i, covered := range columns {
+		colIdx, err := findColumnIndex(schema, covered.name)
+		if err != nil {
+			return maintainedIndex{}, fmt.Errorf("%w: index %q: %w", ErrIndexNotMaintained, rec.name, err)
+		}
 
-	if col := schema.Columns[colIdx]; !indexableKeyColumn(col) {
-		return maintainedIndex{}, fmt.Errorf("%w: index %q keys %q, which is base type %d / field type %s",
-			ErrIndexNotMaintained, rec.name, col.Name, col.BaseType, col.FieldType)
+		if col := schema.Columns[colIdx]; !indexableKeyColumn(col) {
+			if len(columns) > 1 {
+				return maintainedIndex{}, fmt.Errorf("%w: %w: index %q component %q is base type %d / field type %s",
+					ErrIndexNotMaintained, ErrMultiColumnIndex, rec.name, col.Name, col.BaseType, col.FieldType)
+			}
+
+			return maintainedIndex{}, fmt.Errorf("%w: index %q keys %q, which is base type %d / field type %s",
+				ErrIndexNotMaintained, rec.name, col.Name, col.BaseType, col.FieldType)
+		}
+
+		colIdxs[i] = colIdx
 	}
 
 	idx := maintainedIndex{
 		name:       rec.name,
 		objectID:   rec.objectID,
 		rootPageNo: int(rec.rootPageNo),
-		colIdx:     colIdx,
+		colIdx:     colIdxs[0],
+		colIdxs:    colIdxs,
+		keySize:    len(colIdxs) * indexKeySize,
 		unique:     rec.unique || rec.primary,
 		primary:    rec.primary,
 	}
@@ -321,8 +337,10 @@ func (w *TableWriter) describeIndex(rec indexRecord) (maintainedIndex, error) {
 // update mutates the same leaf twice -- a removal then an insertion -- and the
 // second has to see what the first left behind.
 type indexLeaf struct {
-	buf    *pageWriteBuf
-	stride int
+	buf        *pageWriteBuf
+	stride     int
+	keySize    int
+	components int
 }
 
 // indexLeaf buffers and validates the leaf page of one maintained index.
@@ -343,12 +361,15 @@ func (w *TableWriter) indexLeaf(idx maintainedIndex) (indexLeaf, error) {
 			ErrIndexNotMaintained, idx.name, hdr.IsRoot, hdr.IsLeaf)
 	}
 
-	if int(hdr.KeyPrefixSize) != indexKeySize {
+	if int(hdr.KeyPrefixSize) != idx.keySize {
 		return indexLeaf{}, fmt.Errorf("%w: index %q leaf keys are %d bytes, want %d",
-			ErrIndexNotMaintained, idx.name, hdr.KeyPrefixSize, indexKeySize)
+			ErrIndexNotMaintained, idx.name, hdr.KeyPrefixSize, idx.keySize)
 	}
 
-	leaf := indexLeaf{buf: buf, stride: indexKeySize + leafEntrySuffixSize}
+	leaf := indexLeaf{
+		buf: buf, stride: idx.keySize + leafEntrySuffixSize,
+		keySize: idx.keySize, components: len(idx.colIdxs),
+	}
 
 	if end := leaf.end(); end > len(buf.payload) {
 		return indexLeaf{}, fmt.Errorf("%w: index %q claims %d entries, which need %d bytes of a %d-byte page",
@@ -377,12 +398,12 @@ func (l indexLeaf) offset(i int) int {
 func (l indexLeaf) key(i int) []byte {
 	off := l.offset(i)
 
-	return l.buf.payload[off : off+indexKeySize]
+	return l.buf.payload[off : off+l.keySize]
 }
 
 // ref returns the row entry i points at.
 func (l indexLeaf) ref(i int) RecordID {
-	off := l.offset(i) + indexKeySize
+	off := l.offset(i) + l.keySize
 
 	return RecordID{
 		PageNo: int(int32(binary.LittleEndian.Uint32(l.buf.payload[off : off+4]))),
@@ -395,7 +416,7 @@ func (l indexLeaf) ref(i int) RecordID {
 // duplicate is exactly a key the splice would place beside an equal one.
 func (l indexLeaf) hasKey(key []byte) bool {
 	for i := range l.count() {
-		if compareInt32Keys(l.key(i), key) == 0 {
+		if compareCompoundInt32Keys(l.key(i), key, l.components) == 0 {
 			return true
 		}
 	}
@@ -447,7 +468,7 @@ func (l indexLeaf) insert(key []byte, id RecordID) error {
 	pos := count
 
 	for i := range count {
-		if compareInt32Keys(l.key(i), key) > 0 {
+		if compareCompoundInt32Keys(l.key(i), key, l.components) > 0 {
 			pos = i
 
 			break
@@ -459,9 +480,9 @@ func (l indexLeaf) insert(key []byte, id RecordID) error {
 	// copy is a memmove, so the overlap with the shifted region is safe.
 	copy(l.buf.payload[off+l.stride:end+l.stride], l.buf.payload[off:end])
 
-	copy(l.buf.payload[off:off+indexKeySize], key)
-	binary.LittleEndian.PutUint32(l.buf.payload[off+indexKeySize:off+indexKeySize+4], uint32(id.PageNo))
-	binary.LittleEndian.PutUint16(l.buf.payload[off+indexKeySize+4:off+indexKeySize+6], uint16(id.Slot))
+	copy(l.buf.payload[off:off+l.keySize], key)
+	binary.LittleEndian.PutUint32(l.buf.payload[off+l.keySize:off+l.keySize+4], uint32(id.PageNo))
+	binary.LittleEndian.PutUint16(l.buf.payload[off+l.keySize+4:off+l.keySize+6], uint16(id.Slot))
 
 	l.setCount(count + 1)
 
@@ -508,29 +529,43 @@ func (l indexLeaf) remove(id RecordID) error {
 // [null flag byte][int32 little-endian] shape buildIndexLeafEntries writes when
 // CREATE INDEX builds the whole leaf. Sharing that shape is what lets a
 // maintained leaf be compared against a rebuilt one.
-func (w *TableWriter) indexKeyFor(id RecordID, colIdx int) ([]byte, error) {
+func (w *TableWriter) indexKeyFor(id RecordID, colIdxs []int) ([]byte, error) {
 	rec, err := w.Record(id)
 	if err != nil {
 		return nil, err
 	}
 
-	return indexKeyOf(rec, colIdx), nil
+	return indexKeyOf(rec, colIdxs), nil
 }
 
 // indexKeyOf builds one record's leaf key. It takes a Record rather than a
 // RecordID so that a key can be built for a record that has not been stored
 // yet, which is what the duplicate check needs: the engine leaves a refused
 // write's file byte-identical, so the check has to run before the row exists.
-func indexKeyOf(rec Record, colIdx int) []byte {
-	key := make([]byte, indexKeySize)
+func indexKeyOf(rec Record, colIdxs []int) []byte {
+	key := make([]byte, len(colIdxs)*indexKeySize)
 
-	if rec.IsNull(colIdx) {
-		key[0] = 1
-	} else {
-		binary.LittleEndian.PutUint32(key[1:], uint32(rec.Int(colIdx)))
+	for i, colIdx := range colIdxs {
+		component := key[i*indexKeySize : (i+1)*indexKeySize]
+		if rec.IsNull(colIdx) {
+			component[0] = 1
+		} else {
+			binary.LittleEndian.PutUint32(component[1:], uint32(rec.Int(colIdx)))
+		}
 	}
 
 	return key
+}
+
+func compoundKeyHasNull(key []byte, components int) bool {
+	for i := range components {
+		off := i * indexKeySize
+		if off >= len(key) || key[off] != 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // checkKeyIndexes refuses a write that a UNIQUE or PRIMARY index would reject:
@@ -560,7 +595,7 @@ func (w *TableWriter) checkKeyIndexes(indexes []maintainedIndex, raw []byte, bef
 			}
 		}
 
-		key := indexKeyOf(rec, idx.colIdx)
+		key := indexKeyOf(rec, idx.colIdxs)
 		if before != nil && bytes.Equal(before[i], key) {
 			continue
 		}
@@ -575,12 +610,17 @@ func (w *TableWriter) checkKeyIndexes(indexes []maintainedIndex, raw []byte, bef
 
 // checkKeyIndex tests one key against one key-enforcing index.
 func (w *TableWriter) checkKeyIndex(idx maintainedIndex, key []byte) error {
-	column := w.r.Schema().Columns[idx.colIdx].Name
+	columns := make([]string, len(idx.colIdxs))
+	for i, colIdx := range idx.colIdxs {
+		columns[i] = w.r.Schema().Columns[colIdx].Name
+	}
+
+	column := strings.Join(columns, ", ")
 
 	// A PRIMARY KEY column carries no NOT NULL constraint record -- Keys.abs
 	// has none -- and the engine refuses a NULL in it anyway, so nothing in
 	// the constraint array would have caught this.
-	if idx.primary && key[0] != 0 {
+	if idx.primary && compoundKeyHasNull(key, len(idx.colIdxs)) {
 		return fmt.Errorf("%w: %s.%s, covered by the primary key index %q",
 			ErrNotNullViolated, w.r.table.Name(), column, idx.name)
 	}
@@ -619,7 +659,7 @@ func (w *TableWriter) indexRoom(indexes []maintainedIndex) error {
 // indexInsert adds the record at id to every maintained index.
 func (w *TableWriter) indexInsert(indexes []maintainedIndex, id RecordID) error {
 	for _, idx := range indexes {
-		key, err := w.indexKeyFor(id, idx.colIdx)
+		key, err := w.indexKeyFor(id, idx.colIdxs)
 		if err != nil {
 			return err
 		}
@@ -706,7 +746,7 @@ func (w *TableWriter) indexKeys(indexes []maintainedIndex, id RecordID) ([][]byt
 	keys := make([][]byte, len(indexes))
 
 	for i, idx := range indexes {
-		key, err := w.indexKeyFor(id, idx.colIdx)
+		key, err := w.indexKeyFor(id, idx.colIdxs)
 		if err != nil {
 			return nil, err
 		}
@@ -726,7 +766,7 @@ func (w *TableWriter) indexKeys(indexes []maintainedIndex, id RecordID) ([][]byt
 // its State counter for a page whose contents did not change.
 func (w *TableWriter) indexReplace(indexes []maintainedIndex, id RecordID, before [][]byte) error {
 	for i, idx := range indexes {
-		after, err := w.indexKeyFor(id, idx.colIdx)
+		after, err := w.indexKeyFor(id, idx.colIdxs)
 		if err != nil {
 			return err
 		}

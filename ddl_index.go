@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -40,11 +41,12 @@ import (
 // was only ever seen as 1 and the two flag bytes read as a reserved field, so a
 // multi-column index -- which every indexed private fixture has -- was refused.
 //
-// Only a single-covered-column, ascending, case-sensitive, int32-keyed index is
-// built by CREATE INDEX and kept in step on write: it is the only leaf entry
-// format docs/format/indexes.md covers ([null flag byte] + int32 LE key,
-// then PageNo int32 + ItemNo uint16), and a DESC or NOCASE index orders its
-// leaf differently than this package's comparison does.
+// A populated index is built for one or more ascending, case-sensitive Int32
+// columns. MultiKeys.abs pins that each ordinary five-byte component is
+// concatenated in schema order and compared lexicographically. A rowless
+// compound CREATE INDEX may additionally carry a measured VARCHAR component:
+// Constraints.abs pins its metadata and summed width, while an occupied string
+// component remains refused by the separate VARCHAR-key boundary.
 
 var (
 	// ErrIndexExists reports a CREATE INDEX naming an index that already exists
@@ -59,15 +61,11 @@ var (
 	// naming a column the table does not have.
 	ErrNoSuchColumn = errors.New("absdb: no such column")
 
-	// ErrMultiColumnIndex reports a write to a table carrying an index over
-	// more than one column. The records are read now -- Constraints.abs's
-	// CIdxMulti pins their layout -- but a multi-column key concatenates its
-	// columns into one leaf entry, and this package builds and compares only
-	// the single-column, int32-keyed leaf its engine measurement covers. It
-	// accompanies ErrIndexNotMaintained rather than replacing it, so a caller
-	// can tell this refusal apart from the other index shapes
-	// maintainableIndexColumn declines.
-	ErrMultiColumnIndex = errors.New("absdb: multi-column indexes are not supported")
+	// ErrMultiColumnIndex reports a compound operation whose occupied component
+	// shape is still unmeasured, currently a string component or the generated
+	// constraint form of CREATE UNIQUE INDEX. All-Int32 compound leaves are
+	// built and maintained from the MultiKeys*.abs evidence.
+	ErrMultiColumnIndex = errors.New("absdb: occupied multi-column index shape is not supported")
 
 	// ErrIndexBacksConstraint reports a DROP INDEX naming the index a PRIMARY
 	// KEY or UNIQUE constraint record is built on. Dropping it would leave
@@ -150,9 +148,8 @@ type indexRecord struct {
 }
 
 // singleColumn returns the one column this index covers, and reports false for
-// a multi-column index. Every write path in this package keys on a single
-// column, so this is where "the index covers exactly one column" is asked
-// rather than assumed.
+// a multi-column index. Callers that specifically implement single-column
+// lookup or metadata presentation ask here rather than assuming it.
 func (r indexRecord) singleColumn() (indexColumn, bool) {
 	if len(r.columns) != 1 {
 		return indexColumn{}, false
@@ -175,14 +172,15 @@ func (r indexRecord) coversColumn(name string) bool {
 }
 
 // createIndexPlan holds what validating a CREATE INDEX request produces: the
-// table, the column to key by, and the schema stream already split at the
-// points a new record is spliced in at. Splitting CreateIndex into "plan" and
+// table, the columns to key by, their measured empty-root width, and the schema
+// stream already split at the points a new record is spliced in at. Splitting CreateIndex into "plan" and
 // "apply" keeps each half's branching simple enough for cyclop -- the plan is
 // all refusals, the apply is all writes.
 type createIndexPlan struct {
 	table        *Table
-	colIdx       int
-	column       Column
+	colIdxs      []int
+	columns      []Column
+	keySize      int
 	schemaPageNo int
 	raw          []byte
 	colsEnd      int
@@ -197,7 +195,7 @@ type createIndexPlan struct {
 
 // planCreateIndex validates a CREATE INDEX request and returns everything
 // applyCreateIndex needs, without writing anything.
-func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, error) {
+func (db *File) planCreateIndex(table, index string, columns []string) (createIndexPlan, error) {
 	t, err := db.Table(table)
 	if err != nil {
 		return createIndexPlan{}, err
@@ -208,7 +206,7 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 		return createIndexPlan{}, err
 	}
 
-	colIdx, err := findColumnIndex(schema, column)
+	colIdxs, resolved, keySize, err := resolveCreateIndexColumns(schema, index, columns)
 	if err != nil {
 		return createIndexPlan{}, err
 	}
@@ -238,15 +236,11 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 		}
 	}
 
-	if col := schema.Columns[colIdx]; !indexableKeyColumn(col) {
-		return createIndexPlan{}, fmt.Errorf("%w: %q is base type %d / field type %s",
-			ErrUnsupportedIndexColumn, col.Name, col.BaseType, col.FieldType)
-	}
-
 	return createIndexPlan{
 		table:           t,
-		colIdx:          colIdx,
-		column:          schema.Columns[colIdx],
+		colIdxs:         colIdxs,
+		columns:         resolved,
+		keySize:         keySize,
 		schemaPageNo:    schemaPageNo,
 		raw:             raw,
 		colsEnd:         colsEnd,
@@ -254,6 +248,43 @@ func (db *File) planCreateIndex(table, index, column string) (createIndexPlan, e
 		tailStart:       tailStart,
 		constraintCount: len(constraints),
 	}, nil
+}
+
+// resolveCreateIndexColumns resolves and sizes the request independently of
+// the schema stream splice, keeping planCreateIndex's validation readable.
+func resolveCreateIndexColumns(
+	schema *TableSchema, index string, columns []string,
+) ([]int, []Column, int, error) {
+	if len(columns) == 0 || len(columns) > maxSchemaColumns {
+		return nil, nil, 0, fmt.Errorf("%w: index %q covers %d columns", ErrValueRange, index, len(columns))
+	}
+
+	colIdxs := make([]int, len(columns))
+	resolved := make([]Column, len(columns))
+	keySize := 0
+
+	for i, column := range columns {
+		colIdx, err := findColumnIndex(schema, column)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+
+		colIdxs[i], resolved[i] = colIdx, schema.Columns[colIdx]
+
+		component, ok := knownEmptyIndexComponentSize(resolved[i])
+		if !ok || (len(columns) == 1 && !indexableKeyColumn(resolved[i])) {
+			return nil, nil, 0, fmt.Errorf("%w: %q is base type %d / field type %s",
+				ErrUnsupportedIndexColumn, resolved[i].Name, resolved[i].BaseType, resolved[i].FieldType)
+		}
+
+		keySize += component
+	}
+
+	if keySize > math.MaxUint16 {
+		return nil, nil, 0, fmt.Errorf("%w: index %q key width %d", ErrValueRange, index, keySize)
+	}
+
+	return colIdxs, resolved, keySize, nil
 }
 
 // splice rebuilds the schema stream with the new index record appended to the
@@ -279,13 +310,16 @@ func (p createIndexPlan) splice(record, constraint []byte) []byte {
 		p.raw[trailerStart:])
 }
 
-// CreateIndex adds a single-column index to a table.
+// CreateIndex adds an index to a table. Existing single-column calls pass one
+// column; additional names build the multi-column schema record and root.
+// Constraints.abs establishes empty mixed-component roots, and MultiKeys.abs
+// establishes populated all-Int32 roots.
 //
 // It fails with ErrReadOnly unless the file was opened with OpenForWrite, and
 // refuses rather than guess when: the table does not exist (ErrNoSuchTable),
 // the index name is already used (ErrIndexExists), the column does not exist
-// (ErrNoSuchColumn), the column is not an Int32/Integer column
-// (ErrUnsupportedIndexColumn), the table's schema stream tail does not parse
+// (ErrNoSuchColumn), an occupied component is not an Int32/Integer column
+// (ErrUnsupportedIndexColumn/ErrMultiColumnIndex), the schema stream tail does not parse
 // (ErrSchemaTailNotUnderstood), or the table has more rows than fit on one
 // index leaf page (ErrIndexTooManyRows).
 //
@@ -294,8 +328,8 @@ func (p createIndexPlan) splice(record, constraint []byte) []byte {
 // new index record is spliced in ahead of them so they come back byte for byte.
 // Note that the new index is a plain one -- CreateIndex neither creates nor
 // enforces a constraint. CreateUniqueIndex does both.
-func (db *File) CreateIndex(table, index, column string) error {
-	return db.createIndex(table, index, column, false)
+func (db *File) CreateIndex(table, index string, columns ...string) error {
+	return db.createIndex(table, index, columns, false)
 }
 
 // CreateUniqueIndex adds a single-column index that refuses a duplicate key,
@@ -312,27 +346,27 @@ func (db *File) CreateIndex(table, index, column string) error {
 // two equal values cannot be indexed uniquely (ErrDuplicateKey), which is what
 // the SDK manual says the engine checks "when the index is created (if data
 // already exist)". A NULL counts as a value, so two of those collide as well.
-func (db *File) CreateUniqueIndex(table, index, column string) error {
-	return db.createIndex(table, index, column, true)
+func (db *File) CreateUniqueIndex(table, index string, columns ...string) error {
+	return db.createIndex(table, index, columns, true)
 }
 
-func (db *File) createIndex(table, index, column string, unique bool) error {
+func (db *File) createIndex(table, index string, columns []string, unique bool) error {
 	if !db.writable {
 		return ErrReadOnly
 	}
 
-	plan, err := db.planCreateIndex(table, index, column)
+	plan, err := db.planCreateIndex(table, index, columns)
 	if err != nil {
 		return err
 	}
 
-	entries, err := db.buildIndexLeafEntries(plan.table, plan.colIdx)
+	entries, err := db.createIndexEntries(plan, index, unique)
 	if err != nil {
 		return err
 	}
 
 	if unique {
-		if err := refuseDuplicateEntries(entries, index, plan.column.Name); err != nil {
+		if err := refuseDuplicateEntries(entries, index, plan.columns[0].Name, len(plan.colIdxs)); err != nil {
 			return err
 		}
 	}
@@ -346,7 +380,7 @@ func (db *File) createIndex(table, index, column string, unique bool) error {
 
 	rootPageNo := indexPages[0]
 
-	if err := db.writeIndexLeaf(w, rootPageNo, entries); err != nil {
+	if err := db.writeIndexLeafOfSize(w, rootPageNo, plan.keySize, entries); err != nil {
 		return err
 	}
 
@@ -385,6 +419,54 @@ func (db *File) createIndex(table, index, column string, unique bool) error {
 	return nil
 }
 
+// createIndexEntries builds occupied entries for the measured all-Int32 shape.
+// An empty compound index may additionally contain components whose width is
+// known from an empty engine root but whose occupied encoding is not yet known.
+func (db *File) createIndexEntries(plan createIndexPlan, index string, unique bool) ([]BTreeEntry, error) {
+	if unique && len(plan.columns) > 1 {
+		return nil, fmt.Errorf("%w: UNIQUE index %q covers %d columns",
+			ErrMultiColumnIndex, index, len(plan.columns))
+	}
+
+	allInt32 := true
+	for _, column := range plan.columns {
+		allInt32 = allInt32 && indexableKeyColumn(column)
+	}
+
+	if allInt32 {
+		return db.buildIndexLeafEntries(plan.table, plan.colIdxs)
+	}
+
+	empty, err := tableIsEmpty(plan.table)
+	if err != nil || empty {
+		return nil, err
+	}
+
+	return nil, fmt.Errorf("%w: index %q has an unmeasured occupied compound component",
+		ErrMultiColumnIndex, index)
+}
+
+// tableIsEmpty checks whether a request needs occupied component evidence.
+// All-Int32 compound indexes no longer need this escape hatch; mixed compound
+// roots retain it because their empty width is measured but their string bytes
+// are not.
+func tableIsEmpty(t *Table) (bool, error) {
+	r, err := t.Open()
+	if err != nil {
+		return false, err
+	}
+
+	if r.Next() {
+		return false, nil
+	}
+
+	if err := r.Err(); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 // serializeNewIndex builds the records CREATE INDEX splices in: the index
 // record always, and the UNIQUE constraint record naming it when the index is
 // a unique one. The constraint takes the object id after the index's, which is
@@ -392,12 +474,20 @@ func (db *File) createIndex(table, index, column string, unique bool) error {
 func serializeNewIndex(
 	plan createIndexPlan, index string, objectID, rootPageNo int, unique bool,
 ) (record, constraint []byte, err error) {
+	covered := make([]indexColumn, len(plan.columns))
+	for i, column := range plan.columns {
+		covered[i] = indexColumn{
+			name: column.Name, descending: false, caseInsensitive: false,
+			maxIndexedSize: indexColumnMaxIndexedSize,
+		}
+	}
+
 	record, err = serializeIndexRecord(indexRecord{
 		name:       index,
 		objectID:   uint32(objectID), //nolint:gosec // small object ids
 		unique:     unique,
 		rootPageNo: int32(rootPageNo), //nolint:gosec // small page numbers
-		columns:    []indexColumn{{name: plan.column.Name, maxIndexedSize: indexColumnMaxIndexedSize}},
+		columns:    covered,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -409,11 +499,11 @@ func serializeNewIndex(
 
 	constraint, err = serializeConstraintRecord(constraintRecord{
 		kind:     constraintUnique,
-		name:     uniqueConstraintName(plan.column.Name),
+		name:     uniqueConstraintName(plan.columns[0].Name),
 		objectID: uint32(objectID + 1), //nolint:gosec // small object ids
 		ownerID:  uint32(objectID),     //nolint:gosec // small object ids
 		index:    index,
-		columns:  []constraintColumn{{name: plan.column.Name, objectID: plan.column.ID}},
+		columns:  []constraintColumn{{name: plan.columns[0].Name, objectID: plan.columns[0].ID}},
 	})
 	if err != nil {
 		return nil, nil, err
@@ -435,9 +525,9 @@ func uniqueConstraintName(column string) string {
 // already holds a key twice, which the SDK manual says the engine checks when
 // the index is created. The entries are sorted by key, so equal keys are
 // adjacent.
-func refuseDuplicateEntries(entries []BTreeEntry, index, column string) error {
+func refuseDuplicateEntries(entries []BTreeEntry, index, column string, components int) error {
 	for i := 1; i < len(entries); i++ {
-		if compareInt32Keys(entries[i-1].Key, entries[i].Key) == 0 {
+		if compareCompoundInt32Keys(entries[i-1].Key, entries[i].Key, components) == 0 {
 			return fmt.Errorf("%w: %q already holds two rows with the same value, so %q cannot be unique",
 				ErrDuplicateKey, column, index)
 		}
@@ -895,39 +985,43 @@ func serializeIndexArray(records []indexRecord) ([]byte, error) {
 	return out, nil
 }
 
-// serializeIndexRecord builds one index record, the mirror of parseIndexRecord
-// for the one shape this package builds: a Pascal name, the object id, the
-// reserved/UNIQUE/PRIMARY flag bytes, coveredColumnCount=1, the index's own
-// root page, and a single covered column -- a Pascal name, a zero DESC flag, a
-// zero NOCASE flag and the constant maximum indexed size.
+// serializeIndexRecord builds one index record, the mirror of parseIndexRecord:
+// a Pascal name, the object id, the reserved/UNIQUE/PRIMARY flag bytes, the
+// covered-column count, the index's own root page, and one entry per covered
+// column. Each column entry is a Pascal name, its DESC and NOCASE flags, and
+// the constant maximum indexed size.
 //
 // The bytes for a plain index are the same ones this function wrote before
 // covered-column entries were decoded, which is what keeps
 // TestCreateIndexMatchesEngineByteForByte passing unchanged: what used to be
 // "2 reserved bytes plus a 0x14 terminator" is the ASC/CASE/20 entry the
-// engine writes for an ascending, case-sensitive index.
+// engine writes for an ascending, case-sensitive index. Constraints.abs's
+// CPkMulti and CIdxMulti pin the repeated-column form byte for byte; supporting
+// it here is independent of the occupied encoder, whose all-Int32 form is
+// pinned separately by MultiKeys.abs.
 func serializeIndexRecord(rec indexRecord) ([]byte, error) {
 	rawName, err := encodePascalName(rec.name)
 	if err != nil {
 		return nil, err
 	}
 
-	col, ok := rec.singleColumn()
-	if !ok {
-		return nil, fmt.Errorf("%w: index %q covers %d columns", ErrMultiColumnIndex, rec.name, len(rec.columns))
+	if len(rec.columns) == 0 || len(rec.columns) > maxSchemaColumns {
+		return nil, fmt.Errorf("%w: index %q covers %d columns", ErrValueRange, rec.name, len(rec.columns))
 	}
 
-	if col.descending || col.caseInsensitive {
-		return nil, fmt.Errorf("%w: index %q is descending=%t case-insensitive=%t",
-			ErrUnsupportedIndexColumn, rec.name, col.descending, col.caseInsensitive)
+	rawColumns := make([][]byte, len(rec.columns))
+	size := 1 + len(rawName) + 4 + indexRecordFlagsSize + 4 + 4
+
+	for i, col := range rec.columns {
+		rawColumns[i], err = encodePascalName(col.name)
+		if err != nil {
+			return nil, fmt.Errorf("covered column %d: %w", i, err)
+		}
+
+		size += 1 + len(rawColumns[i]) + 2 + 4
 	}
 
-	rawColumn, err := encodePascalName(col.name)
-	if err != nil {
-		return nil, err
-	}
-
-	out := make([]byte, 0, 1+len(rawName)+4+indexRecordFlagsSize+4+4+1+len(rawColumn)+2+4)
+	out := make([]byte, 0, size)
 
 	out = append(out, byte(len(rawName))) //nolint:gosec // checked in encodePascalName
 	out = append(out, rawName...)
@@ -939,19 +1033,21 @@ func serializeIndexRecord(rec indexRecord) ([]byte, error) {
 
 	out = append(out, 0, indexFlagByte(rec.unique), indexFlagByte(rec.primary))
 
-	binary.LittleEndian.PutUint32(buf4[:], 1) // coveredColumnCount
+	binary.LittleEndian.PutUint32(buf4[:], uint32(len(rec.columns))) //nolint:gosec // bounded above
 	out = append(out, buf4[:]...)
 
 	binary.LittleEndian.PutUint32(buf4[:], uint32(rec.rootPageNo))
 	out = append(out, buf4[:]...)
 
-	out = append(out, byte(len(rawColumn))) //nolint:gosec // checked in encodePascalName
-	out = append(out, rawColumn...)
+	for i, col := range rec.columns {
+		rawColumn := rawColumns[i]
+		out = append(out, byte(len(rawColumn))) //nolint:gosec // checked in encodePascalName
+		out = append(out, rawColumn...)
+		out = append(out, indexFlagByte(col.descending), indexFlagByte(col.caseInsensitive))
 
-	out = append(out, 0, 0) // DESC = false, NOCASE = false
-
-	binary.LittleEndian.PutUint32(buf4[:], indexColumnMaxIndexedSize)
-	out = append(out, buf4[:]...)
+		binary.LittleEndian.PutUint32(buf4[:], indexColumnMaxIndexedSize)
+		out = append(out, buf4[:]...)
+	}
 
 	return out, nil
 }
@@ -1032,9 +1128,9 @@ func spliceIndexRecord(data []byte, colsEnd int, newCount int32, parts ...[]byte
 }
 
 // buildIndexLeafEntries reads every row of a table and returns the leaf
-// entries a single-page B-tree index over one Int32 column holds: sorted by
-// key, [null flag byte]+int32 LE, then the row's data page and slot.
-func (db *File) buildIndexLeafEntries(t *Table, colIdx int) ([]BTreeEntry, error) {
+// entries a single-page B-tree index over one or more Int32 columns holds:
+// schema-order five-byte components, then the row's data page and slot.
+func (db *File) buildIndexLeafEntries(t *Table, colIdxs []int) ([]BTreeEntry, error) {
 	r, err := t.Open()
 	if err != nil {
 		return nil, err
@@ -1050,12 +1146,7 @@ func (db *File) buildIndexLeafEntries(t *Table, colIdx int) ([]BTreeEntry, error
 			return nil, fmt.Errorf("absdb: index build: %w", ErrBadLayout)
 		}
 
-		key := make([]byte, indexKeySize)
-		if rec.IsNull(colIdx) {
-			key[0] = 1
-		} else {
-			binary.LittleEndian.PutUint32(key[1:], uint32(rec.Int(colIdx)))
-		}
+		key := indexKeyOf(rec, colIdxs)
 
 		entries = append(entries, BTreeEntry{
 			Key:    key,
@@ -1069,23 +1160,24 @@ func (db *File) buildIndexLeafEntries(t *Table, colIdx int) ([]BTreeEntry, error
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
-		return compareInt32Keys(entries[i].Key, entries[j].Key) < 0
+		return compareCompoundInt32Keys(entries[i].Key, entries[j].Key, len(colIdxs)) < 0
 	})
 
 	return entries, nil
 }
 
-// writeIndexLeaf writes a single B-tree root/leaf page holding entries, the
-// shape writeIndexRoot (ddl_create.go) writes for an empty record-page index:
+// writeIndexLeafOfSize writes a single B-tree root/leaf page holding entries:
 // IsRoot=true, IsLeaf=true, no siblings, HasKeys=true, HasSuffixes=false, keyed
-// by indexKeySize, followed by one leafEntrySuffixSize-suffixed entry per row.
-func (db *File) writeIndexLeaf(w *pageEdit, pageNo int, entries []BTreeEntry) error {
+// by the explicit measured width and followed by one reference-suffixed entry
+// per row. CreateTable uses it for empty keys, and CreateIndex for occupied
+// entries after buildIndexLeafEntries has encoded them.
+func (db *File) writeIndexLeafOfSize(w *pageEdit, pageNo, keySize int, entries []BTreeEntry) error {
 	buf, err := w.load(pageNo)
 	if err != nil {
 		return err
 	}
 
-	stride := indexKeySize + leafEntrySuffixSize
+	stride := keySize + leafEntrySuffixSize
 	if btreeHeaderSize+len(entries)*stride > len(buf.payload) {
 		return fmt.Errorf("%w: %d rows need %d bytes, page holds %d",
 			ErrIndexTooManyRows, len(entries), btreeHeaderSize+len(entries)*stride, len(buf.payload))
@@ -1101,15 +1193,15 @@ func (db *File) writeIndexLeaf(w *pageEdit, pageNo int, entries []BTreeEntry) er
 	binary.LittleEndian.PutUint32(h[6:10], noPageNo)              // RightPageNo
 	h[10] = 1                                                     // HasKeys
 	h[11] = 0                                                     // HasSuffixes
-	binary.LittleEndian.PutUint16(h[12:14], indexKeySize)         // KeyPrefixSize
+	binary.LittleEndian.PutUint16(h[12:14], uint16(keySize))      //nolint:gosec // validated by the caller's schema plan
 	binary.LittleEndian.PutUint16(h[14:16], uint16(len(entries))) //nolint:gosec // bounded by the capacity check above
 	binary.LittleEndian.PutUint16(h[16:18], 0)                    // PagePrefixSize
 
 	for i, e := range entries {
 		off := btreeHeaderSize + i*stride
-		copy(buf.payload[off:off+indexKeySize], e.Key)
-		binary.LittleEndian.PutUint32(buf.payload[off+indexKeySize:off+indexKeySize+4], uint32(e.PageNo))
-		binary.LittleEndian.PutUint16(buf.payload[off+indexKeySize+4:off+indexKeySize+6], e.ItemNo)
+		copy(buf.payload[off:off+keySize], e.Key)
+		binary.LittleEndian.PutUint32(buf.payload[off+keySize:off+keySize+4], uint32(e.PageNo))
+		binary.LittleEndian.PutUint16(buf.payload[off+keySize+4:off+keySize+6], e.ItemNo)
 	}
 
 	buf.dirty = true

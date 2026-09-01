@@ -14,6 +14,7 @@ linters:
     - err113 # sentinel errors too verbose for this codebase
     - exhaustive # don't require exhaustive switch on enums
     - exhaustruct # don't require all struct fields populated
+    - exhaustruct_v5 # renamed exhaustruct in golangci-lint v2.12+
     - gochecknoglobals # package-level vars are fine
     - godox # allow TODO/FIXME comments
     - ireturn # allow returning interfaces

@@ -7,6 +7,140 @@ import (
 	"testing"
 )
 
+// TestCompoundIndexLeafMatchesEngine pins the occupied format measured from
+// MultiKeys.abs: two five-byte Int32 components are concatenated in column
+// order, and B breaks ties only after A compares equal.
+func TestCompoundIndexLeafMatchesEngine(t *testing.T) {
+	db := openFixture(t, "MultiKeys.abs")
+
+	table, err := db.Table("MultiKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	ir, err := table.OpenIndex()
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+
+	indexes := ir.UserIndexes()
+	if len(indexes) != 1 {
+		t.Fatalf("user indexes = %d, want 1", len(indexes))
+	}
+
+	idx := indexes[0]
+	if idx.Name != "IdxAB" || idx.KeySize != 10 || len(idx.Columns) != 2 ||
+		idx.Columns[0] != "A" || idx.Columns[1] != "B" {
+		t.Fatalf("index = %+v, want IdxAB on [A B] with ten-byte keys", idx)
+	}
+
+	got, err := ir.ScanIndex(idx.RootPageNo)
+	if err != nil {
+		t.Fatalf("ScanIndex: %v", err)
+	}
+
+	want := []BTreeEntry{
+		{Key: []byte{0, 1, 0, 0, 0, 0, 10, 0, 0, 0}, PageNo: 10, ItemNo: 2},
+		{Key: []byte{0, 1, 0, 0, 0, 0, 20, 0, 0, 0}, PageNo: 10, ItemNo: 1},
+		{Key: []byte{0, 2, 0, 0, 0, 0, 10, 0, 0, 0}, PageNo: 10, ItemNo: 3},
+		{Key: []byte{0, 2, 0, 0, 0, 0, 20, 0, 0, 0}, PageNo: 10, ItemNo: 0},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("entries = %d, want %d", len(got), len(want))
+	}
+
+	for i := range got {
+		if !bytes.Equal(got[i].Key, want[i].Key) || got[i].PageNo != want[i].PageNo || got[i].ItemNo != want[i].ItemNo {
+			t.Errorf("entry %d = %x -> (%d,%d), want %x -> (%d,%d)", i,
+				got[i].Key, got[i].PageNo, got[i].ItemNo,
+				want[i].Key, want[i].PageNo, want[i].ItemNo)
+		}
+	}
+}
+
+// TestWriterMaintainsCompoundIndexByteForByte applies the same three
+// statements used to generate the official-engine derivative fixtures. No
+// State byte is excluded: leaf maintenance allocates no pages.
+func TestWriterMaintainsCompoundIndexByteForByte(t *testing.T) {
+	cases := []struct {
+		name, want, statement string
+		apply                 func(*testing.T, *File, *TableWriter)
+	}{
+		{
+			name: "insert", want: "MultiKeys-ins.abs",
+			statement: "INSERT INTO MultiKeys VALUES (1, 15, 'one-fifteen')",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				if _, err := w.Insert([]any{int32(1), int32(15), "one-fifteen"}); err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			name: "delete", want: "MultiKeys-del.abs",
+			statement: "DELETE FROM MultiKeys WHERE A = 1 AND B = 10",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.Delete(recordWithPair(t, db, 1, 10)); err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+			},
+		},
+		{
+			name: "key-moving update", want: "MultiKeys-upd.abs",
+			statement: "UPDATE MultiKeys SET B = 15 WHERE A = 1 AND B = 20",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.UpdateColumn(recordWithPair(t, db, 1, 20), 1, int32(15)); err != nil {
+					t.Fatalf("UpdateColumn: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requireEngineBytes(t, "MultiKeys.abs", tc.want, tc.statement, tc.apply)
+		})
+	}
+}
+
+func recordWithPair(t *testing.T, db *File, a, b int32) RecordID {
+	t.Helper()
+
+	table, err := db.Table("MultiKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	r, err := table.Open()
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	for r.Next() {
+		if r.Record().Int(0) == a && r.Record().Int(1) == b {
+			id, ok := r.RecordID()
+			if !ok {
+				t.Fatal("matching row has no RecordID")
+			}
+
+			return id
+		}
+	}
+
+	if err := r.Err(); err != nil {
+		t.Fatalf("reading rows: %v", err)
+	}
+
+	t.Fatalf("no row (%d,%d)", a, b)
+
+	return RecordID{}
+}
+
 // TestWriterMaintainsAnEncryptedIndex shows index maintenance is not a
 // plaintext-only capability: Employees-Rijndael_128.abs carries a user index in
 // an encrypted file, and its index page is written back through the same
@@ -47,7 +181,7 @@ func TestWriterMaintainsAnEncryptedIndex(t *testing.T) {
 }
 
 // TestWriterRefusesAnIndexItCannotMaintain pins what stays refused now that
-// single-page Int32 indexes are maintained. Each case is a shape no fixture
+// root-only Int32-component indexes are maintained. Each case is a shape no fixture
 // captures, so refusing is the only honest answer: guessing at it would produce
 // a file that reads back correctly through this package and is not what the
 // engine writes.
@@ -92,7 +226,7 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 	})
 
 	t.Run("index shape the leaf writer cannot reproduce", func(t *testing.T) {
-		// The two refusals maintainableIndexColumn adds on top of the leaf
+		// The ordering refusals maintainableIndexColumns adds on top of the leaf
 		// shape, checked against hand-built records because no committed
 		// fixture reaches them: the private fixtures that carry these index
 		// shapes all declare a key constraint too, and the constraint gate
@@ -103,16 +237,18 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 		// leaf exactly as it splices a plain one -- so what the flag selects
 		// now is the duplicate check, which TestKeyIndexRefusesADuplicate
 		// covers.
+		columns, err := maintainableIndexColumns(indexRecord{
+			name: "RecIdx", columns: []indexColumn{{name: "A"}, {name: "B"}},
+		})
+		if err != nil || len(columns) != 2 {
+			t.Fatalf("maintainableIndexColumns(compound) = %v, %v, want two columns", columns, err)
+		}
+
 		for _, c := range []struct {
 			name string
 			rec  indexRecord
 			want error
 		}{
-			{
-				name: "more than one column",
-				rec:  indexRecord{name: "RecIdx", columns: []indexColumn{{name: "A"}, {name: "B"}}},
-				want: ErrMultiColumnIndex,
-			},
 			{
 				name: "DESC or NOCASE column",
 				rec:  indexRecord{name: "d", columns: []indexColumn{{name: "A", descending: true}}},
@@ -120,8 +256,8 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 			},
 		} {
 			t.Run(c.name, func(t *testing.T) {
-				if _, err := maintainableIndexColumn(c.rec); !errors.Is(err, c.want) {
-					t.Errorf("maintainableIndexColumn(%q) = %v, want %v", c.rec.name, err, c.want)
+				if _, err := maintainableIndexColumns(c.rec); !errors.Is(err, c.want) {
+					t.Errorf("maintainableIndexColumns(%q) = %v, want %v", c.rec.name, err, c.want)
 				}
 			})
 		}
@@ -133,7 +269,7 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 // refuses every write, because a write that ignores one leaves the file
 // holding a row the engine would have rejected.
 //
-// What is refused has narrowed twice. NOT NULL and MINVALUE/MAXVALUE are
+// What is refused has narrowed repeatedly. NOT NULL and MINVALUE/MAXVALUE are
 // checked (writer_constraint.go), so CNotNull and CMinMax accept writes and
 // are tested for what they reject in TestWriterChecksConstraints; a PRIMARY
 // KEY or UNIQUE clause over a single Int32 column is enforced by its own index
@@ -141,8 +277,9 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 //
 // What is left refuses because of the index rather than the record, and that
 // is the point of the two remaining cases: CBoth's UNIQUE is on a VARCHAR
-// column and CPkMulti's key covers two, so neither index is one this package
-// can splice. The refusal now comes from index resolution, which runs first --
+// column and CPkMulti's second component is VARCHAR. An all-Int32 compound
+// index is maintained; these two mixed/string shapes are not. The refusal now
+// comes from index resolution, which runs first --
 // a constraint whose index cannot be maintained is not separately reported as
 // unchecked, because the index is what would have checked it.
 //
@@ -330,7 +467,7 @@ func requireIndexesMatchRebuild(t *testing.T, path, password string) {
 			t.Fatalf("readBTreeEntries: %v", err)
 		}
 
-		want, err := db.buildIndexLeafEntries(table, idx.colIdx)
+		want, err := db.buildIndexLeafEntries(table, idx.colIdxs)
 		if err != nil {
 			t.Fatalf("buildIndexLeafEntries: %v", err)
 		}

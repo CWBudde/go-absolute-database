@@ -116,19 +116,19 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   consequence of reallocation.
 
 - **Index maintenance is deliberately narrow, and its narrowness is load-bearing**: insert, delete
-  and a key-moving update keep a **single-page index over an `Int32` column** in step — `Integer`
-  or `AUTOINC`, which are the same index byte for byte — and that is exactly the shape
-  `CREATE INDEX` builds. `indexableKeyColumn` (`index.go`) is the single definition of that rule;
+  and a key-moving update keep a **root-only index over one or more `Int32` components** in step—
+  `Integer` or `AUTOINC`, which are the same component byte for byte—and that is exactly the
+  occupied shape `CREATE INDEX` builds. `MultiKeys*.abs` pins the compound concatenation,
+  lexicographic component order and all three splice operations with full byte identity.
+  `indexableKeyColumn` (`index.go`) is the single definition of the component rule;
   it had four copies before, and they have to agree, because a rebuild that builds an index the
   writer will not maintain produces a table nothing can insert into. Everything else is refused
-  with `ErrIndexNotMaintained` rather than guessed at: a tree deep enough to have split, a key of
-  another shape, and an index whose ordering this package does not reproduce (multi-column,
-  `DESC`, `NOCASE`). **A multi-column index is the largest single blocker, but count what a
-  shape unblocks rather than what it is reported against**: sixteen tables are refused, a
-  multi-column key is named among nine of them and is the _only_ reason for five, and `NOCASE`
-  is the sole reason for none at all because every `NOCASE` index in the corpus keys a string
-  column. `PLAN.md` carries the full table, and it is measured, not asserted — the first-reason
-  count that stood here overstated the multi-column item by three tables.
+  with `ErrIndexNotMaintained` rather than guessed at: a tree deep enough to have split, an
+  occupied component of another shape, or ordering this package does not reproduce (`DESC`,
+  `NOCASE`). The last private-corpus survey found sixteen refused tables and showed that an
+  all-integer multi-column key was the sole reason for five of them, so this implementation
+  predicts eleven remaining. That re-measurement is still pending because the private 111-table
+  corpus is not in this checkout; `PLAN.md` keeps the measured old table and labels the projection.
   Three behaviours come from fixtures and must not be "tidied": a removal
   **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), a key-moving update is a
   **removal followed by a sorted insertion** rather than an in-place patch (`Writes-idx-upd.abs`),

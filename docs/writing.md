@@ -10,15 +10,17 @@ back correctly. Each byte-identity test takes a database DBManager produced, app
 this package the one SQL statement or menu action DBManager was given, and requires the result
 to equal DBManager's file:
 
-| Test                                          | Operation                                   |
-| --------------------------------------------- | ------------------------------------------- |
-| `TestWriterMatchesEngineByteForByte`          | `INSERT`, `UPDATE`, `DELETE`, index splices |
-| `TestDropTableMatchesEngineByteForByte`       | `DROP TABLE`                                |
-| `TestCreateTableMatchesEngineByteForByte`     | `CREATE TABLE`                              |
-| `TestCreateIndexMatchesEngineByteForByte`     | `CREATE INDEX`                              |
-| `TestGrowthMatchesEngineByteForByte`          | file growth                                 |
-| `TestCreateDatabaseMatchesEngineByteForByte`  | `CreateDatabase`                            |
-| `TestCompactDatabaseMatchesEngineByteForByte` | `CompactDatabase`                           |
+| Test                                                      | Operation                                   |
+| --------------------------------------------------------- | ------------------------------------------- |
+| `TestWriterMatchesEngineByteForByte`                      | `INSERT`, `UPDATE`, `DELETE`, index splices |
+| `TestDropTableMatchesEngineByteForByte`                   | `DROP TABLE`                                |
+| `TestCreateTableMatchesEngineByteForByte`                 | `CREATE TABLE`                              |
+| `TestCreateIndexMatchesEngineByteForByte`                 | `CREATE INDEX`                              |
+| `TestCreateMultiColumnIndexOnPopulatedTableMatchesEngine` | populated compound `CREATE INDEX`           |
+| `TestWriterMaintainsCompoundIndexByteForByte`             | compound insert, delete, key-moving update  |
+| `TestGrowthMatchesEngineByteForByte`                      | file growth                                 |
+| `TestCreateDatabaseMatchesEngineByteForByte`              | `CreateDatabase`                            |
+| `TestCompactDatabaseMatchesEngineByteForByte`             | `CompactDatabase`                           |
 
 Reading a write back correctly is **not sufficient evidence**: the engine keeps counters a
 naive writer would miss, and this package's own reader would not notice.
@@ -69,7 +71,10 @@ insert**, so `freeSlot` scans bitmap order rather than appending.
 
 ## Index maintenance
 
-A user index over an `Int32` column is kept in step on insert, delete and a key-moving update.
+A root-only user index over one or more `Int32` columns is kept in step on insert, delete and a
+key-moving update. Compound keys concatenate the ordinary five-byte components in schema order
+and compare them lexicographically; the `MultiKeys*.abs` engine fixtures pin that B breaks a tie
+only after A is equal.
 Two behaviours come from fixtures and must not be tidied:
 
 - **A removal leaves the entry slot it vacates untouched.** Removing the middle of three
@@ -81,8 +86,9 @@ Two behaviours come from fixtures and must not be tidied:
   info page's record count is untouched and only its change counter moves.
 
 Maintenance allocates no page, so every splice is byte-identical to the engine's files with
-**no `State` exclusion** — the four `Writes-idx*` pairs for a plain index and seven `Keys*`
-pairs for a key-enforcing one.
+**no `State` exclusion** — the four `Writes-idx*` pairs for a plain index, seven `Keys*`
+pairs for a key-enforcing one, and the insert/delete/update `MultiKeys*` derivatives for a
+compound index.
 
 ### A `UNIQUE` or `PRIMARY` index
 
@@ -137,12 +143,15 @@ bound, so whether the engine refuses or wraps is unknown). The narrower `AUTOINC
 column of one is never mistaken for an ordinary integer and left with a stale counter.
 
 Everything else is refused with `ErrIndexNotMaintained` rather than guessed at: a tree deep
-enough to have split, a key of another shape, a multi-column index (`ErrMultiColumnIndex`), a
-`DESC` or `NOCASE` index, which orders its leaf differently than this package compares, and a
-column that is not `Int32`.
+enough to have split; an occupied component that is not `Int32`; a `DESC` or `NOCASE` index,
+which orders its leaf differently than this package compares; and compound shapes that also
+need one of those unsupported capabilities. `ErrMultiColumnIndex` now identifies only a
+compound request whose occupied component encoding is still unmeasured, such as the committed
+`INTEGER`/`VARCHAR` key—not the all-integer shape itself.
 
-Sixteen of the corpus's 111 tables are refused, and counting every reason each one carries rather
-than only the first one reported, the shapes rank like this:
+The last available survey, taken before occupied compound maintenance landed, found sixteen of
+the private corpus's 111 tables refused. Counting every reason each one carried rather than only
+the first one reported ranked the shapes like this:
 
 | Shape                  | Sole reason a table is refused | Named among a table's reasons |
 | ---------------------- | ------------------------------ | ----------------------------- |
@@ -153,10 +162,12 @@ than only the first one reported, the shapes rank like this:
 | `DESC`                 | 1                              | 1                             |
 
 The first column is the one to plan by, and it is not the one a first-reason count gives. A
-multi-column index is reported against eight tables but is the _only_ thing wrong with five of
-them: two of the other three also key a `VARCHAR` column and one also has a split leaf. `NOCASE`
-is the sharper case — it is the sole reason for nothing at all, because every table that has a
-`NOCASE` index keys a string column with it.
+multi-column index appears in nine tables but was the _only_ thing wrong with five of them; the
+other four also need a string component or a split leaf. The all-integer compound implementation
+therefore predicts five newly writable tables and eleven remaining refusals. Re-running the
+private survey is still required to turn that arithmetic into a current measurement; the private
+corpus is not part of this checkout. `NOCASE` is the sharper case—it is the sole reason for
+nothing at all, because every table that has a `NOCASE` index keys a string column with it.
 
 Indexes are resolved from the table's own schema records, with the pages kept as a cross-check
 in the other direction: an index the pages show that the schema does not name stops the write.
@@ -165,11 +176,11 @@ Trusting the pages alone left an index whose leaf is empty invisible, because
 pages an entry points at — and a table whose `PRIMARY KEY` index has no rows yet is exactly
 that case, which is the state every table this package creates starts in.
 
-That closed a hole as well as opening the door. Four rowless tables carrying an index this
-package cannot maintain — `Constraints.abs`'s `CIdxDesc`, `CIdxNoCase` and `CIdxMulti`, and
-`MultiTable-createidxgrow.abs`'s `Delta` with its string-keyed index — used to **accept**
-writes, because the index nobody could see was the index nobody refused. The first insert into
-any of them would have left it describing nothing.
+That closed a hole as well as opening the door. Rowless tables carrying an unsupported index—
+`Constraints.abs`'s `CIdxDesc` and `CIdxNoCase`, its mixed integer/string `CIdxMulti`, and
+`MultiTable-createidxgrow.abs`'s string-keyed `Delta`—used to **accept** writes, because the
+index nobody could see was the index nobody refused. The first insert into any of them would
+have left it describing nothing. An all-integer compound root is no longer in that refusal set.
 
 ## Constraint records
 
@@ -320,36 +331,36 @@ that order hands out the same ones.
 
 Each is an error rather than a silent success.
 
-| Error                        | Meaning                                                                                                                                                                                  |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ErrReadOnly`                | The handle was not opened with `OpenForWrite`                                                                                                                                            |
-| `ErrTableFull`               | No record slot could be found or made — the single-page record-page index root is out of entries, or the row is too wide to fit any data page. A page-splitting ceiling, not a space one |
-| `ErrIndexTooManyRows`        | The single-page index leaf is full — likewise                                                                                                                                            |
-| `ErrOutOfSpace`              | No free page and the file cannot grow                                                                                                                                                    |
-| `ErrDatabaseTooLarge`        | Growth would pass the first PFS page's 32 448-page reach                                                                                                                                 |
-| `ErrIndexNotMaintained`      | The table carries an index shape this package will not keep in step                                                                                                                      |
-| `ErrMultiColumnIndex`        | Specifically, an index over more than one column                                                                                                                                         |
-| `ErrIndexBacksConstraint`    | `DROP INDEX` on the index a `PRIMARY KEY` or `UNIQUE` is built on; DBManager drops the constraint, not the index                                                                         |
-| `ErrSchemaTailNotUnderstood` | The schema stream's tail does not parse as the documented layout                                                                                                                         |
-| `ErrColumnConstrained`       | `DROP COLUMN` on a column a constraint record covers                                                                                                                                     |
-| `ErrColumnIndexed`           | `DROP COLUMN` on a column an index covers                                                                                                                                                |
-| `ErrBlobReferenceLost`       | An update would overwrite a live BLOB reference, whose pages nothing here can free                                                                                                       |
-| `ErrBookkeepingMismatch`     | Stored counters disagree with the records present, so a write cannot bring them forward without guessing                                                                                 |
-| `ErrLastTable`               | `DROP TABLE` on the database's only table                                                                                                                                                |
-| `ErrTableHasBlobPages`       | `DROP TABLE` on a table owning BLOB pages                                                                                                                                                |
-| `ErrPageUnattributed`        | The file holds an allocated page belonging to no table                                                                                                                                   |
-| `ErrCatalogNotWritable`      | A compressed catalog, or one spanning more than one page                                                                                                                                 |
-| `ErrConstraintsNotRebuilt`   | Compaction of a table carrying a constraint record `CREATE TABLE` cannot write back — a key over more than one column, or over a column an index leaf is not built for                   |
-| `ErrConstraintsNotEnforced`  | A write to a table declaring a constraint this package does not check — a record whose column or bound type does not resolve, or a key whose index is not maintained                     |
-| `ErrDuplicateKey`            | A write whose key a `UNIQUE` or `PRIMARY` index already holds, or `CreateUniqueIndex` over a column that already holds one twice                                                         |
-| `ErrAutoIncNotMaintained`    | A table carrying an `AUTOINC` column whose counter this package will not keep in step — a `CYCLED` column, or one of the narrower `AUTOINC` field types                                  |
-| `ErrAutoIncExhausted`        | An `AUTOINC` value to assign past the column's `MAXVALUE`, or past what an `Int32` column holds                                                                                          |
-| `ErrNotNullViolated`         | A write storing `NULL` in a column a `NOT NULL` record covers, or in one a `PRIMARY` index covers                                                                                        |
-| `ErrCheckViolated`           | A write storing a value outside a column's `MINVALUE`/`MAXVALUE` pair                                                                                                                    |
-| `ErrEncryptionUnsupported`   | `CreateDatabase` with `Encrypted: true`, or compaction of an encrypted database                                                                                                          |
-| `ErrUnsupportedColumnType`   | `CREATE TABLE` with a column type no fixture evidences                                                                                                                                   |
-| `ErrUnsupportedIndexColumn`  | `CREATE INDEX` over a column type no fixture evidences, or a `DESC`/`NOCASE` record put through the serializer                                                                           |
-| `ErrBadGeometry`             | A `CreateDatabaseOptions` the format cannot express                                                                                                                                      |
+| Error                        | Meaning                                                                                                                                                                                               |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ErrReadOnly`                | The handle was not opened with `OpenForWrite`                                                                                                                                                         |
+| `ErrTableFull`               | No record slot could be found or made — the single-page record-page index root is out of entries, or the row is too wide to fit any data page. A page-splitting ceiling, not a space one              |
+| `ErrIndexTooManyRows`        | The single-page index leaf is full — likewise                                                                                                                                                         |
+| `ErrOutOfSpace`              | No free page and the file cannot grow                                                                                                                                                                 |
+| `ErrDatabaseTooLarge`        | Growth would pass the first PFS page's 32 448-page reach                                                                                                                                              |
+| `ErrIndexNotMaintained`      | The table carries an index shape this package will not keep in step                                                                                                                                   |
+| `ErrMultiColumnIndex`        | A compound operation needs an occupied component encoding not yet measured (currently a string component), or requests a compound `CreateUniqueIndex` whose generated constraint shape has no fixture |
+| `ErrIndexBacksConstraint`    | `DROP INDEX` on the index a `PRIMARY KEY` or `UNIQUE` is built on; DBManager drops the constraint, not the index                                                                                      |
+| `ErrSchemaTailNotUnderstood` | The schema stream's tail does not parse as the documented layout                                                                                                                                      |
+| `ErrColumnConstrained`       | `DROP COLUMN` on a column a constraint record covers                                                                                                                                                  |
+| `ErrColumnIndexed`           | `DROP COLUMN` on a column an index covers                                                                                                                                                             |
+| `ErrBlobReferenceLost`       | An update would overwrite a live BLOB reference, whose pages nothing here can free                                                                                                                    |
+| `ErrBookkeepingMismatch`     | Stored counters disagree with the records present, so a write cannot bring them forward without guessing                                                                                              |
+| `ErrLastTable`               | `DROP TABLE` on the database's only table                                                                                                                                                             |
+| `ErrTableHasBlobPages`       | `DROP TABLE` on a table owning BLOB pages                                                                                                                                                             |
+| `ErrPageUnattributed`        | The file holds an allocated page belonging to no table                                                                                                                                                |
+| `ErrCatalogNotWritable`      | A compressed catalog, or one spanning more than one page                                                                                                                                              |
+| `ErrConstraintsNotRebuilt`   | Compaction carries a constraint `CREATE TABLE` cannot safely reproduce, including a key with an unsupported occupied component shape                                                                  |
+| `ErrConstraintsNotEnforced`  | A write to a table declaring a constraint this package does not check — a record whose column or bound type does not resolve, or a key whose index is not maintained                                  |
+| `ErrDuplicateKey`            | A write whose key a `UNIQUE` or `PRIMARY` index already holds, or `CreateUniqueIndex` over a column that already holds one twice                                                                      |
+| `ErrAutoIncNotMaintained`    | A table carrying an `AUTOINC` column whose counter this package will not keep in step — a `CYCLED` column, or one of the narrower `AUTOINC` field types                                               |
+| `ErrAutoIncExhausted`        | An `AUTOINC` value to assign past the column's `MAXVALUE`, or past what an `Int32` column holds                                                                                                       |
+| `ErrNotNullViolated`         | A write storing `NULL` in a column a `NOT NULL` record covers, or in one a `PRIMARY` index covers                                                                                                     |
+| `ErrCheckViolated`           | A write storing a value outside a column's `MINVALUE`/`MAXVALUE` pair                                                                                                                                 |
+| `ErrEncryptionUnsupported`   | `CreateDatabase` with `Encrypted: true`, or compaction of an encrypted database                                                                                                                       |
+| `ErrUnsupportedColumnType`   | `CREATE TABLE` with a column type no fixture evidences                                                                                                                                                |
+| `ErrUnsupportedIndexColumn`  | `CREATE INDEX` over a column type no fixture evidences, or a `DESC`/`NOCASE` record put through the serializer                                                                                        |
+| `ErrBadGeometry`             | A `CreateDatabaseOptions` the format cannot express                                                                                                                                                   |
 
 A commit is **not crash-atomic**. Rollback is exact, because nothing is written before
 `Commit`, but a crash inside `Commit` leaves some pages written. The engine's own journalling
