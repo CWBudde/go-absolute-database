@@ -1,6 +1,7 @@
-package absdb
+package deccrypto
 
 import (
+	"crypto/cipher"
 	"errors"
 	"math/bits"
 )
@@ -247,7 +248,7 @@ func buildSquareTable(sbox *[256]byte, coeffs [4]byte) [4][256]uint32 {
 	return table
 }
 
-// newSquare builds the cipher from a 16-byte key, expanding it into the nine
+// NewSquare builds the cipher from a 16-byte key, expanding it into the nine
 // encryption round keys and the nine decryption round keys.
 //
 // The two schedules are produced in one pass: round key T is copied into the
@@ -255,7 +256,7 @@ func buildSquareTable(sbox *[256]byte, coeffs [4]byte) [4][256]uint32 {
 // diffused through PHI in place. The encryption schedule therefore ends with
 // keys 0..7 diffused and key 8 raw, and the decryption schedule with keys 0..7
 // raw and key 8 diffused.
-func newSquare(key []byte) (*squareCipher, error) {
+func NewSquare(key []byte) (cipher.Block, error) {
 	if len(key) != squareKeySize {
 		return nil, ErrSquareKeySize
 	}

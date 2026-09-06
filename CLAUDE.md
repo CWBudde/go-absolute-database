@@ -41,7 +41,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
 ## Key Policies
 
 - **Minimal dependencies**: the core read path uses the standard library plus two `golang.org/x` packages, which are maintained by the Go team and are effectively extended stdlib: `golang.org/x/text/encoding/charmap` for Windows-1252 decoding (`reader.go`) and `golang.org/x/crypto/blowfish` for the Blowfish cipher used by encrypted files (`crypto.go`). `github.com/spf13/cobra` is a CLI-only dependency and must not be imported by the library. Anything beyond that needs a reason.
-- **DEC's ciphers stay in-tree**: `twofish.go`, `square.go`, `rijndael.go` and `tdes.go` are not stylistic preferences over `golang.org/x/crypto` or `crypto/aes`. ABSCipher is a fork of DEC 3.0, and three of its ciphers deviate from the published algorithms, so a correct implementation cannot read these files:
+- **DEC's ciphers stay in-tree**: `internal/deccrypto/twofish.go`, `internal/deccrypto/square.go`, `internal/deccrypto/rijndael.go` and `internal/deccrypto/tdes.go` are not stylistic preferences over `golang.org/x/crypto` or `crypto/aes`. ABSCipher is a fork of DEC 3.0, and three of its ciphers deviate from the published algorithms, so a correct implementation cannot read these files:
   - **Twofish** — DEC's key schedule has a `shr`/`shl` typo, so `golang.org/x/crypto/twofish` is incompatible.
   - **Rijndael-256** — DEC's key schedule matches AES for 128- and 192-bit keys but diverges for 256-bit ones, so `crypto/aes` is correct for `Rijndael_128` and wrong for `Rijndael_256`.
   - **DES-Triple** — this is DEC's `TCipher_3TDES`, a **24-byte** block, and its word swap contains a typo that must be reproduced.

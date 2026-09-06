@@ -1,6 +1,7 @@
-package absdb
+package deccrypto
 
 import (
+	"crypto/cipher"
 	"errors"
 	"math/bits"
 )
@@ -230,8 +231,8 @@ func twofishF32(x uint32, k []uint32, keyLen int) uint32 {
 	return twofishMDS[0][a] ^ twofishMDS[1][b] ^ twofishMDS[2][c] ^ twofishMDS[3][d]
 }
 
-// newTwofish builds the cipher from a 16- or 32-byte key.
-func newTwofish(key []byte) (*twofishCipher, error) {
+// NewTwofish builds the cipher from a 16- or 32-byte key.
+func NewTwofish(key []byte) (cipher.Block, error) {
 	if len(key) != 16 && len(key) != 32 {
 		return nil, ErrTwofishKeySize
 	}

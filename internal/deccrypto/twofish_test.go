@@ -1,4 +1,4 @@
-package absdb
+package deccrypto
 
 import (
 	"bytes"
@@ -28,7 +28,7 @@ func encryptCTSNoIV(block interface {
 ) []byte {
 	bs := block.BlockSize()
 
-	feedback := bytes.Repeat([]byte{ivFillByte}, bs)
+	feedback := bytes.Repeat([]byte{0xFF}, bs)
 	block.Encrypt(feedback, feedback)
 
 	dst := make([]byte, len(src))
@@ -60,9 +60,9 @@ func encryptCTSNoIV(block interface {
 func TestDECTwofishSelfTest(t *testing.T) {
 	key := append([]byte("TCipher_Twofish"), 0)
 
-	c, err := newTwofish(key)
+	c, err := NewTwofish(key)
 	if err != nil {
-		t.Fatalf("newTwofish: %v", err)
+		t.Fatalf("NewTwofish: %v", err)
 	}
 
 	want, err := hex.DecodeString(
@@ -84,9 +84,9 @@ func TestDECTwofishSelfTest(t *testing.T) {
 // typo makes it something else. If this ever starts matching, the deviation has
 // been "fixed" and every encrypted .abs file will stop decrypting.
 func TestTwofishNotReference(t *testing.T) {
-	c, err := newTwofish(make([]byte, 16))
+	c, err := NewTwofish(make([]byte, 16))
 	if err != nil {
-		t.Fatalf("newTwofish: %v", err)
+		t.Fatalf("NewTwofish: %v", err)
 	}
 
 	out := make([]byte, twofishBlockSize)
@@ -108,9 +108,9 @@ func TestTwofishRoundTrip(t *testing.T) {
 			key[i] = byte(i * 7)
 		}
 
-		c, err := newTwofish(key)
+		c, err := NewTwofish(key)
 		if err != nil {
-			t.Fatalf("newTwofish(%d): %v", keyLen, err)
+			t.Fatalf("NewTwofish(%d): %v", keyLen, err)
 		}
 
 		if c.BlockSize() != twofishBlockSize {
@@ -152,14 +152,14 @@ func TestTwofishRoundTrip(t *testing.T) {
 // 192-bit schedule would be unreachable and untestable code.
 func TestTwofishKeySize(t *testing.T) {
 	for _, n := range []int{0, 1, 8, 15, 17, 24, 31, 33, 64} {
-		if _, err := newTwofish(make([]byte, n)); !errors.Is(err, ErrTwofishKeySize) {
-			t.Errorf("newTwofish(%d bytes) error = %v, want ErrTwofishKeySize", n, err)
+		if _, err := NewTwofish(make([]byte, n)); !errors.Is(err, ErrTwofishKeySize) {
+			t.Errorf("NewTwofish(%d bytes) error = %v, want ErrTwofishKeySize", n, err)
 		}
 	}
 
 	for _, n := range []int{16, 32} {
-		if _, err := newTwofish(make([]byte, n)); err != nil {
-			t.Errorf("newTwofish(%d bytes) = %v, want success", n, err)
+		if _, err := NewTwofish(make([]byte, n)); err != nil {
+			t.Errorf("NewTwofish(%d bytes) = %v, want success", n, err)
 		}
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/cwbudde/go-absolute-database/internal/deccrypto"
+	"github.com/cwbudde/go-absolute-database/internal/ripemd"
 	"golang.org/x/crypto/blowfish" //nolint:staticcheck // deprecated, but required to read files written with it
 )
 
@@ -69,6 +71,18 @@ var ErrUnsupportedCipherMode = errors.New("absdb: unsupported cipher mode")
 
 // ErrNoPassword indicates that an encrypted database was accessed without a password.
 var ErrNoPassword = errors.New("absdb: database is encrypted but no password was supplied")
+
+// ErrRijndaelKeySize indicates a key length this cipher does not accept.
+var ErrRijndaelKeySize = deccrypto.ErrRijndaelKeySize
+
+// ErrTwofishKeySize indicates a key length this package does not implement.
+var ErrTwofishKeySize = deccrypto.ErrTwofishKeySize
+
+// ErrSquareKeySize indicates a key length this cipher does not accept.
+var ErrSquareKeySize = deccrypto.ErrSquareKeySize
+
+// ErrTripleDESKeySize indicates a key length this cipher does not accept.
+var ErrTripleDESKeySize = deccrypto.ErrTripleDESKeySize
 
 // CryptoHeader holds the parsed TABSCryptoHeader from page 0.
 type CryptoHeader struct {
@@ -152,9 +166,9 @@ func newAESCipher(key []byte) (cipher.Block, error) {
 // schedule coincides with AES for 128- and 192-bit keys, so the stdlib is
 // byte-identical there and is both faster and constant-time. It diverges for
 // 256-bit keys, which is why that one algorithm needs the in-tree
-// implementation. See rijndael.go.
+// implementation. See internal/deccrypto/rijndael.go.
 func newRijndaelCipher(key []byte) (cipher.Block, error) {
-	block, err := newRijndael(key)
+	block, err := deccrypto.NewRijndael(key)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: rijndael: %w", err)
 	}
@@ -176,10 +190,10 @@ func newDESCipher(key []byte) (cipher.Block, error) {
 // This is not two-key EDE Triple DES over an 8-byte block, which is what the
 // name suggests and what this package assumed before a fixture existed. It is
 // DEC's TCipher_3TDES: a 24-byte block, keyed with the 16-byte RIPEMD-128
-// digest zero-extended to 24 so the third DES key is all zeros. See tdes.go,
+// digest zero-extended to 24 so the third DES key is all zeros. See internal/deccrypto/tdes.go,
 // including the swap typo that has to be reproduced.
 func newTripleDESCipher(key []byte) (cipher.Block, error) {
-	block, err := newTripleDES(key)
+	block, err := deccrypto.NewTripleDES(key)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: 3tdes: %w", err)
 	}
@@ -204,10 +218,10 @@ func newBlowfishCipher(key []byte) (cipher.Block, error) {
 // 16-byte key produce plain AES-128 for Rijndael-128, which the
 // Addresses-Rijndael_128.abs fixture confirms.
 //
-// This is *not* reference Twofish; see twofish.go for the one-line deviation in
+// This is *not* reference Twofish; see internal/deccrypto/twofish.go for the one-line deviation in
 // DEC's key schedule and why golang.org/x/crypto/twofish cannot be used here.
 func newTwofishCipher(key []byte) (cipher.Block, error) {
-	block, err := newTwofish(key)
+	block, err := deccrypto.NewTwofish(key)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: twofish: %w", err)
 	}
@@ -221,9 +235,9 @@ func newTwofishCipher(key []byte) (cipher.Block, error) {
 //
 // Square is DEC-specific: golang.org/x/crypto has no Square at all, so unlike
 // Blowfish or AES there was never an off-the-shelf implementation to reach for.
-// See square.go for the port of DEC 3.0's TCipher_Square.
+// See internal/deccrypto/square.go for the port of DEC 3.0's TCipher_Square.
 func newSquareCipher(key []byte) (cipher.Block, error) {
-	block, err := newSquare(key)
+	block, err := deccrypto.NewSquare(key)
 	if err != nil {
 		return nil, fmt.Errorf("absdb: square: %w", err)
 	}
@@ -242,12 +256,12 @@ func deriveKey(algo CryptoAlgorithm, password string) []byte {
 	}
 
 	if spec.hash == hashRipeMD256 {
-		digest := ripemd256Sum([]byte(password))
+		digest := ripemd.Sum256([]byte(password))
 
 		return digest[:spec.keySize]
 	}
 
-	digest := ripemd128Sum([]byte(password))
+	digest := ripemd.Sum128([]byte(password))
 
 	return digest[:spec.keySize]
 }

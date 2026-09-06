@@ -2,9 +2,36 @@ package absdb
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"errors"
 	"testing"
+
+	"github.com/cwbudde/go-absolute-database/internal/ripemd"
 )
+
+// The public sentinels must still identify errors from the internal ciphers,
+// including after the database layer wraps them with context.
+func TestCipherKeySizeErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		newBlock func([]byte) (cipher.Block, error)
+		want     error
+	}{
+		{"Rijndael", newRijndaelCipher, ErrRijndaelKeySize},
+		{"Twofish", newTwofishCipher, ErrTwofishKeySize},
+		{"Square", newSquareCipher, ErrSquareKeySize},
+		{"TripleDES", newTripleDESCipher, ErrTripleDESKeySize},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			block, err := tt.newBlock(nil)
+			if block != nil || !errors.Is(err, tt.want) {
+				t.Fatalf("invalid key: block = %v, error = %v, want nil block and %v", block, err, tt.want)
+			}
+		})
+	}
+}
 
 // The three Addresses-* encrypted fixtures (Addresses-Rijndael_128.abs,
 // Addresses-Blowfish.abs, Addresses-DES_Single.abs) are encrypted copies of
@@ -347,10 +374,10 @@ func TestKeySizes(t *testing.T) {
 		var want []byte
 
 		if tt.hash == hashRipeMD256 {
-			digest := ripemd256Sum([]byte(testPassword))
+			digest := ripemd.Sum256([]byte(testPassword))
 			want = digest[:tt.size]
 		} else {
-			digest := ripemd128Sum([]byte(testPassword))
+			digest := ripemd.Sum128([]byte(testPassword))
 			want = digest[:tt.size]
 		}
 

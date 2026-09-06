@@ -5,6 +5,13 @@
 absdb
 !absdb/
 
+# Build output, coverage reports, and local verification caches
+/bin/
+/coverage.html
+/.cache/
+/.tmp/
+/.internal-check.*/
+
 # IDE
 .idea/
 .vscode/

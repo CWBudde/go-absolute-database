@@ -88,7 +88,7 @@ extra chaining. The round function itself is ordinary AES.
 
 So `crypto/aes` is **correct for `Rijndael_128` and wrong for `Rijndael_256`**.
 `CryptoRijndael128` uses `crypto/aes`, which is byte-identical there and both faster and
-constant-time; `rijndael.go` implements DEC's schedule for the 256-bit case.
+constant-time; `internal/deccrypto/rijndael.go` implements DEC's schedule for the 256-bit case.
 
 ### DES-Triple — `TCipher_3TDES`, plus a swap typo
 

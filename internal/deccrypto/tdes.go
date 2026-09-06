@@ -1,4 +1,4 @@
-package absdb
+package deccrypto
 
 import (
 	"crypto/cipher"
@@ -50,7 +50,7 @@ const tripleDESBlockSize = 24
 const tripleDESKeySize = 24
 
 // tripleDESDerivedKeySize is the key length the .abs key derivation actually
-// supplies: the full RIPEMD-128 digest, which newTripleDES zero-extends to
+// supplies: the full RIPEMD-128 digest, which NewTripleDES zero-extends to
 // tripleDESKeySize.
 const tripleDESDerivedKeySize = 16
 
@@ -70,10 +70,10 @@ type tripleDESCipher struct {
 	keys [3]cipher.Block
 }
 
-// newTripleDES builds the cipher from either the 16-byte RIPEMD-128 digest the
+// NewTripleDES builds the cipher from either the 16-byte RIPEMD-128 digest the
 // .abs key derivation produces, which is zero-extended to 24 bytes exactly as
 // DEC's TCipher_3DES.Init does, or from a full 24-byte key.
-func newTripleDES(key []byte) (*tripleDESCipher, error) {
+func NewTripleDES(key []byte) (cipher.Block, error) {
 	if len(key) != tripleDESDerivedKeySize && len(key) != tripleDESKeySize {
 		return nil, ErrTripleDESKeySize
 	}

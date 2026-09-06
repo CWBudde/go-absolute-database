@@ -1,4 +1,4 @@
-package absdb
+package ripemd
 
 import (
 	"encoding/binary"
@@ -40,8 +40,8 @@ var (
 	}
 )
 
-// ripemd128Sum computes the RIPEMD-128 hash of data, returning a 16-byte digest.
-func ripemd128Sum(data []byte) [16]byte {
+// Sum128 computes the RIPEMD-128 hash of data, returning a 16-byte digest.
+func Sum128(data []byte) [16]byte {
 	h0 := uint32(0x67452301)
 	h1 := uint32(0xefcdab89)
 	h2 := uint32(0x98badcfe)

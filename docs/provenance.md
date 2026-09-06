@@ -90,8 +90,8 @@ knowledge of where it deviates and the self-test vectors that pin those deviatio
    package doc comment on `internal/zlib1`. If that package is ever rewritten from scratch, the
    notice still stays until the last line of zlib-derived structure is gone.
 2. **DEC.** DEC 3.0 Part I is Copyright (c) Hagen Reddmann, on the terms "freeware, but this
-   Copyright must be included". The notice is carried in `NOTICE` and at the top of `rijndael.go`,
-   `twofish.go`, `tdes.go` and `square.go`.
+   Copyright must be included". The notice is carried in `NOTICE` and at the top of `internal/deccrypto/rijndael.go`,
+   `internal/deccrypto/twofish.go`, `internal/deccrypto/tdes.go` and `internal/deccrypto/square.go`.
 3. **ComponentAce trademarks**, with an explicit statement that this project is independent and
    unaffiliated. `README.md` repeats it, because that is what a visitor reads first.
 

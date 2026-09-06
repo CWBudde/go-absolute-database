@@ -54,8 +54,8 @@ zlib's. Report bugs here, never to the zlib authors.
 
 Absolute Database's ABSCipher unit is a fork of DEC 3.0 Part I. Three of its
 ciphers deviate from the published algorithms, and files written with them
-cannot be read by a correct implementation, so rijndael.go, twofish.go,
-tdes.go and square.go reproduce DEC's behaviour rather than the specifications.
+cannot be read by a correct implementation, so the implementations in
+internal/deccrypto/ reproduce DEC's behaviour rather than the specifications.
 
 Those four files are independent Go implementations written from the published
 algorithm descriptions (Rijndael/AES, Twofish, DES, and the 1997

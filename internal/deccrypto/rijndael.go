@@ -1,6 +1,7 @@
-package absdb
+package deccrypto
 
 import (
+	"crypto/cipher"
 	"errors"
 	"math/bits"
 )
@@ -336,10 +337,10 @@ func rijndaelInvMix(w uint32) uint32 {
 		bits.RotateLeft32(rijndaelKeyTable[lowByte(w>>24)], 24)
 }
 
-// newRijndael builds the cipher from a 16-, 24- or 32-byte key, expanding it
+// NewRijndael builds the cipher from a 16-, 24- or 32-byte key, expanding it
 // into the encryption round keys and the reversed, InvMixColumns-folded
 // decryption round keys.
-func newRijndael(key []byte) (*rijndaelCipher, error) {
+func NewRijndael(key []byte) (cipher.Block, error) {
 	rounds, err := rijndaelRoundCount(len(key))
 	if err != nil {
 		return nil, err

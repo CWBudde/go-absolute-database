@@ -1,4 +1,4 @@
-package absdb
+package ripemd
 
 import (
 	"bytes"
@@ -46,7 +46,7 @@ func TestRIPEMD256(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ripemd256Sum([]byte(tt.input))
+			got := Sum256([]byte(tt.input))
 
 			want, err := hex.DecodeString(tt.hash)
 			if err != nil {

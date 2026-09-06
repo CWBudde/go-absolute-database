@@ -1,4 +1,4 @@
-package absdb
+package deccrypto
 
 import (
 	"bytes"
@@ -24,9 +24,9 @@ import (
 func TestDECSquareSelfTest(t *testing.T) {
 	key := append([]byte("TCipher_Square"), 0, 0)
 
-	c, err := newSquare(key)
+	c, err := NewSquare(key)
 	if err != nil {
-		t.Fatalf("newSquare: %v", err)
+		t.Fatalf("NewSquare: %v", err)
 	}
 
 	want, err := hex.DecodeString(
@@ -50,9 +50,9 @@ func TestSquareRoundTrip(t *testing.T) {
 		key[i] = byte(i * 7)
 	}
 
-	c, err := newSquare(key)
+	c, err := NewSquare(key)
 	if err != nil {
-		t.Fatalf("newSquare: %v", err)
+		t.Fatalf("NewSquare: %v", err)
 	}
 
 	if c.BlockSize() != squareBlockSize {
@@ -97,13 +97,13 @@ func TestSquareRoundTrip(t *testing.T) {
 // only for a 128-bit key, and deriveKey never produces anything else for it.
 func TestSquareKeySize(t *testing.T) {
 	for _, n := range []int{0, 1, 8, 15, 17, 24, 31, 32, 33, 64} {
-		if _, err := newSquare(make([]byte, n)); !errors.Is(err, ErrSquareKeySize) {
-			t.Errorf("newSquare(%d bytes) error = %v, want ErrSquareKeySize", n, err)
+		if _, err := NewSquare(make([]byte, n)); !errors.Is(err, ErrSquareKeySize) {
+			t.Errorf("NewSquare(%d bytes) error = %v, want ErrSquareKeySize", n, err)
 		}
 	}
 
-	if _, err := newSquare(make([]byte, squareKeySize)); err != nil {
-		t.Errorf("newSquare(%d bytes) = %v, want success", squareKeySize, err)
+	if _, err := NewSquare(make([]byte, squareKeySize)); err != nil {
+		t.Errorf("NewSquare(%d bytes) = %v, want success", squareKeySize, err)
 	}
 }
 

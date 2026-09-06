@@ -52,7 +52,8 @@ work below needs your own licensed copy. See [provenance.md](provenance.md).
 
 ## Source layout
 
-All library code is in the repository root, package `absdb`.
+The public library is in the repository root, package `absdb`. Standalone cipher,
+hash, and compression implementations live in `internal/`.
 
 ```
 absdb.go              File, Page, Open/Close, page headers
@@ -64,11 +65,6 @@ index.go              B-tree index reading
 crypto.go             Encryption and decryption
 cryptowrite.go        Re-encrypting a modified page
 crc.go                absCRC32
-ripemd128.go          RIPEMD-128, ripemd256.go RIPEMD-256
-rijndael.go           DEC's Rijndael (needed for Rijndael-256)
-twofish.go            DEC's Twofish variant
-tdes.go               DEC's TCipher_3TDES, 24-byte block
-square.go             DEC's Square
 encode.go             Field encoding for the write path
 writer.go             Record insert, update, delete
 writer_index.go       User index maintenance
@@ -80,6 +76,8 @@ ddl_constraint.go     Constraint records
 ddl_alter.go          ALTER TABLE ADD/DROP COLUMN
 ddl_database.go       CreateDatabase
 ddl_compact.go        CompactDatabase
+internal/deccrypto/   DEC Rijndael, Twofish, Square and 24-byte Triple DES
+internal/ripemd/      RIPEMD-128 and RIPEMD-256 password hashes
 internal/zlib1/       A deflate encoder bit-compatible with C zlib level 1
 cmd/absdb/            The CLI
 testdata/             Fixtures (gitignored bar an allowlist)

@@ -1,11 +1,11 @@
-package absdb
+package ripemd
 
 import (
 	"encoding/binary"
 	"math/bits"
 )
 
-// ripemd256Sum computes the RIPEMD-256 hash of data, returning a 32-byte digest.
+// Sum256 computes the RIPEMD-256 hash of data, returning a 32-byte digest.
 //
 // RIPEMD-256 is the 256-bit extension of RIPEMD-128. It uses the identical
 // message schedule, rotation amounts, round functions and round constants; the
@@ -13,7 +13,7 @@ import (
 // four), the exchange of one working word between the two lines after every
 // round, and the absence of the cross-line mixing at the end of a block. The
 // schedule and rotation tables in ripemd128.go are therefore used verbatim.
-func ripemd256Sum(data []byte) [32]byte {
+func Sum256(data []byte) [32]byte {
 	h := [8]uint32{
 		0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476,
 		0x76543210, 0xFEDCBA98, 0x89ABCDEF, 0x01234567,
