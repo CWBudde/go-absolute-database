@@ -31,6 +31,47 @@ An `Int32` key is `[null flag byte] + int32 little-endian`, for a total of 5 byt
 compared **by value**, not with `bytes.Compare`: the page is sorted by value, while a byte-wise
 comparison of little-endian integers orders 256 before 2.
 
+### `VARCHAR` keys
+
+`VarcharKeys.abs` establishes the occupied component as a null flag followed by Windows-1252
+text and zero padding. The width depends on the declaration:
+
+| Declaration   | Text bytes indexed | `KeyPrefixSize` |
+| ------------- | ------------------ | --------------- |
+| `VARCHAR(10)` | at most 10         | 12              |
+| `VARCHAR(30)` | at most 20         | 23              |
+
+For declared sizes through the index record's `MaxIndexedSize` of 20, the width is `Size+2`:
+one null flag, the declared text capacity, and a terminating zero. Larger declarations cap the
+text at 20 bytes and use a 23-byte component; the remaining two bytes are zero. Thus the
+24-character value `abcdefghijklmnopqrstUVWX` is stored as the flag, its first 20 bytes
+`abcdefghijklmnopqrst`, and two zero bytes. A `NULL` has flag `01`, an otherwise all-zero
+component, and sorts first.
+
+Non-NULL values are **not** ordered by their encoded bytes. The engine-made leaf orders the test
+values as `€`, `a`, `ä`, `Ä`, `aa`, `long`, `z`, `Z`; byte order would put `Z` first and the
+high-byte characters last. Decoding the component as Windows-1252 and applying the default
+Unicode collation reproduces the engine order, including accent, case, and prefix tie-breaks.
+
+### `NOCASE` ordering
+
+`NoCaseKeys.abs` isolates the per-column `NOCASE` flag on a `VARCHAR(3)` index. It does not
+change the five-byte component encoding: the leaf still stores the original Windows-1252 bytes.
+It changes comparison by ignoring the default collator's case level. The fixture deliberately
+inserts upper-case first in several pairs and produces these equal runs:
+
+| Values   | Leaf order | Finding                                            |
+| -------- | ---------- | -------------------------------------------------- |
+| `A`, `a` | `A`, `a`   | ASCII case compares equal                          |
+| `Á`, `á` | `Á`, `á`   | the accent remains significant; case does not      |
+| `Ä`, `ä` | `ä`, `Ä`   | equal values retain their original insertion order |
+| `Œ`, `œ` | `Œ`, `œ`   | Windows-1252 ligature case also compares equal     |
+
+`ss` and `ß` remain distinct, so this is a case-insensitive collation rather than arbitrary
+Unicode compatibility folding. `NULL` still sorts before every non-NULL value. A stable sort is
+required when building a populated index, and incremental inserts go after the existing run of
+equal folded keys; both reproduce the engine's insertion-order tie-break.
+
 ### Multi-column keys
 
 The empty index roots in `Constraints.abs` settle how component widths combine:
@@ -65,11 +106,10 @@ equal. `MultiKeys-ins.abs` inserts `(1, 15)` between `(1, 10)` and `(1, 20)`;
 the single-column fixtures, with no extra compound-key bookkeeping.
 
 The write path therefore builds and maintains any root-only ascending, case-sensitive compound
-index whose components are all `INTEGER`/`AUTOINC`: populated `CreateIndex`, insert, delete,
-key-moving update, compound `PRIMARY KEY`/`UNIQUE` enforcement, and compaction all use the measured
-concatenation and ordering. Empty compound roots may additionally contain a `VARCHAR` component
-whose width `Constraints.abs` establishes. An occupied string component remains part of the
-separate `VARCHAR`-key work; it is not inferred from the integer fixture.
+index whose components are supported `INTEGER`/`AUTOINC` or `VARCHAR` columns, plus the measured
+single-column `VARCHAR NOCASE` shape. Populated creation, insert, delete, key-moving update,
+compound `PRIMARY KEY`/`UNIQUE` enforcement, and compaction all share the component codec and
+lexicographic ordering.
 
 An internal node's separator key is the child's smallest key, with a `0` sentinel on the first
 entry, so a descent takes the rightmost separator `<= searchKey`.
@@ -110,15 +150,15 @@ can therefore still be unattributable in a multi-table file when its keys offer 
 The schema metadata also makes lookup selection explicit. `FindByStringKey` takes a column name
 and selects the single-column index whose `Columns` entry matches it case-insensitively; it no
 longer assumes that the first secondary index happens to cover the requested value. Compound
-indexes are deliberately excluded until their occupied key layout is pinned by an engine-made
-fixture.
+indexes are deliberately excluded from this convenience lookup because its caller supplies only
+one value; scanning and writer maintenance support them normally.
 
 ## Key-enforcing indexes
 
 A `PRIMARY KEY` or `UNIQUE` index is an ordinary index with two of the record's three flag
 bytes doing the work — `00 00 FF` for a primary key, `00 FF 00` for a unique one. **Its page is
-the same in every other respect**: the same 18-byte header, the same `[null flag byte] + int32`
-key, the same 11-byte stride, and the same splices on insert, delete and a key-moving update.
+the same in every other respect**: the same 18-byte header, the covered column's ordinary key
+component, and the same splices on insert, delete and a key-moving update.
 An empty one is the record-page index root with `KeyPrefixSize` 5 instead of 4, which pages 20
 and 26 of `Constraints.abs` are byte-identical to page 19 but for.
 

@@ -163,10 +163,8 @@ func TestCreateIndexReproducesTheEngineStream(t *testing.T) {
 }
 
 // TestCreateMultiColumnIndexWritesTheMeasuredEmptyShape covers the part of a
-// compound CREATE INDEX the committed fixtures fully determine: the repeated
-// schema columns and a rowless mixed INTEGER/VARCHAR root whose key width is
-// 5 + 12 = 17. Its first occupied string component remains guarded by
-// ErrMultiColumnIndex; the all-Int32 occupied case is tested below.
+// compound CREATE INDEX the committed fixtures determine: the repeated schema
+// columns and a mixed INTEGER/VARCHAR root whose key width is 5 + 12 = 17.
 func TestCreateMultiColumnIndexWritesTheMeasuredEmptyShape(t *testing.T) {
 	path := writableCopy(t, "MultiTable-create.abs")
 
@@ -217,8 +215,12 @@ func TestCreateMultiColumnIndexWritesTheMeasuredEmptyShape(t *testing.T) {
 	}
 	defer w.Close()
 
-	if _, err := w.Insert([]any{int32(1), "one"}); !errors.Is(err, ErrMultiColumnIndex) {
-		t.Errorf("first insert into compound index = %v, want ErrMultiColumnIndex", err)
+	if _, err := w.Insert([]any{int32(1), "one"}); err != nil {
+		t.Fatalf("first insert into compound index: %v", err)
+	}
+
+	if err := w.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 }
 
@@ -262,6 +264,145 @@ func TestCreateMultiColumnIndexOnPopulatedTableMatchesEngine(t *testing.T) {
 	}
 
 	reportByteDifferencesExcept(t, got, want, "CREATE INDEX IdxAB ON MultiKeys (A, B)", excluded)
+}
+
+// TestCreateVarcharIndexesOnPopulatedTableMatchesEngine rebuilds all three
+// occupied VARCHAR oracle leaves, including the capped long and mixed shapes,
+// and compares every deterministic byte with DBManager's output.
+func TestCreateVarcharIndexesOnPopulatedTableMatchesEngine(t *testing.T) {
+	want, err := os.ReadFile(requireFixture(t, "VarcharKeys.abs"))
+	if err != nil {
+		t.Fatalf("reading VarcharKeys.abs: %v", err)
+	}
+
+	path := writableCopy(t, "VarcharKeys-pre.abs")
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	for _, index := range []struct {
+		name    string
+		columns []string
+	}{
+		{"IdxShort", []string{"Short"}},
+		{"IdxLongText", []string{"LongText"}},
+		{"IdxGroupShort", []string{"GroupId", "Short"}},
+	} {
+		if err := db.CreateIndex("VarcharKeys", index.name, index.columns...); err != nil {
+			t.Fatalf("CreateIndex(%s): %v", index.name, err)
+		}
+	}
+
+	pageSize, pageCount := db.PageSize(), db.PageCount()
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after: %v", err)
+	}
+
+	excluded := make(map[int]bool, pageCount*4)
+	for no := range pageCount {
+		start := no*pageSize + pageStateOffset
+		for i := range 4 {
+			excluded[start+i] = true
+		}
+	}
+
+	reportByteDifferencesExcept(t, got, want, "three CREATE INDEX statements on VarcharKeys", excluded)
+}
+
+// TestCreateNoCaseIndexOnPopulatedTableMatchesEngine rebuilds the folded leaf
+// from the pre-index fixture and compares every deterministic byte with the
+// official engine's CREATE INDEX ... NOCASE result.
+func TestCreateNoCaseIndexOnPopulatedTableMatchesEngine(t *testing.T) {
+	want, err := os.ReadFile(requireFixture(t, "NoCaseKeys.abs"))
+	if err != nil {
+		t.Fatalf("reading NoCaseKeys.abs: %v", err)
+	}
+
+	path := writableCopy(t, "NoCaseKeys-pre.abs")
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+
+	if err := db.CreateNoCaseIndex("NoCaseKeys", "IdxNoCase", "TextValue"); err != nil {
+		t.Fatalf("CreateNoCaseIndex: %v", err)
+	}
+
+	pageSize, pageCount := db.PageSize(), db.PageCount()
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile after: %v", err)
+	}
+
+	excluded := make(map[int]bool, pageCount*4)
+	for no := range pageCount {
+		start := no*pageSize + pageStateOffset
+		for i := range 4 {
+			excluded[start+i] = true
+		}
+	}
+
+	reportByteDifferencesExcept(t, got, want,
+		"CREATE INDEX IdxNoCase ON NoCaseKeys (TextValue NOCASE)", excluded)
+}
+
+func TestCreateNoCaseIndexRejectsANonStringColumn(t *testing.T) {
+	path := writableCopy(t, "NoCaseKeys-pre.abs")
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+	defer db.Close()
+
+	err = db.CreateNoCaseIndex("NoCaseKeys", "IdxNoCase", "RowId")
+	if !errors.Is(err, ErrUnsupportedIndexColumn) {
+		t.Errorf("CreateNoCaseIndex on INTEGER = %v, want %v", err, ErrUnsupportedIndexColumn)
+	}
+}
+
+func TestCreateUniqueVarcharIndexEnforcesKeys(t *testing.T) {
+	path := writableCopy(t, "VarcharKeys-pre.abs")
+
+	db, err := OpenForWrite(path)
+	if err != nil {
+		t.Fatalf("OpenForWrite: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.CreateUniqueIndex("VarcharKeys", "IdxShortUnique", "Short"); err != nil {
+		t.Fatalf("CreateUniqueIndex: %v", err)
+	}
+
+	w, err := db.OpenTableWriter()
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+	defer w.Rollback()
+
+	if _, err := w.Insert([]any{int32(10), int32(2), "a", "duplicate"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("duplicate VARCHAR key = %v, want ErrDuplicateKey", err)
+	}
+
+	if _, err := w.Insert([]any{int32(10), int32(2), nil, "duplicate null"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("duplicate NULL VARCHAR key = %v, want ErrDuplicateKey", err)
+	}
+
+	if _, err := w.Insert([]any{int32(10), int32(2), "ab", "distinct"}); err != nil {
+		t.Errorf("distinct VARCHAR key: %v", err)
+	}
 }
 
 // TestDropIndexReproducesTheEngineStream is TestCreateIndexReproducesTheEngineStream
@@ -529,17 +670,15 @@ func TestIndexRefusals(t *testing.T) {
 		}
 	})
 
-	t.Run("CreateIndex on a column CreateIndex has no corpus evidence for", func(t *testing.T) {
+	t.Run("CreateIndex on an unsupported column type", func(t *testing.T) {
 		db, err := OpenForWrite(writableCopy(t, "Writes.abs"))
 		if err != nil {
 			t.Fatalf("OpenForWrite: %v", err)
 		}
 		defer db.Close()
 
-		// Name is a Varchar/String column, not the only supported Int32/Integer
-		// shape (see ErrUnsupportedIndexColumn).
-		if err := db.CreateIndex("Writes", "IdxName", "Name"); !errors.Is(err, ErrUnsupportedIndexColumn) {
-			t.Errorf("CreateIndex on a String column: %v, want ErrUnsupportedIndexColumn", err)
+		if err := db.CreateIndex("Writes", "IdxSalary", "Salary"); !errors.Is(err, ErrUnsupportedIndexColumn) {
+			t.Errorf("CreateIndex on a Double column: %v, want ErrUnsupportedIndexColumn", err)
 		}
 	})
 

@@ -66,9 +66,7 @@ var growthCases = []struct {
 }
 
 // TestExtendFileMatchesEngineGrowth holds the growth step itself to the file
-// the engine wrote, on all three pairs -- including the CREATE INDEX one, whose
-// statement indexes a VARCHAR column and so cannot be replayed through
-// CreateIndex yet (it refuses any key that is not an Int32).
+// the engine wrote on all three pairs.
 //
 // Growth is asserted in isolation rather than as part of a statement, which is
 // what lets it be asserted exactly: extendFile alone must take the file to the
@@ -160,11 +158,7 @@ func TestExtendFileMatchesEngineGrowth(t *testing.T) {
 }
 
 // TestGrowthMatchesEngineByteForByte replays the whole statement, not just its
-// growth step, and requires the result to be the file the engine wrote. It is
-// TestCreateTableMatchesEngineByteForByte's standard applied to the two pairs
-// whose statement this package can execute; the third pair's CREATE INDEX
-// indexes a VARCHAR column, which CreateIndex refuses, and is covered by
-// TestExtendFileMatchesEngineGrowth instead.
+// growth step, and requires the result to be the file the engine wrote.
 //
 // The State exclusion is exactly the pages the statement allocates, and nothing
 // else. A newly allocated page's ABSP State is seeded randomly by the engine
@@ -174,6 +168,13 @@ func TestExtendFileMatchesEngineGrowth(t *testing.T) {
 // which is what pins them as zero-filled and header-free.
 func TestGrowthMatchesEngineByteForByte(t *testing.T) {
 	run := map[string]func(t *testing.T, db *File){
+		"MultiTable-createidxgrow.abs": func(t *testing.T, db *File) {
+			t.Helper()
+
+			if err := db.CreateIndex("Delta", "IdxDeltaY", "Y"); err != nil {
+				t.Fatalf("CreateIndex: %v", err)
+			}
+		},
 		"MultiTable-createidxtab.abs": func(t *testing.T, db *File) {
 			t.Helper()
 

@@ -92,23 +92,23 @@ import (
 // table would not safely have (ErrConstraintsNotRebuilt), and an index shape
 // CreateIndex cannot safely rebuild
 // (ErrIndexNotMaintained, ErrMultiColumnIndex or ErrUnsupportedIndexColumn).
-// Losing an index is not an acceptable outcome of a compaction, so a
-// string-keyed index—including a compound one with an occupied string
-// component—refuses the whole operation.
+// Losing an index is not an acceptable outcome of a compaction, so any shape
+// outside the writer's measured Int32/VARCHAR boundary refuses the operation.
 
 // ErrConstraintsNotRebuilt reports a compaction of a table carrying a
 // constraint record the rebuild cannot write back. CreateTable writes the
 // column-shaped kinds -- NOT NULL and MINVALUE/MAXVALUE -- into the new table's
 // schema stream, and key records bring their backing index. A compound key is
-// rebuildable with rows when all components use the measured Int32 encoding;
-// another occupied component is refused before destination creation.
+// rebuildable with rows when all components use the measured Int32 or VARCHAR
+// encoding; another occupied component is refused before destination creation.
 var ErrConstraintsNotRebuilt = errors.New("absdb: table carries constraint records a rebuild would lose")
 
 // compactIndex is one index CompactDatabase re-creates: its name and covered
 // columns in key order.
 type compactIndex struct {
-	name    string
-	columns []string
+	name            string
+	columns         []string
+	caseInsensitive bool
 }
 
 // compactTable is one table's whole definition, which is everything CreateTable
@@ -393,10 +393,8 @@ func schemaTailArrays(raw []byte) ([]indexRecord, []constraintRecord, error) {
 	return records, constraints, err
 }
 
-// planCompactIndexes checks every index record against what CreateIndex builds.
-// A table with rows retains the writer's ascending Int32-component gate because
-// its rows are copied through that writer. An empty table may also carry the
-// measured mixed compound schema/root shape because no leaf entry is filled.
+// planCompactIndexes checks every index record against what CreateIndex builds
+// and the row-copying writer maintains.
 func planCompactIndexes(
 	schema *TableSchema, records []indexRecord, keyed map[uint32]bool, allowMixedEmpty bool,
 ) ([]compactIndex, error) {
@@ -404,6 +402,15 @@ func planCompactIndexes(
 
 	for _, rec := range records {
 		if keyed[rec.objectID] {
+			// CreateTable rebuilds these indexes from constraint records,
+			// which carry no ordering flags. Refuse flags it would discard.
+			for _, col := range rec.columns {
+				if col.descending || col.caseInsensitive {
+					return nil, fmt.Errorf("%w: backing index %q keys %q with descending=%t, case-insensitive=%t",
+						ErrConstraintsNotRebuilt, rec.name, col.name, col.descending, col.caseInsensitive)
+				}
+			}
+
 			continue
 		}
 
@@ -412,15 +419,18 @@ func planCompactIndexes(
 			return nil, err
 		}
 
-		indexes = append(indexes, compactIndex{name: rec.name, columns: columns})
+		indexes = append(indexes, compactIndex{
+			name: rec.name, columns: columns,
+			caseInsensitive: len(rec.columns) == 1 && rec.columns[0].caseInsensitive,
+		})
 	}
 
 	return indexes, nil
 }
 
-// compactIndexColumns accepts all-Int32 compound indexes with rows. When the
-// source is empty it may additionally reproduce a measured mixed compound's
-// metadata and key width without encoding an occupied entry.
+// compactIndexColumns accepts measured Int32/VARCHAR components. The empty
+// flag remains part of the shared planner contract for shapes that can be
+// represented without an occupied encoder.
 func compactIndexColumns(schema *TableSchema, rec indexRecord, allowMixedEmpty bool) ([]string, error) {
 	covered, err := maintainableIndexColumns(rec)
 	if err != nil {
@@ -435,6 +445,14 @@ func compactIndexColumns(schema *TableSchema, rec indexRecord, allowMixedEmpty b
 		}
 
 		owner := schema.Columns[colIdx]
+		if col.caseInsensitive {
+			component, ok := indexKeyComponentFor(colIdx, owner)
+			if !ok || component.kind != indexKeyString {
+				return nil, fmt.Errorf("%w: index %q applies NOCASE to non-VARCHAR column %q",
+					ErrUnsupportedIndexColumn, rec.name, owner.Name)
+			}
+		}
+
 		if len(covered) == 1 || !allowMixedEmpty {
 			if !indexableKeyColumn(owner) {
 				return nil, fmt.Errorf("%w: index %q keys %q, which is base type %d / field type %s",
@@ -468,7 +486,14 @@ func rebuildInto(src, dst *File, plan []compactTable) error {
 		}
 
 		for _, idx := range tbl.indexes {
-			if err := dst.CreateIndex(tbl.name, idx.name, idx.columns...); err != nil {
+			var err error
+			if idx.caseInsensitive {
+				err = dst.CreateNoCaseIndex(tbl.name, idx.name, idx.columns[0])
+			} else {
+				err = dst.CreateIndex(tbl.name, idx.name, idx.columns...)
+			}
+
+			if err != nil {
 				return err
 			}
 		}

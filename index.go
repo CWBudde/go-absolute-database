@@ -7,6 +7,11 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
+
+	"golang.org/x/text/collate"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/language"
 )
 
 const (
@@ -167,12 +172,13 @@ type IndexReader struct {
 
 // indexRoot tracks a discovered index root page.
 type indexRoot struct {
-	pageNo  int
-	header  *BTreePageHeader
-	keySize int
-	name    string
-	columns []string
-	primary bool
+	pageNo          int
+	header          *BTreePageHeader
+	keySize         int
+	name            string
+	columns         []string
+	primary         bool
+	caseInsensitive bool
 }
 
 // info converts a discovered root into its public description.
@@ -181,10 +187,16 @@ func (r *indexRoot) info() IndexInfo {
 		RootPageNo: r.pageNo,
 		KeySize:    r.keySize,
 		EntryCount: int(r.header.EntryCount),
-		IsInternal: r.keySize == systemKeySize,
+		IsInternal: r.isSystem(),
 		Name:       r.name,
 		Columns:    append([]string(nil), r.columns...),
 	}
+}
+
+// isSystem uses schema ownership first: VARCHAR(2) user indexes have the same
+// four-byte key width as the engine's page indexes.
+func (r *indexRoot) isSystem() bool {
+	return len(r.columns) == 0 && r.keySize == systemKeySize
 }
 
 // applyDefinition joins the schema stream's description of a user index to
@@ -194,6 +206,7 @@ func (r *indexRoot) info() IndexInfo {
 func (r *indexRoot) applyDefinition(rec indexRecord) {
 	r.name = rec.name
 	r.primary = rec.primary
+	r.caseInsensitive = len(rec.columns) == 1 && rec.columns[0].caseInsensitive
 	r.columns = make([]string, len(rec.columns))
 
 	for i, col := range rec.columns {
@@ -299,14 +312,15 @@ func (ir *IndexReader) Indexes() []IndexInfo {
 }
 
 // UserIndexes returns every index defined over table rows, that is all
-// discovered indexes except the engine's internal page indexes (systemKeySize
-// keys). Only user index entries reference real rows: the PageNo of a system
+// discovered indexes except the engine's internal page indexes. Schema-defined
+// indexes are user indexes even when their key width matches a system index.
+// Only user index entries reference real rows: the PageNo of a system
 // index entry is an engine-internal value, not a data page number.
 func (ir *IndexReader) UserIndexes() []IndexInfo {
 	var result []IndexInfo
 
 	for _, root := range ir.indexes {
-		if root.keySize == systemKeySize {
+		if root.isSystem() {
 			continue
 		}
 
@@ -342,7 +356,7 @@ func (ir *IndexReader) SecondaryIndexes() []IndexInfo {
 	var result []IndexInfo
 
 	for _, root := range ir.indexes {
-		if root.keySize == systemKeySize || root.primary {
+		if root.isSystem() || root.primary {
 			continue
 		}
 
@@ -378,15 +392,14 @@ func (ir *IndexReader) FindByPrimaryKey(key int32) (dataPageNo int32, itemNo uin
 
 // FindByStringKey searches the single-column user index that covers column for
 // value. Column names are matched case-insensitively, like table and column
-// names elsewhere in the package. A compound index is not selected: building
-// its search key needs the full component layout that PLAN.md still leaves to
-// a row-bearing engine fixture.
+// names elsewhere in the package. A compound index is not selected because
+// this convenience lookup accepts only one component value.
 func (ir *IndexReader) FindByStringKey(column, value string) (dataPageNo int32, itemNo uint16, err error) {
 	var idx *indexRoot
 
 	for i := range ir.indexes {
 		root := &ir.indexes[i]
-		if root.keySize == systemKeySize || len(root.columns) != 1 ||
+		if root.isSystem() || len(root.columns) != 1 ||
 			!strings.EqualFold(root.columns[0], column) {
 			continue
 		}
@@ -405,7 +418,9 @@ func (ir *IndexReader) FindByStringKey(column, value string) (dataPageNo int32, 
 		return 0, 0, err
 	}
 
-	entry, err := ir.searchTree(idx.pageNo, searchKey, compareStringKeys)
+	entry, err := ir.searchTree(idx.pageNo, searchKey, func(a, b []byte) int {
+		return compareStringKeys(a, b, idx.caseInsensitive)
+	})
 	if err != nil {
 		return 0, 0, err
 	}
@@ -573,14 +588,45 @@ func (ir *IndexReader) findLeftmostLeaf(pageNo int) (int, error) {
 		ErrMalformedIndex, start, maxTreeDepth)
 }
 
-// compareInt32Keys compares two int32 index keys: a null flag byte followed by
-// the value in little-endian byte order. Byte-wise comparison must not be used
-// for these keys — the least significant byte comes first, so it orders 256
-// before 2 — while the entries on a page are sorted by value.
-//
+// indexKeyKind selects the encoder and comparator for one component.
+type indexKeyKind uint8
+
+const (
+	indexKeyInt32 indexKeyKind = iota
+	indexKeyString
+)
+
+// indexKeyComponent describes one fixed-width component of a leaf key.
+// VARCHAR widths come from VarcharKeys.abs: declared sizes through 20 use
+// Size+2 bytes, while larger declarations use a 23-byte component containing
+// at most 20 text bytes. colIdx is the owning table column.
+type indexKeyComponent struct {
+	colIdx          int
+	size            int
+	kind            indexKeyKind
+	caseInsensitive bool
+}
+
+func indexKeyComponentFor(colIdx int, col Column) (indexKeyComponent, bool) {
+	if col.BaseType == BftInt32 &&
+		(col.FieldType == FieldInteger || col.FieldType == FieldAutoInc) {
+		return indexKeyComponent{colIdx: colIdx, size: indexKeySize, kind: indexKeyInt32}, true
+	}
+
+	if col.BaseType == BftVarchar && col.FieldType == FieldString && col.Size > 0 {
+		size := int(col.Size) + 2
+		if col.Size > indexColumnMaxIndexedSize {
+			size = indexColumnMaxIndexedSize + 3
+		}
+
+		return indexKeyComponent{colIdx: colIdx, size: size, kind: indexKeyString}, true
+	}
+
+	return indexKeyComponent{}, false
+}
+
 // indexableKeyColumn reports whether an index over this column is one this
-// package builds and maintains: a 5-byte Int32 key, ordered by
-// compareInt32Keys.
+// package builds and maintains: a five-byte Int32 or measured VARCHAR key.
 //
 // An AUTOINC column is included because its key is an Integer one byte for
 // byte -- Auto.abs's index record and leaf are the Int32 shape exactly. What
@@ -592,14 +638,16 @@ func (ir *IndexReader) findLeftmostLeaf(pageNo int) (int, error) {
 // have to agree -- a rebuild that builds an index the writer will not maintain
 // produces a table nothing can insert into -- so they share this.
 func indexableKeyColumn(col Column) bool {
-	return col.BaseType == BftInt32 &&
-		(col.FieldType == FieldInteger || col.FieldType == FieldAutoInc)
+	_, ok := indexKeyComponentFor(0, col)
+
+	return ok
 }
 
-// A NULL key sorts before every value, which is the opposite of what comparing
-// the flag byte as a number gives. No index in the corpus held one until
-// testdata/Keys-uniqnull.abs, whose UNIQUE index stores the NULL entry ahead
-// of 10, 20 and 30; before it, this ordered NULL last and nothing noticed.
+// compareInt32Keys compares two int32 index keys: a null flag byte followed by
+// the value in little-endian byte order. Byte-wise comparison must not be used
+// for these keys — the least significant byte comes first, so it orders 256
+// before 2 — while the entries on a page are sorted by value. A NULL key sorts
+// before every value, which testdata/Keys-uniqnull.abs pins.
 func compareInt32Keys(a, b []byte) int {
 	if len(a) < primaryKeySize || len(b) < primaryKeySize {
 		return bytes.Compare(a, b)
@@ -627,60 +675,84 @@ func compareInt32Keys(a, b []byte) int {
 	}
 }
 
-// compareCompoundInt32Keys compares a concatenation of fixed-width Int32 key
-// components in schema order. MultiKeys.abs establishes both the five-byte
-// component concatenation and the lexicographic tie break: B orders two rows
-// only after their A components compare equal.
-func compareCompoundInt32Keys(a, b []byte, components int) int {
-	for i := range components {
-		start := i * indexKeySize
-
-		end := start + indexKeySize
-		if end > len(a) || end > len(b) {
-			return bytes.Compare(a, b)
-		}
-
-		if cmp := compareInt32Keys(a[start:end], b[start:end]); cmp != 0 {
-			return cmp
-		}
-	}
-
-	return bytes.Compare(a[components*indexKeySize:], b[components*indexKeySize:])
+var indexStringCollators = sync.Pool{ //nolint:gochecknoglobals // Collator has reusable internal iterators and is not concurrency-safe.
+	New: func() any { return collate.New(language.Und) },
 }
 
-// compareStringKeys compares two string index keys.
-// Keys have format: [null_flag] + null-terminated string + garbage.
-// We compare the null flag byte, then the string up to the first null terminator.
-func compareStringKeys(a, b []byte) int {
+var indexNoCaseCollators = sync.Pool{ //nolint:gochecknoglobals // Collator has reusable internal iterators and is not concurrency-safe.
+	New: func() any { return collate.New(language.Und, collate.IgnoreCase) },
+}
+
+// compareStringKeys compares two VARCHAR index components. VarcharKeys.abs
+// establishes that NULL sorts first and non-NULL Windows-1252 bytes use the
+// engine's locale-style collation, not byte order. NoCaseKeys.abs adds that a
+// NOCASE component ignores the collator's case level while retaining accents,
+// symbols and expansions; equal folded values retain insertion order.
+func compareStringKeys(a, b []byte, caseInsensitive bool) int {
 	if len(a) == 0 || len(b) == 0 {
 		return bytes.Compare(a, b)
 	}
 
-	// Compare null flag byte.
-	if a[0] != b[0] {
-		if a[0] < b[0] {
+	aNull, bNull := a[0] != 0, b[0] != 0
+	if aNull != bNull {
+		if aNull {
 			return -1
 		}
 
 		return 1
 	}
 
-	// Extract strings (up to null terminator).
-	strA := extractNullTerminated(a[1:])
-	strB := extractNullTerminated(b[1:])
+	if aNull {
+		return 0
+	}
 
-	return bytes.Compare(strA, strB)
-}
+	pool := &indexStringCollators
+	if caseInsensitive {
+		pool = &indexNoCaseCollators
+	}
 
-// extractNullTerminated returns the bytes up to (not including) the first null byte.
-func extractNullTerminated(data []byte) []byte {
-	for i, b := range data {
-		if b == 0 {
-			return data[:i]
+	c, ok := pool.Get().(*collate.Collator)
+	if !ok {
+		if caseInsensitive {
+			c = collate.New(language.Und, collate.IgnoreCase)
+		} else {
+			c = collate.New(language.Und)
 		}
 	}
 
-	return data
+	cmp := c.CompareString(decodeANSI(a[1:]), decodeANSI(b[1:]))
+	pool.Put(c)
+
+	return cmp
+}
+
+// compareIndexKeys compares a fixed-width compound key component by component,
+// using each column's measured engine ordering.
+func compareIndexKeys(a, b []byte, components []indexKeyComponent) int {
+	off := 0
+	for _, component := range components {
+		end := off + component.size
+		if end > len(a) || end > len(b) {
+			return bytes.Compare(a, b)
+		}
+
+		var cmp int
+
+		switch component.kind {
+		case indexKeyInt32:
+			cmp = compareInt32Keys(a[off:end], b[off:end])
+		case indexKeyString:
+			cmp = compareStringKeys(a[off:end], b[off:end], component.caseInsensitive)
+		}
+
+		if cmp != 0 {
+			return cmp
+		}
+
+		off = end
+	}
+
+	return bytes.Compare(a[off:], b[off:])
 }
 
 // makeStringKey creates a search key for string indexes.
@@ -691,11 +763,18 @@ func makeStringKey(value string, keySize int) ([]byte, error) {
 		return nil, fmt.Errorf("%w: string key size %d too small", ErrMalformedIndex, keySize)
 	}
 
-	// The first byte stays 0 (the null flag: 0 = not null); the string is
-	// copied behind it, truncated if it does not fit, and the rest stays zero,
-	// which both terminates and pads the key.
+	raw, err := charmap.Windows1252.NewEncoder().Bytes([]byte(value))
+	if err != nil || bytes.IndexByte(raw, 0) >= 0 {
+		return nil, fmt.Errorf("%w: %q", ErrStringEncoding, value)
+	}
+
+	// The first byte stays 0 (the null flag: 0 = not null). A short key has
+	// room for keySize-2 text bytes plus its terminator; a capped long key has
+	// the same 20-byte text limit as the schema's MaxIndexedSize field and one
+	// additional zero byte of padding.
 	key := make([]byte, keySize)
-	copy(key[1:], value)
+	textSize := min(keySize-2, indexColumnMaxIndexedSize)
+	copy(key[1:1+textSize], raw)
 
 	return key, nil
 }
@@ -800,7 +879,7 @@ func (ir *IndexReader) rootReferences(root indexRoot, own map[int]bool) (bool, e
 		// A system index keys pages by number and its PageNo is an internal
 		// value; a user index does the reverse. Either field landing on one of
 		// this table's data pages identifies the owner.
-		if root.keySize == systemKeySize {
+		if root.isSystem() {
 			if len(e.Key) >= 4 && own[int(int32(binary.LittleEndian.Uint32(e.Key[:4])))] {
 				return true, nil
 			}

@@ -75,6 +75,16 @@ var oracleRowCounts = map[string]int{
 	"MultiKeys-ins.abs":          5,
 	"MultiKeys-del.abs":          3,
 	"MultiKeys-upd.abs":          4,
+	"VarcharKeys-pre.abs":        9,
+	"VarcharKeys.abs":            9,
+	"VarcharKeys-ins.abs":        10,
+	"VarcharKeys-del.abs":        8,
+	"VarcharKeys-upd.abs":        9,
+	"NoCaseKeys-pre.abs":         22,
+	"NoCaseKeys.abs":             22,
+	"NoCaseKeys-ins.abs":         23,
+	"NoCaseKeys-del.abs":         21,
+	"NoCaseKeys-upd.abs":         22,
 }
 
 // unindexedFixtures are the fixtures with no user index rows to cross-check
@@ -105,6 +115,8 @@ var unindexedFixtures = map[string]bool{
 	"Writes-delins.abs":        true,
 	"MultiTable-dropfirst.abs": true,
 	"MultiKeys-pre.abs":        true,
+	"VarcharKeys-pre.abs":      true,
+	"NoCaseKeys-pre.abs":       true,
 
 	// The Empty* files hold no tables at all -- they are what File -> Create
 	// Database writes before anything is in them -- so there is nothing for a

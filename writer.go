@@ -51,7 +51,7 @@ var (
 
 	// ErrIndexNotMaintained reports a write against an index this package will
 	// not edit, rather than one it silently leaves stale. Single-page indexes
-	// over an Int32 column are maintained (see writer_index.go); a tree deep
+	// over Int32 and VARCHAR components are maintained (see writer_index.go); a tree deep
 	// enough to have split, a key of another shape, and a schema whose index
 	// definitions cannot be read are all refused here.
 	ErrIndexNotMaintained = errors.New("absdb: table has an index this package cannot maintain")

@@ -105,8 +105,8 @@ Not unknowns — decisions, recorded so they can be revisited on purpose.
   rebuild needs six free pages and nothing could grow a file) has expired now that growth
   exists, and compaction has since shown object-id replay works. What remains is the work of
   reproducing the four-transaction sequence.
-- **Compaction refuses a table whose key covers more than one column**, or whose key column an
-  index leaf is not built for (`ErrConstraintsNotRebuilt`). A single-column `Int32` key is
-  rebuilt now, index and all. What is left is the same two shapes index maintenance refuses,
-  which is not a coincidence: the rows are copied through that writer, so an index it would not
-  maintain could not be filled anyway.
+- **Compaction refuses an index the row writer cannot maintain.** Root-only ascending
+  `Int32`/`VARCHAR` keys, including compound case-sensitive mixtures and a single-column
+  `VARCHAR NOCASE` index, are rebuilt now. A split tree, another component type, `DESC`, or
+  compound `NOCASE` remains refused; the rows are copied through that writer, so an index it
+  would not maintain could not be filled safely either.

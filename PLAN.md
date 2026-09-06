@@ -128,22 +128,31 @@ is a list rather than a line.
 `Constraints.abs`'s `CBoth`, `MultiTable-createidxgrow.abs`'s `Delta`, and it is a prerequisite
 for three of the `NOCASE` tables and two of the multi-column ones.
 
-- [ ] a. Read what a string key stores in the leaf: padded to the column width or to
+- [x] a. Read what a string key stores in the leaf: padded to the column width or to
       `maxIndexedSize`, and how a shorter value is terminated. The corpus has such indexes to
-      read; only the ordering rule needs the engine.
-- [ ] b. Fixtures: insert, delete and a key-moving update against a `VARCHAR`-keyed index.
-- [ ] c. Ordering — whether the engine compares by Windows-1252 byte or by something else.
-- [ ] d. Maintain it (`indexableKeyColumn` widened, `indexKeySize` no longer a constant).
-- [ ] e. `CREATE INDEX`/`CREATE TABLE` build one, and compaction rebuilds it.
-- [ ] f. Docs, and re-measure.
+      read; `VarcharKeys.abs` pins `Size+2` through 20 and a 23-byte capped long key.
+- [x] b. Fixtures: `VarcharKeys-{pre,ins,del,upd}.abs` pin insert, delete and a key-moving update.
+- [x] c. Ordering — not Windows-1252 byte order: decode it, then apply locale-style collation.
+      The fixture order `€`, `a`, `ä`, `Ä`, `aa`, `long`, `z`, `Z` matches the default Unicode collator.
+- [x] d. Maintain it (`indexableKeyColumn` widened and per-component key widths/descriptors shared).
+- [x] e. `CREATE INDEX`/`CREATE TABLE` build one, and compaction rebuilds it. Populated short,
+      capped-long and mixed leaves are covered, as is a `VARCHAR` primary key across compaction.
+- [~] f. Docs, and re-measure. Format, writer boundary, fixtures and provenance are documented.
+  The old survey predicts four more writable tables (100 to 104) and seven remaining, but the
+  private 111-table corpus is not in this checkout, so a fresh measurement is blocked.
 
 ### `NOCASE` ordering — 0 alone, 3 in total
 
 `Addresses.abs`'s `NameSort`, `Constraints.abs`'s `CIdxNoCase`, `TS03.abs`'s `EN`. Do this after
 the `VARCHAR` key: all three key a string column, so neither is any use alone.
 
-- [ ] a. Which case-folding the engine uses, from the order of an existing `NOCASE` leaf.
-- [ ] b. Maintenance, `CREATE INDEX`, compaction, docs.
+- [x] a. Which case-folding the engine uses, from the order of an engine-made `NOCASE` leaf.
+      `NoCaseKeys.abs` shows the default locale-style Unicode collation with its case level
+      ignored: accents and expansions still participate, while `A`/`a`, `Á`/`á` and `Œ`/`œ`
+      compare equal and retain insertion order.
+- [x] b. Maintenance, `CREATE INDEX`, compaction, docs. The five `NoCaseKeys*.abs` fixtures pin
+      populated creation plus insert, delete and a key-moving update; `CreateNoCaseIndex` writes
+      the single-column `VARCHAR` shape, and compaction preserves the flag and folded ordering.
 
 ### A split B-tree leaf — 1 alone, 3 in total
 
@@ -283,10 +292,10 @@ Deferred until there is a concrete use case.
 
 ## Next
 
-The index-shape table above now points next to a **`VARCHAR` key column**, then **`NOCASE`**.
-The completed all-integer multi-column item predicts the write path moving from 95 to 100 of 111
-tables; `VARCHAR` and `NOCASE` would take that projection to 107. The private corpus must be
-available before those projections can be reported as a fresh measurement.
+The index-shape table above now points next to **a split B-tree leaf**. Completed all-integer
+compound, `VARCHAR` and `NOCASE` work predicts the write path moving from 95 to 107 of 111
+tables, leaving four. The private corpus must be available before that projection can be reported
+as a fresh measurement.
 
 Three of the remaining validation gaps need the Delphi engine driven directly rather than through
 DBManager's SQL tab: a **`Bytes` value**, a **split B-tree leaf**, and a **second PFS page**. The

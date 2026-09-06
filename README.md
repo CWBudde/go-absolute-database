@@ -69,13 +69,14 @@ db, err := absdb.OpenForWrite("project.abs")
 ```
 
 That gives you record insert, update and delete with index maintenance, plus `CREATE TABLE`,
-`DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `ALTER TABLE ADD/DROP COLUMN`, database creation and
+`DROP TABLE`, ordinary and single-column `VARCHAR NOCASE` indexes (`CreateIndex` and
+`CreateNoCaseIndex`), `DROP INDEX`, `ALTER TABLE ADD/DROP COLUMN`, database creation and
 compaction. Writes are held to a deliberately harsh standard: for each supported operation, a test
-requires this package to reproduce **byte for byte** the file the vendor's own DB Manager produced
-for the same SQL statement. Reading a write back correctly is not accepted as evidence.
+requires this package to reproduce **byte for byte** the file the vendor engine produced for the
+same SQL statement. Reading a write back correctly is not accepted as evidence.
 
-Where this package cannot meet that standard it refuses the write rather than guessing — a table
-declaring any constraint, or an index whose ordering is not reproduced, is rejected with a named
+Where this package cannot meet that standard it refuses the write rather than guessing — an
+unsupported constraint, component type, tree depth, or index ordering is rejected with a named
 error. [`docs/writing.md`](docs/writing.md) lists every refusal and why it exists.
 
 ## Command line
@@ -118,8 +119,8 @@ just ci          # everything CI runs, plus the parts CI cannot
 
 **A green CI badge is narrower than it looks.** `testdata/` is gitignored: most fixtures are real
 private project files and are never committed, and every test that opens one skips when the file
-is absent. What CI covers is the synthetic and unit tests plus the forty committed fixtures, which
-are ours — they hold invented tables and invented values. Those forty do exercise the full
+is absent. What CI covers is the synthetic and unit tests plus the seventy-five committed fixtures,
+which are ours — they hold invented tables and invented values. Those fixtures exercise the full
 encrypted read path for all eight algorithms and the byte-for-byte write tests, but validation
 against the private corpus happens locally only. [`docs/testing.md`](docs/testing.md) is explicit
 about the boundary.

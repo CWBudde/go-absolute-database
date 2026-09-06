@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"os"
+	"slices"
 	"testing"
 )
 
@@ -17,6 +19,141 @@ import (
 var constraintTestColumns = []Column{
 	{Name: "A", BaseType: BftInt32, FieldType: FieldInteger},
 	{Name: "B", BaseType: BftVarchar, FieldType: FieldString, Size: 10},
+}
+
+func TestCompactDatabaseRefusesConstraintIndexOrdering(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		kind            constraintKind
+		descending      bool
+		caseInsensitive bool
+		compound        bool
+	}{
+		{name: "nocase-unique", kind: constraintUnique, caseInsensitive: true},
+		{name: "nocase-primary", kind: constraintPrimaryKey, caseInsensitive: true},
+		{name: "descending", kind: constraintUnique, descending: true},
+		{name: "compound-nocase", kind: constraintUnique, caseInsensitive: true, compound: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := newDatabasePath(t, "source.abs")
+			dst := newDatabasePath(t, "compacted.abs")
+
+			db, err := CreateDatabase(src, CreateDatabaseOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			t.Cleanup(func() { _ = db.Close() })
+
+			covered := []constraintColumn{{name: "B"}}
+			if tc.compound {
+				covered = append(covered, constraintColumn{name: "A"})
+			}
+
+			constraint := constraintRecord{
+				kind: tc.kind, name: "Key", table: "Codes", index: "Key", columns: covered,
+			}
+			if err := db.createTable("Codes", constraintTestColumns, []constraintRecord{constraint}); err != nil {
+				t.Fatal(err)
+			}
+
+			writer, err := db.OpenTableWriter()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := writer.Insert([]any{int32(1), "a"}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := writer.Commit(); err != nil {
+				t.Fatal(err)
+			}
+
+			// A single occupied key has the same order for all these flags.
+			// Change only metadata to exercise shapes CreateTable cannot emit.
+			setConstraintIndexOrdering(t, db, tc.descending, tc.caseInsensitive)
+
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			before, err := os.ReadFile(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := CompactDatabase(src, dst); !errors.Is(err, ErrConstraintsNotRebuilt) {
+				t.Fatalf("CompactDatabase = %v, want ErrConstraintsNotRebuilt", err)
+			}
+
+			after, err := os.ReadFile(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !bytes.Equal(before, after) {
+				t.Error("refused compaction changed the source")
+			}
+
+			if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("destination after refusal: %v, want os.ErrNotExist", err)
+			}
+		})
+	}
+}
+
+func setConstraintIndexOrdering(t *testing.T, db *File, descending, caseInsensitive bool) {
+	t.Helper()
+
+	table, err := db.Table("Codes")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pageNo, err := table.schemaPageNo()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := db.readSchemaStream(pageNo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records, _, err := schemaTailArrays(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(records) != 1 {
+		t.Fatalf("index count = %d, want 1", len(records))
+	}
+
+	rec := records[0]
+	rec.columns[0].descending = descending
+	rec.columns[0].caseInsensitive = caseInsensitive
+
+	encoded, err := serializeIndexRecord(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(encoded) != rec.end-rec.start {
+		t.Fatal("ordering flags changed the index record size")
+	}
+
+	copy(raw[rec.start:rec.end], encoded)
+
+	edits := newPageEdit(db)
+
+	if err := db.writeSchemaStream(edits, pageNo, raw); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.flushPages(edits.order, edits.pages); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestCreateTableWritesTheEngineSchemaStream is the oracle for writing a
@@ -369,6 +506,96 @@ func TestCompactDatabaseRebuildsPopulatedCompoundIndex(t *testing.T) {
 	}
 }
 
+// TestCompactDatabaseRebuildsPopulatedVarcharIndexes exercises both replay
+// phases: CREATE INDEX reconstructs all three empty roots and row copying then
+// maintains their short, capped-long, and mixed keys.
+func TestCompactDatabaseRebuildsPopulatedVarcharIndexes(t *testing.T) {
+	src := requireFixture(t, "VarcharKeys.abs")
+	dst := newDatabasePath(t, "varchar-keys-compacted.abs")
+
+	if err := CompactDatabase(src, dst); err != nil {
+		t.Fatalf("CompactDatabase: %v", err)
+	}
+
+	compareRows(t, dst, src, "VarcharKeys", "COMPACT DATABASE with populated VARCHAR indexes")
+
+	got, want := captureIndexes(t, dst, "VarcharKeys"), captureIndexes(t, src, "VarcharKeys")
+	if len(got) != 3 || len(want) != 3 {
+		t.Fatalf("compacted indexes = %+v, source indexes = %+v", got, want)
+	}
+
+	for i := range got {
+		if got[i].name != want[i].name || got[i].column != want[i].column || len(got[i].entries) != len(want[i].entries) {
+			t.Errorf("compacted index %d = %+v, source = %+v", i, got[i], want[i])
+			continue
+		}
+
+		for j := range got[i].entries {
+			if !bytes.Equal(got[i].entries[j].Key, want[i].entries[j].Key) {
+				t.Errorf("%s key %d = %x, want %x",
+					got[i].name, j, got[i].entries[j].Key, want[i].entries[j].Key)
+			}
+		}
+	}
+
+	after := openTestFileAt(t, dst)
+
+	table, err := after.Table("VarcharKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	if checked := crossCheckTable(t, table); checked != 3 {
+		t.Errorf("cross-checked %d indexes, want 3", checked)
+	}
+}
+
+// TestCompactDatabaseRebuildsPopulatedNoCaseIndex proves compaction preserves
+// both the schema flag and the folded ordering while replaying rows through a
+// freshly created NOCASE leaf.
+func TestCompactDatabaseRebuildsPopulatedNoCaseIndex(t *testing.T) {
+	src := requireFixture(t, "NoCaseKeys.abs")
+	dst := newDatabasePath(t, "nocase-keys-compacted.abs")
+
+	if err := CompactDatabase(src, dst); err != nil {
+		t.Fatalf("CompactDatabase: %v", err)
+	}
+
+	compareRows(t, dst, src, "NoCaseKeys", "COMPACT DATABASE with populated NOCASE index")
+
+	got, want := captureIndexes(t, dst, "NoCaseKeys"), captureIndexes(t, src, "NoCaseKeys")
+	if len(got) != 1 || len(want) != 1 {
+		t.Fatalf("compacted indexes = %+v, source indexes = %+v", got, want)
+	}
+
+	if got[0].name != want[0].name || got[0].column != want[0].column ||
+		!got[0].caseInsensitive || !want[0].caseInsensitive {
+		t.Errorf("compacted index = %+v, source = %+v", got[0], want[0])
+	}
+
+	if len(got[0].entries) != len(want[0].entries) {
+		t.Fatalf("compacted entries = %d, source = %d", len(got[0].entries), len(want[0].entries))
+	}
+
+	for i := range got[0].entries {
+		if !bytes.Equal(got[0].entries[i].Key, want[0].entries[i].Key) {
+			t.Errorf("NOCASE key %d = %x, want %x",
+				i, got[0].entries[i].Key, want[0].entries[i].Key)
+		}
+	}
+
+	after := openTestFileAt(t, dst)
+
+	table, err := after.Table("NoCaseKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	if checked := crossCheckTable(t, table); checked != 1 {
+		t.Errorf("cross-checked %d indexes, want 1", checked)
+	}
+}
+
 // TestCompoundPrimaryKeySurvivesCreateAndCompact covers the key-backed path:
 // CREATE TABLE builds a two-column primary index, inserts maintain it, and a
 // compaction preserves both tuple uniqueness and PRIMARY's no-NULL rule.
@@ -438,6 +665,100 @@ func TestCompoundPrimaryKeySurvivesCreateAndCompact(t *testing.T) {
 
 	if _, err := writer.Insert([]any{int32(2), int32(20)}); err != nil {
 		t.Errorf("distinct compound primary key: %v", err)
+	}
+
+	writer.Rollback()
+}
+
+func TestVarcharPrimaryKeySurvivesCreateAndCompact(t *testing.T) {
+	src := newDatabasePath(t, "varchar-primary.abs")
+
+	db, err := CreateDatabase(src, CreateDatabaseOptions{})
+	if err != nil {
+		t.Fatalf("CreateDatabase: %v", err)
+	}
+
+	columns := []Column{
+		{Name: "Code", BaseType: BftVarchar, FieldType: FieldString, Size: 10},
+		{Name: "Value", BaseType: BftInt32, FieldType: FieldInteger},
+	}
+
+	constraint := constraintRecord{
+		kind: constraintPrimaryKey, name: "C_PK$Code", table: "Codes", index: "C_PK$Code",
+		columns: []constraintColumn{{name: "Code"}},
+	}
+	if err := db.createTable("Codes", columns, []constraintRecord{constraint}); err != nil {
+		t.Fatalf("createTable: %v", err)
+	}
+
+	w, err := db.OpenTableWriter()
+	if err != nil {
+		t.Fatalf("OpenTableWriter: %v", err)
+	}
+
+	for _, row := range [][]any{{"a", int32(1)}, {"ä", int32(2)}} {
+		if _, err := w.Insert(row); err != nil {
+			t.Fatalf("Insert(%v): %v", row, err)
+		}
+	}
+
+	if _, err := w.Insert([]any{"a", int32(3)}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("duplicate VARCHAR primary key = %v, want ErrDuplicateKey", err)
+	}
+
+	if _, err := w.Insert([]any{nil, int32(3)}); !errors.Is(err, ErrNotNullViolated) {
+		t.Errorf("NULL VARCHAR primary key = %v, want ErrNotNullViolated", err)
+	}
+
+	if err := w.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close source: %v", err)
+	}
+
+	dst := newDatabasePath(t, "varchar-primary-compacted.abs")
+	if err := CompactDatabase(src, dst); err != nil {
+		t.Fatalf("CompactDatabase: %v", err)
+	}
+
+	after, err := OpenForWrite(dst)
+	if err != nil {
+		t.Fatalf("OpenForWrite compacted database: %v", err)
+	}
+	defer after.Close()
+
+	table, err := after.Table("Codes")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	ir, err := table.OpenIndex()
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+
+	primary, err := ir.PrimaryKeyIndex()
+	if err != nil {
+		t.Fatalf("PrimaryKeyIndex: %v", err)
+	}
+
+	if primary.KeySize != 12 || !slices.Equal(primary.Columns, []string{"Code"}) {
+		t.Errorf("primary index = %+v, want 12-byte Code key", primary)
+	}
+
+	writer, err := table.OpenWriter()
+	if err != nil {
+		t.Fatalf("OpenWriter compacted database: %v", err)
+	}
+
+	if _, err := writer.Insert([]any{"ä", int32(3)}); !errors.Is(err, ErrDuplicateKey) {
+		t.Errorf("duplicate after compaction = %v, want ErrDuplicateKey", err)
+	}
+
+	if _, err := writer.Insert([]any{"Z", int32(3)}); err != nil {
+		t.Errorf("distinct key after compaction: %v", err)
 	}
 
 	writer.Rollback()

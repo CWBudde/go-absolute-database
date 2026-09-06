@@ -139,6 +139,208 @@ func TestFindByStringKeySelectsTheCoveredColumn(t *testing.T) {
 	}
 }
 
+func TestVarcharTwoIndexDiscoveryAndLookup(t *testing.T) {
+	db, err := CreateDatabase(newDatabasePath(t, "short-keys.abs"), CreateDatabaseOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ids := make(map[string]RecordID)
+
+	for _, name := range []string{"Plain", "Folded"} {
+		if err := db.CreateTable(name, []Column{
+			{Name: "Code", BaseType: BftVarchar, FieldType: FieldString, Size: 2},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if name == "Folded" {
+			err = db.CreateNoCaseIndex(name, "Idx"+name, "Code")
+		} else {
+			err = db.CreateIndex(name, "Idx"+name, "Code")
+		}
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		table, err := db.Table(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w, err := table.OpenWriter()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ids[name], err = w.Insert([]any{"ab"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := w.Commit(); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ir, err := db.OpenIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := len(ir.UserIndexes()); got != 2 {
+		t.Errorf("file UserIndexes = %d, want 2", got)
+	}
+
+	for _, idx := range ir.Indexes() {
+		if idx.IsInternal != (idx.Name == "") {
+			t.Errorf("incorrect system classification: %+v", idx)
+		}
+	}
+
+	for name, id := range ids {
+		t.Run(name, func(t *testing.T) {
+			table, err := db.Table(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ir, err := table.OpenIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, indexes := range [][]IndexInfo{ir.UserIndexes(), ir.SecondaryIndexes()} {
+				if len(indexes) != 1 || indexes[0].Name != "Idx"+name || indexes[0].IsInternal {
+					t.Fatalf("table index discovery = %+v, want one user index for %s", indexes, name)
+				}
+			}
+
+			value := "ab"
+			if name == "Folded" {
+				value = "AB"
+			}
+
+			page, slot, err := ir.FindByStringKey("Code", value)
+			if err != nil || int(page) != id.PageNo || int(slot) != id.Slot {
+				t.Errorf("lookup = (%d,%d), %v; want %+v", page, slot, err, id)
+			}
+		})
+	}
+}
+
+func TestFindByStringKeyUsesEngineVarcharEncodingAndCollation(t *testing.T) {
+	db := openFixture(t, "VarcharKeys.abs")
+
+	table, err := db.Table("VarcharKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	ir, err := table.OpenIndex()
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+
+	for _, tc := range []struct {
+		column, value string
+		slot          uint16
+	}{
+		{"Short", "€", 7},
+		{"Short", "ä", 6},
+		{"Short", "Ä", 5},
+		{"LongText", "abcdefghijklmnopqrstUVWX", 8},
+	} {
+		page, slot, err := ir.FindByStringKey(tc.column, tc.value)
+		if err != nil {
+			t.Errorf("FindByStringKey(%q, %q): %v", tc.column, tc.value, err)
+			continue
+		}
+
+		if page != 10 || slot != tc.slot {
+			t.Errorf("FindByStringKey(%q, %q) = (%d,%d), want (10,%d)",
+				tc.column, tc.value, page, slot, tc.slot)
+		}
+	}
+
+	if _, _, err := ir.FindByStringKey("Short", "→"); !errors.Is(err, ErrStringEncoding) {
+		t.Errorf("FindByStringKey with text outside Windows-1252 = %v, want ErrStringEncoding", err)
+	}
+}
+
+// TestNoCaseIndexLeafMatchesEngine pins the case-folding rule independently
+// of raw key bytes. Several pairs were inserted upper-case first even though
+// the ordinary collator sorts lower-case first; the NOCASE leaf preserves
+// insertion order within those folded-equal runs, including accented and
+// Windows-1252 ligature pairs.
+func TestNoCaseIndexLeafMatchesEngine(t *testing.T) {
+	db := openFixture(t, "NoCaseKeys.abs")
+
+	table, err := db.Table("NoCaseKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	ir, err := table.OpenIndex()
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+
+	indexes := ir.UserIndexes()
+	if len(indexes) != 1 {
+		t.Fatalf("user indexes = %d, want 1", len(indexes))
+	}
+
+	idx := indexes[0]
+	if idx.Name != "IdxNoCase" || idx.KeySize != 5 || !slices.Equal(idx.Columns, []string{"TextValue"}) {
+		t.Fatalf("index = %+v, want IdxNoCase on TextValue with 5-byte keys", idx)
+	}
+
+	entries, err := ir.ScanIndex(idx.RootPageNo)
+	if err != nil {
+		t.Fatalf("ScanIndex: %v", err)
+	}
+
+	wantSlots := []uint16{0, 9, 1, 2, 18, 19, 3, 4, 5, 6, 16, 17, 14, 15, 12, 13, 20, 21, 10, 11, 7, 8}
+	if len(entries) != len(wantSlots) {
+		t.Fatalf("entries = %d, want %d", len(entries), len(wantSlots))
+	}
+
+	for i, entry := range entries {
+		if entry.PageNo != 10 || entry.ItemNo != wantSlots[i] {
+			t.Errorf("entry %d = (%d,%d), want (10,%d)", i, entry.PageNo, entry.ItemNo, wantSlots[i])
+		}
+	}
+
+	for _, tc := range []struct {
+		value string
+		slot  uint16
+	}{
+		{"A", 1},
+		{"a", 1},
+		{"Á", 18},
+		{"á", 18},
+		{"Œ", 20},
+		{"œ", 20},
+	} {
+		page, slot, err := ir.FindByStringKey("TextValue", tc.value)
+		if err != nil {
+			t.Errorf("FindByStringKey(%q): %v", tc.value, err)
+			continue
+		}
+
+		if page != 10 || slot != tc.slot {
+			t.Errorf("FindByStringKey(%q) = (%d,%d), want (10,%d)", tc.value, page, slot, tc.slot)
+		}
+	}
+}
+
 func TestTS03PrimaryKeyLookup(t *testing.T) {
 	db := openTestFile(t, "TS03.abs")
 

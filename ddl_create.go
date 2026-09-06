@@ -161,9 +161,9 @@ func (db *File) CreateTable(name string, columns []Column) error {
 // A PRIMARY KEY or UNIQUE record brings an index with it, and that index is
 // built here: one more page, one more object id and one more record in the
 // schema stream's index array. Constraints.abs pins a compound key's schema
-// record and empty root exactly; later writes maintain it when every occupied
-// component is the all-Int32 shape MultiKeys.abs measures. A key with another
-// occupied component remains refused by writer index resolution.
+// record and empty root exactly; later writes maintain its measured Int32 and
+// VARCHAR components. A key with another occupied component remains refused by
+// writer index resolution.
 func (db *File) createTable(name string, columns []Column, constraints []constraintRecord) error {
 	if !db.writable {
 		return ErrReadOnly
@@ -495,20 +495,14 @@ func keyConstraintIndex(rec constraintRecord, owners []Column, objectID int) (in
 	}, nil
 }
 
-// knownEmptyIndexComponentSize returns the component width established by an
-// empty engine-written root. It is deliberately narrower than an encoder: an
-// Int32 contributes five bytes, while Constraints.abs establishes twelve for
-// its VARCHAR(10), hence declared size plus null flag and terminator. A string
-// longer than MaxIndexedSize remains unknown because the empty fixtures cannot
-// say whether the engine truncates it there.
+// knownEmptyIndexComponentSize returns a component width established by an
+// engine-written root. Constraints.abs establishes Size+2 for VARCHAR(10),
+// while the occupied VarcharKeys.abs establishes the 23-byte capped shape for
+// declarations above MaxIndexedSize.
 func knownEmptyIndexComponentSize(col Column) (int, bool) {
-	if indexableKeyColumn(col) {
-		return indexKeySize, true
-	}
-
-	if col.BaseType == BftVarchar && col.FieldType == FieldString &&
-		col.Size > 0 && col.Size <= indexColumnMaxIndexedSize {
-		return int(col.Size) + 2, true
+	component, ok := indexKeyComponentFor(0, col)
+	if ok {
+		return component.size, true
 	}
 
 	return 0, false

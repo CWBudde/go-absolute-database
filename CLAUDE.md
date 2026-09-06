@@ -116,19 +116,21 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   consequence of reallocation.
 
 - **Index maintenance is deliberately narrow, and its narrowness is load-bearing**: insert, delete
-  and a key-moving update keep a **root-only index over one or more `Int32` components** in step—
-  `Integer` or `AUTOINC`, which are the same component byte for byte—and that is exactly the
-  occupied shape `CREATE INDEX` builds. `MultiKeys*.abs` pins the compound concatenation,
-  lexicographic component order and all three splice operations with full byte identity.
+  and a key-moving update keep a **root-only ascending index over `Int32` and `VARCHAR`
+  components** in step. `MultiKeys*.abs` pins compound concatenation; `VarcharKeys*.abs` pins
+  short and capped-long widths, Windows-1252 bytes, locale collation, mixed components, and all
+  three splice operations with full byte identity. `NoCaseKeys*.abs` adds the measured
+  single-column `VARCHAR NOCASE` shape: ignore the collator's case level and keep stable order
+  among folded-equal values.
   `indexableKeyColumn` (`index.go`) is the single definition of the component rule;
   it had four copies before, and they have to agree, because a rebuild that builds an index the
   writer will not maintain produces a table nothing can insert into. Everything else is refused
   with `ErrIndexNotMaintained` rather than guessed at: a tree deep enough to have split, an
-  occupied component of another shape, or ordering this package does not reproduce (`DESC`,
-  `NOCASE`). The last private-corpus survey found sixteen refused tables and showed that an
-  all-integer multi-column key was the sole reason for five of them, so this implementation
-  predicts eleven remaining. That re-measurement is still pending because the private 111-table
-  corpus is not in this checkout; `PLAN.md` keeps the measured old table and labels the projection.
+  occupied component of another shape, or ordering this package does not reproduce (`DESC` or
+  compound `NOCASE`). The last private-corpus survey found sixteen refused tables; completed
+  compound, `VARCHAR`, and `NOCASE` work predicts four remaining. That re-measurement is still
+  pending because the private 111-table corpus is not in this checkout; `PLAN.md` keeps the
+  measured old table and labels the projection.
   Three behaviours come from fixtures and must not be "tidied": a removal
   **leaves the entry slot it vacates untouched** (`Writes-idx-del.abs`), a key-moving update is a
   **removal followed by a sorted insertion** rather than an in-place patch (`Writes-idx-upd.abs`),
@@ -182,7 +184,7 @@ Raw equivalents: `go test ./...`, `go test -race ./...`, `go test -run '^$' -fuz
   never widen an exclusion to make a test pass.
 - **No panics**: All error paths return errors. Never panic on malformed input.
 - **Fuzz-safe**: The parser must handle arbitrary byte sequences without crashes or unbounded allocations.
-- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored — almost all of the files are real private project data and are never committed. The exceptions are the eight `testdata/Employees-*.abs` fixtures (one per encryption algorithm), the fourteen `testdata/Writes*.abs` fixtures (the write path's ground truth, four of them carrying a user index) and the twelve `testdata/MultiTable*.abs` fixtures (the table catalog and the schema operations over it), the five `testdata/Empty*.abs` fixtures (what the engine writes for a brand-new database, and how it grows one) `testdata/Constraints.abs` (twelve tables differing from a control by one column constraint or index variation each) `testdata/Types.abs` (eight tables covering every field type, each column of unknown width followed by a sentinel so a wrong width fails loudly) and `testdata/Types2.abs` (what `Types.abs` could not settle: the TimeStamp layout, from eleven instants, and eleven refused attempts at a `BYTES` value), which are ours and are committed; see `testdata/README.md`. Tests that need a fixture must `t.Skip` when it is missing, so a fresh clone (and CI) still runs green on the synthetic, unit, `Employees-*` and `Writes*` tests alone. A green CI run therefore still does **not** mean the parser was validated against the private fixtures; run `just test` locally for that.
+- **Test against real files**: Primary validation uses real `.abs` fixtures in `testdata/`. That directory is gitignored because most files are private project data and are never committed. An explicit allowlist admits the 75 synthetic engine-made fixtures described in `testdata/README.md`, including the `MultiKeys*`, `VarcharKeys*`, and `NoCaseKeys*` index oracles. Tests that need an absent private fixture must `t.Skip`; a green CI run therefore still does **not** mean the parser was validated against the private corpus. Run `just test` locally for that.
 - **Windows-1252 aware**: String fields use Windows-1252 encoding by default. Always decode to UTF-8.
 
 ## Formatting and Linting
@@ -198,4 +200,4 @@ Linting is `golangci-lint` with `default: all` and a curated disable list. Every
 
 ## CI
 
-`.github/workflows/ci.yml` runs build, `go vet`, `gofmt`, `go mod tidy -diff`, race tests, `golangci-lint`, and a short fuzz budget per target. It sees only the two committed Twofish fixtures, not the private ones, so read the scope note at the top of that file before trusting a green check.
+`.github/workflows/ci.yml` runs build, `go vet`, `gofmt`, `go mod tidy -diff`, race tests, `golangci-lint`, and a short fuzz budget per target. It sees the 75 committed synthetic fixtures, not the private corpus, so read the scope note at the top of that file before trusting a green check.

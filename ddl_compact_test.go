@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -214,6 +215,9 @@ func compareIndexes(t *testing.T, gotPath, wantPath, table, statement string) {
 		case g.column != w.column:
 			t.Errorf("%s: %q index %q keys %q, the engine keys %q",
 				statement, table, g.name, g.column, w.column)
+		case g.caseInsensitive != w.caseInsensitive:
+			t.Errorf("%s: %q index %q NOCASE=%t, the engine wrote %t",
+				statement, table, g.name, g.caseInsensitive, w.caseInsensitive)
 		case fmt.Sprint(g.entries) != fmt.Sprint(w.entries):
 			t.Errorf("%s: %q index %q holds %v, the engine holds %v",
 				statement, table, g.name, g.entries, w.entries)
@@ -223,9 +227,10 @@ func compareIndexes(t *testing.T, gotPath, wantPath, table, statement string) {
 
 // capturedIndex is one user index as a semantic comparison sees it.
 type capturedIndex struct {
-	name    string
-	column  string
-	entries []BTreeEntry
+	name            string
+	column          string
+	caseInsensitive bool
+	entries         []BTreeEntry
 }
 
 func indexNames(indexes []capturedIndex) []string {
@@ -292,7 +297,11 @@ func captureIndexes(t *testing.T, path, table string) []capturedIndex {
 			column = col.name
 		}
 
-		indexes = append(indexes, capturedIndex{name: rec.name, column: column, entries: entries})
+		indexes = append(indexes, capturedIndex{
+			name: rec.name, column: column,
+			caseInsensitive: len(rec.columns) == 1 && rec.columns[0].caseInsensitive,
+			entries:         entries,
+		})
 	}
 
 	return indexes
@@ -575,10 +584,10 @@ func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 		{"CMinMax", nil},
 		{"CPk", nil},
 		{"CUnique", nil},
-		{"CBoth", ErrConstraintsNotRebuilt},
+		{"CBoth", nil},
 		{"CPkMulti", nil},
 		{"CIdxDesc", ErrIndexNotMaintained},
-		{"CIdxNoCase", ErrIndexNotMaintained},
+		{"CIdxNoCase", nil},
 		{"CIdxMulti", nil},
 	} {
 		t.Run(c.table, func(t *testing.T) {
@@ -599,13 +608,7 @@ func TestPlanCompactTableRefusalsPerTable(t *testing.T) {
 	}
 }
 
-// TestPlanCompactIndexesRefusesAStringKey is the one index refusal no fixture
-// can reach through a whole-file compaction: CreateIndex builds only Int32
-// keys, so the corpus holds no plain single-column index over a string that
-// this package could also have created. The record is built by hand instead,
-// because losing an index is not an acceptable outcome of a compaction and the
-// refusal has to be pinned somewhere.
-func TestPlanCompactIndexesRefusesAStringKey(t *testing.T) {
+func TestPlanCompactIndexesAcceptsAStringKey(t *testing.T) {
 	schema := &TableSchema{Columns: []Column{
 		{Name: "S", BaseType: BftVarchar, FieldType: FieldString, Size: 20},
 	}}
@@ -618,9 +621,27 @@ func TestPlanCompactIndexesRefusesAStringKey(t *testing.T) {
 		}},
 	}}
 
+	indexes, err := planCompactIndexes(schema, records, nil, false)
+	if err != nil {
+		t.Fatalf("planCompactIndexes over a string column: %v", err)
+	}
+
+	if len(indexes) != 1 || indexes[0].name != "IdxS" || !slices.Equal(indexes[0].columns, []string{"S"}) {
+		t.Errorf("planned indexes = %+v, want IdxS on S", indexes)
+	}
+}
+
+func TestPlanCompactIndexesRefusesNoCaseOnANonStringKey(t *testing.T) {
+	schema := &TableSchema{Columns: []Column{
+		{Name: "N", BaseType: BftInt32, FieldType: FieldInteger},
+	}}
+	records := []indexRecord{{
+		name: "IdxN", columns: []indexColumn{{name: "N", caseInsensitive: true}},
+	}}
+
 	_, err := planCompactIndexes(schema, records, nil, false)
 	if !errors.Is(err, ErrUnsupportedIndexColumn) {
-		t.Errorf("planCompactIndexes over a string column = %v, want %v", err, ErrUnsupportedIndexColumn)
+		t.Errorf("planCompactIndexes with NOCASE INTEGER = %v, want %v", err, ErrUnsupportedIndexColumn)
 	}
 }
 

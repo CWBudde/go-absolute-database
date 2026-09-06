@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"slices"
 	"testing"
 )
 
@@ -141,6 +142,265 @@ func recordWithPair(t *testing.T, db *File, a, b int32) RecordID {
 	return RecordID{}
 }
 
+// TestVarcharIndexLeafMatchesEngine pins the occupied VARCHAR evidence from
+// VarcharKeys.abs: short and capped-long widths, NULL-first locale collation,
+// Windows-1252 bytes, and mixed-component concatenation.
+func TestVarcharIndexLeafMatchesEngine(t *testing.T) {
+	db := openFixture(t, "VarcharKeys.abs")
+
+	table, err := db.Table("VarcharKeys")
+	if err != nil {
+		t.Fatalf("Table: %v", err)
+	}
+
+	ir, err := table.OpenIndex()
+	if err != nil {
+		t.Fatalf("OpenIndex: %v", err)
+	}
+
+	indexes := ir.UserIndexes()
+	if len(indexes) != 3 {
+		t.Fatalf("user indexes = %d, want 3", len(indexes))
+	}
+
+	want := []struct {
+		name    string
+		size    int
+		columns []string
+		slots   []uint16
+	}{
+		{"IdxShort", 12, []string{"Short"}, []uint16{0, 7, 2, 6, 5, 3, 8, 4, 1}},
+		{"IdxLongText", 23, []string{"LongText"}, []uint16{0, 7, 2, 6, 5, 3, 8, 4, 1}},
+		{"IdxGroupShort", 17, []string{"GroupId", "Short"}, []uint16{0, 7, 2, 6, 5, 3, 4, 1, 8}},
+	}
+
+	for i, idx := range indexes {
+		if idx.Name != want[i].name || idx.KeySize != want[i].size || !slices.Equal(idx.Columns, want[i].columns) {
+			t.Errorf("index %d = %+v, want %s on %v with %d-byte keys",
+				i, idx, want[i].name, want[i].columns, want[i].size)
+		}
+
+		entries, err := ir.ScanIndex(idx.RootPageNo)
+		if err != nil {
+			t.Fatalf("ScanIndex(%s): %v", idx.Name, err)
+		}
+
+		if len(entries) != len(want[i].slots) {
+			t.Fatalf("%s entries = %d, want %d", idx.Name, len(entries), len(want[i].slots))
+		}
+
+		for j, entry := range entries {
+			if entry.PageNo != 10 || entry.ItemNo != want[i].slots[j] {
+				t.Errorf("%s entry %d = (%d,%d), want (10,%d)",
+					idx.Name, j, entry.PageNo, entry.ItemNo, want[i].slots[j])
+			}
+		}
+	}
+
+	longEntries, err := ir.ScanIndex(indexes[1].RootPageNo)
+	if err != nil {
+		t.Fatalf("ScanIndex(IdxLongText): %v", err)
+	}
+
+	if got, wantKey := longEntries[6].Key, []byte{
+		0, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j',
+		'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 0, 0,
+	}; !bytes.Equal(got, wantKey) {
+		t.Errorf("capped long key = %x, want %x", got, wantKey)
+	}
+}
+
+// TestWriterMaintainsVarcharIndexesByteForByte applies the three statements
+// used for the engine-made derivative fixtures. All three populated indexes
+// are maintained in one write, including the mixed integer/string leaf.
+func TestWriterMaintainsVarcharIndexesByteForByte(t *testing.T) {
+	cases := []struct {
+		name, want, statement string
+		apply                 func(*testing.T, *File, *TableWriter)
+	}{
+		{
+			name: "insert", want: "VarcharKeys-ins.abs",
+			statement: "INSERT INTO VarcharKeys VALUES (10, 1, 'ab', 'ab')",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				if _, err := w.Insert([]any{int32(10), int32(1), "ab", "ab"}); err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			name: "delete", want: "VarcharKeys-del.abs",
+			statement: "DELETE FROM VarcharKeys WHERE RowId = 3",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.Delete(recordWithKey(t, db, 3)); err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+			},
+		},
+		{
+			name: "key-moving update", want: "VarcharKeys-upd.abs",
+			statement: "UPDATE VarcharKeys SET Short = 'A', LongText = 'A' WHERE RowId = 5",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.Update(recordWithKey(t, db, 5), []any{int32(5), int32(1), "A", "A"}); err != nil {
+					t.Fatalf("Update: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requireEngineBytes(t, "VarcharKeys.abs", tc.want, tc.statement, tc.apply)
+		})
+	}
+}
+
+// TestWriterMaintainsNoCaseIndexByteForByte replays the three engine
+// statements against a NOCASE leaf. Insert and update both exercise folded
+// positioning; delete pins the same uncleared vacated stride as other leaves.
+func TestWriterMaintainsNoCaseIndexByteForByte(t *testing.T) {
+	cases := []struct {
+		name, want, statement string
+		apply                 func(*testing.T, *File, *TableWriter)
+	}{
+		{
+			name: "insert", want: "NoCaseKeys-ins.abs",
+			statement: "INSERT INTO NoCaseKeys VALUES (23, 1, 'Ab')",
+			apply: func(t *testing.T, _ *File, w *TableWriter) {
+				t.Helper()
+
+				if _, err := w.Insert([]any{int32(23), int32(1), "Ab"}); err != nil {
+					t.Fatalf("Insert: %v", err)
+				}
+			},
+		},
+		{
+			name: "delete", want: "NoCaseKeys-del.abs",
+			statement: "DELETE FROM NoCaseKeys WHERE RowId = 3",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.Delete(recordWithKey(t, db, 3)); err != nil {
+					t.Fatalf("Delete: %v", err)
+				}
+			},
+		},
+		{
+			name: "key-moving update", want: "NoCaseKeys-upd.abs",
+			statement: "UPDATE NoCaseKeys SET TextValue = 'c' WHERE RowId = 17",
+			apply: func(t *testing.T, db *File, w *TableWriter) {
+				t.Helper()
+
+				if err := w.Update(recordWithKey(t, db, 17), []any{int32(17), int32(2), "c"}); err != nil {
+					t.Fatalf("Update: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requireEngineBytes(t, "NoCaseKeys.abs", tc.want, tc.statement, tc.apply)
+		})
+	}
+}
+
+// Updating a unique value must exclude the row itself even when the stored
+// bytes change without changing its collation value (soft hyphen is ignored).
+func TestUniqueStringUpdateCollationEqual(t *testing.T) {
+	for _, columnOnly := range []bool{false, true} {
+		name := "Update"
+		if columnOnly {
+			name = "UpdateColumn"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			db, err := CreateDatabase(newDatabasePath(t, "unique-text.abs"), CreateDatabaseOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			if err := db.CreateTable("Codes", []Column{
+				{Name: "Code", BaseType: BftVarchar, FieldType: FieldString, Size: 10},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := db.CreateUniqueIndex("Codes", "UniqueCode", "Code"); err != nil {
+				t.Fatal(err)
+			}
+
+			w, err := db.OpenTableWriter()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Rollback()
+
+			id, err := w.Insert([]any{"a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := w.Insert([]any{"b"}); err != nil {
+				t.Fatal(err)
+			}
+
+			update := func(value string) error {
+				if columnOnly {
+					return w.UpdateColumn(id, 0, value)
+				}
+
+				return w.Update(id, []any{value})
+			}
+			if err := update("a\u00ad"); err != nil {
+				t.Fatalf("collation-equal update: %v", err)
+			}
+
+			if err := update("b\u00ad"); !errors.Is(err, ErrDuplicateKey) {
+				t.Fatalf("update conflicting with another row = %v, want ErrDuplicateKey", err)
+			}
+
+			rec, err := w.Record(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got := rec.String(0); got != "a\u00ad" {
+				t.Errorf("value after refused update = %q, want a followed by soft hyphen", got)
+			}
+
+			if err := w.Commit(); err != nil {
+				t.Fatal(err)
+			}
+
+			ir, err := db.OpenIndex()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			indexes := ir.UserIndexes()
+			if len(indexes) != 1 {
+				t.Fatalf("user indexes = %d, want 1", len(indexes))
+			}
+
+			entries, err := ir.ScanIndex(indexes[0].RootPageNo)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(entries) != 2 || decodeANSI(entries[0].Key[1:]) != "a\u00ad" {
+				t.Errorf("index did not retain the updated key bytes: %+v", entries)
+			}
+		})
+	}
+}
+
 // TestWriterMaintainsAnEncryptedIndex shows index maintenance is not a
 // plaintext-only capability: Employees-Rijndael_128.abs carries a user index in
 // an encrypted file, and its index page is written back through the same
@@ -181,10 +441,10 @@ func TestWriterMaintainsAnEncryptedIndex(t *testing.T) {
 }
 
 // TestWriterRefusesAnIndexItCannotMaintain pins what stays refused now that
-// root-only Int32-component indexes are maintained. Each case is a shape no fixture
-// captures, so refusing is the only honest answer: guessing at it would produce
-// a file that reads back correctly through this package and is not what the
-// engine writes.
+// root-only Int32/VARCHAR-component indexes are maintained. Each case is a
+// shape no fixture captures, so refusing is the only honest answer: guessing
+// at it would produce a file that reads back correctly through this package
+// and is not what the engine writes.
 //
 // The first two poke a copy of Writes-idx.abs rather than needing a fixture of
 // their own, which is safe because a page checksum is only an encryption
@@ -250,8 +510,15 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 			want error
 		}{
 			{
-				name: "DESC or NOCASE column",
+				name: "DESC column",
 				rec:  indexRecord{name: "d", columns: []indexColumn{{name: "A", descending: true}}},
+				want: ErrIndexNotMaintained,
+			},
+			{
+				name: "compound NOCASE column",
+				rec: indexRecord{name: "n", columns: []indexColumn{
+					{name: "A"}, {name: "B", caseInsensitive: true},
+				}},
 				want: ErrIndexNotMaintained,
 			},
 		} {
@@ -275,13 +542,10 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 // KEY or UNIQUE clause over a single Int32 column is enforced by its own index
 // now (checkKeyIndexes), so CPk and CUnique accept writes too.
 //
-// What is left refuses because of the index rather than the record, and that
-// is the point of the two remaining cases: CBoth's UNIQUE is on a VARCHAR
-// column and CPkMulti's second component is VARCHAR. An all-Int32 compound
-// index is maintained; these two mixed/string shapes are not. The refusal now
-// comes from index resolution, which runs first --
-// a constraint whose index cannot be maintained is not separately reported as
-// unchecked, because the index is what would have checked it.
+// VARCHAR, mixed integer/string, and single-column VARCHAR NOCASE indexes are
+// maintained too; CBoth, CPkMulti, and CIdxNoCase therefore join the allowed
+// cases. DESC and compound NOCASE shapes remain in
+// TestWriterRefusesAnIndexItCannotMaintain.
 //
 // Constraints.abs isolates one clause per table, so each case names exactly
 // which one stopped the write. CNone is the control: the same file, the same
@@ -297,8 +561,9 @@ func TestWriterRefusesAConstrainedTable(t *testing.T) {
 		{"CMinMax", nil},
 		{"CPk", nil},
 		{"CUnique", nil},
-		{"CBoth", ErrIndexNotMaintained},
-		{"CPkMulti", ErrMultiColumnIndex},
+		{"CBoth", nil},
+		{"CPkMulti", nil},
+		{"CIdxNoCase", nil},
 	} {
 		t.Run(c.table, func(t *testing.T) {
 			path := writableCopy(t, "Constraints.abs")
@@ -467,7 +732,7 @@ func requireIndexesMatchRebuild(t *testing.T, path, password string) {
 			t.Fatalf("readBTreeEntries: %v", err)
 		}
 
-		want, err := db.buildIndexLeafEntries(table, idx.colIdxs)
+		want, err := db.buildIndexLeafEntries(table, idx.components)
 		if err != nil {
 			t.Fatalf("buildIndexLeafEntries: %v", err)
 		}

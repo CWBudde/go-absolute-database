@@ -107,6 +107,16 @@ testdata/*
 !testdata/MultiKeys-ins.abs
 !testdata/MultiKeys-del.abs
 !testdata/MultiKeys-upd.abs
+!testdata/VarcharKeys-pre.abs
+!testdata/VarcharKeys.abs
+!testdata/VarcharKeys-ins.abs
+!testdata/VarcharKeys-del.abs
+!testdata/VarcharKeys-upd.abs
+!testdata/NoCaseKeys-pre.abs
+!testdata/NoCaseKeys.abs
+!testdata/NoCaseKeys-ins.abs
+!testdata/NoCaseKeys-del.abs
+!testdata/NoCaseKeys-upd.abs
 !testdata/README.md
 # Safety net only, not a location. The ComponentAce SDK is not redistributable
 # and lives OUTSIDE this repository -- by convention ../absolute-database-sdk/.

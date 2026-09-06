@@ -146,8 +146,8 @@ func TestNewConstraintChecksRefusals(t *testing.T) {
 // TestConstraintGateResolvesACompoundKey establishes that the constraint side
 // has no single-column assumption left: a key record resolves all covered
 // columns, in order, against the maintained index with the matching object id.
-// The fixture itself has a VARCHAR component and remains outside occupied
-// maintenance; the all-Int32 compound writer reaches and uses this same gate.
+// The fixture itself has a VARCHAR component, which the mixed compound writer
+// reaches and maintains through this same gate.
 func TestConstraintGateResolvesACompoundKey(t *testing.T) {
 	db := openFixture(t, constraintsFixture)
 

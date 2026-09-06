@@ -157,7 +157,8 @@ Extracted BLOBs are private project payload and are written `0o600`.
 
 ## Committed fixtures
 
-The 40 committed `.abs` files were produced by this project under the ComponentAce DB Manager,
-with invented table names and invented values. Before staging a new one, run the content scan
-`testdata/README.md` documents and confirm that only the file signature, `ABSP`, the invented
-names and the invented values appear.
+The 75 committed `.abs` files were produced by this project with the ComponentAce engine, through
+DB Manager or a Delphi console fixture generator linked against the official Personal Edition
+units, and contain invented table names and invented values. Before staging a new one, run the
+content scan `testdata/README.md` documents and confirm that only the file signature, `ABSP`, the
+invented names and the invented values appear.
