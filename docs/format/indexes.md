@@ -185,7 +185,8 @@ anywhere in the corpus, where a `CREATE TABLE ... UNIQUE` clause names its table
 
 A single-page leaf has room for 367 entries at the measured key shape — `(4056 - 18) / 11` for
 the 5-byte key and 6-byte reference of an `Int32` user index. That is a computed ceiling, not an
-observed fill: **the engine splits well before a leaf is full.**
+observed split threshold. Partially filled leaves in a finished tree are consistent with a
+split at capacity followed by redistribution; they do not establish an earlier trigger.
 
 Five indexes in the corpus are split trees, all of them depth 2:
 
@@ -200,9 +201,11 @@ Five indexes in the corpus are split trees, all of them depth 2:
 `TestFindByPrimaryKeyRoundTrip` reads two of these, which is what exercises the internal-node
 entry stride and the descent. So **reading** a multi-level tree is covered by real files. What no
 file demonstrates is the engine **performing** a split — the before/after page pair that would
-show how it chooses a split point and rewrites the parent. Since the fullest observed leaf is 232
-of a possible 367, the split point is evidently not "leaf full", and nothing here reproduces the
-rule. That is why every write path refuses a multi-level tree.
+show how it chooses a split point and rewrites the parent. Neither the trigger nor the split
+point can be recovered from the fullest remaining leaf's 232 entries. Nothing here reproduces
+the rule, which is why every write path refuses a multi-level tree. The
+[fixture capture procedure](../../testdata/README.md#capturing-a-split-b-tree-leaf) separates
+the first root split, a subsequent leaf split, and the record-page index transition.
 
 These five trees all live in private fixtures, which are gitignored; a fresh clone and CI see
 none of them.

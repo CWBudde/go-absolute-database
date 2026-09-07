@@ -462,7 +462,8 @@ func TestWriterRefusesAnIndexItCannotMaintain(t *testing.T) {
 
 	t.Run("leaf with no room for another entry", func(t *testing.T) {
 		// EntryCount raised to exactly what the page holds, so the next insert
-		// is the one the engine would split on.
+		// exceeds the writer's capacity. This does not measure the engine's
+		// split trigger.
 		path := pokeIndexLeaf(t, "Writes-idx.abs", func(payload []byte) {
 			capacity := (len(payload) - btreeHeaderSize) / (indexKeySize + leafEntrySuffixSize)
 			binary.LittleEndian.PutUint16(payload[14:16], uint16(capacity))

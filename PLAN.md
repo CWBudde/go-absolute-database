@@ -160,14 +160,20 @@ the `VARCHAR` key: all three key a string column, so neither is any use alone.
 ceiling under `ErrIndexTooManyRows` and under the `ErrTableFull` that the record-page index root
 raises, so it is the only item here that closes a limit as well as a shape.
 
-- [ ] a. Fixture: drive the engine past a split. The corpus's fullest leaf holds 232 of a
-      possible 367, so the trigger is not "leaf full" and no existing file shows the moment.
+- [ ] a. Fixture: drive the engine past a split. Existing files show the resulting trees,
+      not the transition; their leaf occupancy does not establish the trigger. The capture
+      procedure is in [testdata/README.md](testdata/README.md#capturing-a-split-b-tree-leaf).
 - [ ] b. The rule: what triggers a split and where the split point falls.
       → `docs/format/indexes.md`.
 - [ ] c. Perform a split in index maintenance.
 - [ ] d. The same for the internal record-page index, which raises `ErrTableFull` for the same
       reason.
 - [ ] e. Docs, and re-measure.
+
+The September 2026 checkout has the 75 committed fixtures but no split-transition fixture,
+private corpus, or SDK at the documented `../absolute-database-sdk/` location; Wine is also
+absent from `PATH`. Step a needs an accessible engine installation before the split rule and
+write implementation can be validated. No split capability has been enabled yet.
 
 ### `DESC` ordering — 1 alone, 1 in total
 

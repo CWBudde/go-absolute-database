@@ -657,6 +657,53 @@ Verify those by bytes too: a derived file must actually differ from its parent
 (`cmp -l parent child | wc -l`), because a script that silently failed to run produces a
 file that is byte-identical to its parent and looks like a valid fixture.
 
+### Capturing a split B-tree leaf
+
+This is a procedure for the next fixtures, **not a description of generated or validated
+files**. It requires the official engine; files produced by this Go writer cannot establish
+the engine's split rule. Keep the SDK, compiler and generator build products outside the
+repository, and use only invented tables and values in scratch databases.
+
+Start with an unencrypted database with 4096-byte pages, an `INTEGER` column `Id`, and a
+single ascending index on `Id`. Create the index while the table is empty, then insert distinct
+integers one statement and committed transaction at a time. Do not start by indexing an already
+populated table: bulk index creation may choose a different layout from incremental maintenance.
+
+1. Before each insert, close the database and preserve a copy. Execute exactly one insert,
+   commit, close, and inspect the resulting B-tree headers. Log the SQL, engine version,
+   database settings, root page, leaf page numbers, entry counts and sibling links. The
+   committed parent and child must differ. Preserve complete files, including unused payload
+   bytes and allocation pages.
+2. Capture the first transition from a root leaf to an internal root. At this key width the
+   computed capacity is 367 entries; inspect each insert through the transition rather than
+   assuming either that capacity or the existing corpus's 232-entry maximum is the trigger.
+   Record both children's entries, the root separators and the allocation order. Distinguish
+   the trigger (occupancy before insertion) from the split point (distribution afterward).
+3. Continue until a non-root leaf splits under an existing parent, preserving another pair.
+   Repeat with decreasing keys and keys inserted between existing keys. Repeat with a wider
+   compound key to distinguish an entry-count threshold from a byte-capacity threshold.
+   Duplicate keys, including a run spanning leaves, need a separate plain-index experiment
+   to establish placement and separator tie-breaking.
+4. From copies of the split tree, capture an ordinary insert, a delete, and a key-moving
+   update that crosses leaves. Include changes to a child's smallest key, and deletes that
+   empty a leaf, to determine parent updates and whether the engine merges or frees pages.
+   These are prerequisites for allowing general writes to an existing split tree.
+5. Isolate the record-page index in a second table with no user index. Use wide fixed-size
+   rows (for example, an `INTEGER` and `VARCHAR(1000)`) so data pages fill quickly. Track actual
+   data-page counts rather than assuming one page per row. Its six-byte leaf entries have
+   a computed capacity of 673 at this page size. Capture the insertion allocating the data
+   page that causes the first split, then a later leaf split and count changes on both sides.
+   Inspect internal entries separately: the system leaf's page-number/count pair is not a
+   user key/record-reference entry.
+
+Turn these files into reader assertions and byte-comparison write tests before enabling the
+new shape. Compare all deterministic bytes, including vacated slots, parent and sibling
+updates, allocation maps, and table bookkeeping. Exclude a page `State` word only where the
+pair demonstrates allocation or reseeding; existing pages may still have deterministic
+increments. Record the measured rule in `docs/format/indexes.md`, the exact statements and
+parent/child filenames here, and add only reviewed synthetic filenames to `.gitignore`.
+The private-corpus survey remains separate from these synthetic experiments.
+
 ## `zlib1/` — golden vectors for the level-1 deflate encoder
 
 `internal/zlib1` must reproduce the C zlib library's level-1 output byte for byte, because

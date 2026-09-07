@@ -42,8 +42,8 @@ import (
 //
 //   - an index that is not a single root-and-leaf page, that is one deep enough
 //     to have split (ErrIndexNotMaintained);
-//   - an insert into a leaf with no room for another entry, which is where the
-//     engine would split (ErrIndexTooManyRows, the same error CreateIndex
+//   - an insert into a leaf with no room for another entry, the current writer's
+//     capacity limit (ErrIndexTooManyRows, the same error CreateIndex
 //     raises for a table too large to index in the first place);
 //   - a key component other than the measured Int32 and VARCHAR shapes
 //     CreateIndex builds, a DESC column, a compound NOCASE shape, and a table
@@ -448,9 +448,9 @@ func (l indexLeaf) setCount(n int) {
 	l.buf.dirty = true
 }
 
-// room reports whether one more entry fits, which is the boundary at which the
-// engine would split the leaf into a deeper tree. No fixture captures a split,
-// so this refuses instead.
+// room reports whether one more entry fits. This is the writer's capacity
+// boundary; no fixture establishes the engine's split trigger or split point,
+// so a leaf that would overflow is refused.
 func (l indexLeaf) room() error {
 	if l.end()+l.stride > len(l.buf.payload) {
 		return fmt.Errorf("%w: index leaf page %d already holds %d entries",
